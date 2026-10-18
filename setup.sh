@@ -86,7 +86,7 @@ RADIUS_TIMEOUT=5s
 RADIUS_RETRIES=3
 
 # Web Interface
-WEB_PORT=8080
+WEB_PORT=8088
 VITE_API_URL=/api/v1
 
 # Security
@@ -157,7 +157,7 @@ else
 fi
 
 echo -n "  Waiting for backend API"
-if wait_for_health "backend" "curl -sf http://localhost:8080/health" 60; then
+if wait_for_health "backend" "curl -sf http://localhost:8088/health" 60; then
     success "Backend API is ready"
 else
     warn "Backend health check timed out. Check logs: $COMPOSE_CMD logs backend"
@@ -186,15 +186,12 @@ echo -e "${GREEN}   Setup Complete!                               ${NC}"
 echo -e "${GREEN}=================================================${NC}"
 echo ""
 echo -e "  ${BLUE}Web Interface:${NC}  http://localhost:8081"
-echo -e "  ${BLUE}Backend API:${NC}    http://localhost:8080"
+echo -e "  ${BLUE}Backend API:${NC}    http://localhost:8088"
 echo -e "  ${BLUE}RADIUS Auth:${NC}    localhost:1812/UDP"
 echo -e "  ${BLUE}RADIUS Acct:${NC}    localhost:1813/UDP"
 echo ""
-echo -e "  ${YELLOW}Default Login:${NC}"
-echo -e "  Username: superadmin"
-echo -e "  Password: Admin@123456"
-echo ""
-echo -e "  ${RED}⚠  CHANGE THE DEFAULT PASSWORD IMMEDIATELY!${NC}"
+echo -e "  ${YELLOW}First run:${NC} open the web interface and complete the setup wizard"
+echo -e "  to create your admin account (there is no default login)."
 echo ""
 echo -e "  Useful commands:"
 echo -e "  ${BLUE}View logs:${NC}    $COMPOSE_CMD logs -f"

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -103,15 +104,16 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 	}
 
 	receipt := generateReceiptNumber()
+	claims, _ := middleware.GetClaims(c)
 
 	var id int
 	err := h.db.QueryRow(`
 		INSERT INTO payments (invoice_id, username, amount, currency, payment_method,
-		                      gateway, gateway_ref, notes, receipt_number, status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed') RETURNING id`,
+		                      gateway, gateway_ref, notes, receipt_number, status, processed_by)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed',$10) RETURNING id`,
 		req.InvoiceID, nullableString(req.Username), req.Amount, req.Currency,
 		req.PaymentMethod, nullableString(req.Gateway), nullableString(req.GatewayRef),
-		nullableString(req.Notes), receipt).Scan(&id)
+		nullableString(req.Notes), receipt, claims.UserID).Scan(&id)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to record payment")
 		return
@@ -245,8 +247,8 @@ func (h *Handler) PaymentSummary(c *gin.Context) {
 
 func generateReceiptNumber() string {
 	t := time.Now()
-	r := rand.Intn(9000) + 1000
-	return fmt.Sprintf("RCP-%d%02d%02d-%04d", t.Year(), t.Month(), t.Day(), r)
+	r := rand.Intn(900000) + 100000
+	return fmt.Sprintf("RCP-%d%02d%02d-%06d", t.Year(), t.Month(), t.Day(), r)
 }
 
 func buildReceiptHTML(p Payment, orgName, orgEmail string) string {

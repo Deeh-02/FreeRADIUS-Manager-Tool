@@ -190,9 +190,9 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 
 	var plan UserPlan
 	err = h.db.QueryRow(`
-		SELECT id, name, data_limit_mb, validity_days, bandwidth_profile_id, max_devices
+		SELECT id, name, price, currency, data_limit_mb, validity_days, bandwidth_profile_id, max_devices
 		FROM user_plans WHERE id=$1`, *body.PlanID).
-		Scan(&plan.ID, &plan.Name, &plan.DataLimitMB, &plan.ValidityDays, &plan.BandwidthProfileID, &plan.MaxDevices)
+		Scan(&plan.ID, &plan.Name, &plan.Price, &plan.Currency, &plan.DataLimitMB, &plan.ValidityDays, &plan.BandwidthProfileID, &plan.MaxDevices)
 	if err == sql.ErrNoRows {
 		respondError(c, http.StatusNotFound, "plan not found")
 		return
@@ -224,12 +224,11 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 	}
 
 	// Auto-generate invoice for paid plans
-	if plan.ValidityDays > 0 {
-		invoiceNum := fmt.Sprintf("INV-%s-%04d", time.Now().Format("200601"), userID)
+	if plan.Price > 0 {
+		invoiceNum := fmt.Sprintf("INV-%s-%06d", time.Now().Format("200601"), time.Now().UnixNano()%1000000)
 		h.db.Exec(`INSERT INTO invoices (invoice_number,user_id,username,plan_id,plan_name,amount,currency,due_date,created_by)
-			VALUES ($1,$2,$3,$4,$5,0,'USD',CURRENT_DATE+$6,$7)
-			ON CONFLICT (invoice_number) DO NOTHING`,
-			invoiceNum, userID, username, body.PlanID, plan.Name, plan.ValidityDays, claims.UserID)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_DATE+7,$8)`,
+			invoiceNum, userID, username, body.PlanID, plan.Name, plan.Price, plan.Currency, claims.UserID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("plan '%s' assigned to %s", plan.Name, username)})

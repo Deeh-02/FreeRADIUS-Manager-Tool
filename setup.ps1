@@ -67,7 +67,7 @@ RADIUS_SECRET=$RadiusSecret
 RADIUS_TIMEOUT=5s
 RADIUS_RETRIES=3
 
-WEB_PORT=8080
+WEB_PORT=8088
 VITE_API_URL=/api/v1
 
 ADMIN_IP_WHITELIST=0.0.0.0/0
@@ -112,12 +112,9 @@ Write-Host "   Setup Complete!                               " -ForegroundColor 
 Write-Host "=================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Web Interface:  http://localhost:8081" -ForegroundColor Cyan
-Write-Host "  Backend API:    http://localhost:8080" -ForegroundColor Cyan
+Write-Host "  Backend API:    http://localhost:8088" -ForegroundColor Cyan
 Write-Host "  RADIUS Port:    localhost:1812/UDP" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Default Login:" -ForegroundColor Yellow
-Write-Host "  Username: superadmin"
-Write-Host "  Password: Admin@123456"
-Write-Host ""
-Write-Host "  CHANGE THE DEFAULT PASSWORD IMMEDIATELY!" -ForegroundColor Red
+Write-Host "  First run: open the web interface and complete the setup wizard" -ForegroundColor Yellow
+Write-Host "  to create your admin account (there is no default login)."
 Write-Host ""

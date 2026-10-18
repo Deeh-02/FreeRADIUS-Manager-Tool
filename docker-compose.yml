@@ -11,6 +11,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./migrations/009_billing.sql:/docker-entrypoint-initdb.d/02-billing.sql
     networks:
       - radius-network
     healthcheck:

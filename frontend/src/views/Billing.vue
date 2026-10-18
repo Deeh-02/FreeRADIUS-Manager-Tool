@@ -182,7 +182,8 @@ async function loadInvoices() {
     invoices.value = data.data || []
     total.value = data.total || 0
     if (data.summary) {
-      Object.assign(summary, data.summary)
+      const { total_revenue, ...counts } = data.summary
+      Object.assign(summary, counts, { totalRevenue: total_revenue ?? 0 })
     }
   } catch { /* silent */ } finally { loading.value = false }
 }
