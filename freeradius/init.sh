@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e
 
+# No fallbacks: a default shared secret or empty DB password would be a silent hole.
+[ -n "${RADIUS_SECRET:-}" ] || { echo "[FreeRADIUS] RADIUS_SECRET is not set; refusing to start." >&2; exit 1; }
+[ -n "${DB_PASS:-}" ] || { echo "[FreeRADIUS] DB_PASS is not set; refusing to start." >&2; exit 1; }
+
 echo "[FreeRADIUS] Waiting for PostgreSQL to be ready..."
 until pg_isready -h "${DB_HOST:-postgres}" -p "${DB_PORT:-5432}" -U "${DB_USER:-radius_user}" 2>/dev/null; do
     echo "[FreeRADIUS] PostgreSQL not ready, retrying in 2s..."
@@ -14,7 +18,7 @@ echo "[FreeRADIUS] PostgreSQL is ready."
 sed_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/&/\\&/g; s/|/\\|/g'; }
 
 # ── 1. RADIUS shared secret → clients.conf ───────────────────────────────────
-SECRET="${RADIUS_SECRET:-testing123}"
+SECRET="$RADIUS_SECRET"
 sed -i "s|RADIUS_SECRET_PLACEHOLDER|$(sed_escape "$SECRET")|g" \
     /etc/freeradius/clients.conf
 echo "[FreeRADIUS] clients.conf secret set (length: ${#SECRET})."
@@ -25,7 +29,7 @@ sed -i "s|DB_HOST_PLACEHOLDER|$(sed_escape "${DB_HOST:-postgres}")|g"    "$SQL"
 sed -i "s|DB_PORT_PLACEHOLDER|$(sed_escape "${DB_PORT:-5432}")|g"        "$SQL"
 sed -i "s|DB_NAME_PLACEHOLDER|$(sed_escape "${DB_NAME:-radius}")|g"      "$SQL"
 sed -i "s|DB_USER_PLACEHOLDER|$(sed_escape "${DB_USER:-radius_user}")|g" "$SQL"
-sed -i "s|DB_PASS_PLACEHOLDER|$(sed_escape "${DB_PASS:-}")|g"            "$SQL"
+sed -i "s|DB_PASS_PLACEHOLDER|$(sed_escape "$DB_PASS")|g"            "$SQL"
 echo "[FreeRADIUS] SQL module credentials set (host: ${DB_HOST:-postgres})."
 
 echo "[FreeRADIUS] Starting FreeRADIUS..."

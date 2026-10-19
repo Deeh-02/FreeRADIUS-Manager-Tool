@@ -1,0 +1,42 @@
+# Usage caps, checked at login (authorize section of sites-available/default).
+#
+# datacounter: a user with a radcheck "Max-Octets" row (plan or voucher data cap, in bytes) is
+#   rejected once their recorded traffic reaches it. For customers the count starts at
+#   radius_users.period_start (set when a plan period is paid/started), so the cap resets each
+#   period; vouchers (no radius_users row) count all their traffic.
+# timecounter: a user with "Max-All-Session" (voucher time limit, in seconds) is rejected once
+#   their total online time reaches it; while time remains, Session-Timeout is set to the rest.
+#
+# Both rely on accounting (radacct) and are evaluated only when the user logs in: someone who
+# is already online keeps going until they reconnect (the API's quota task disconnects them
+# when the NAS supports Disconnect-Request).
+sqlcounter datacounter {
+	sql_module_instance = sql
+	dialect = ${modules.sql.dialect}
+	counter_name = Total-Octets-Used
+	check_name = Max-Octets
+	reply_name = Octets-Remaining
+	key = User-Name
+	reset = never
+	query = "\
+		SELECT COALESCE(SUM(acctinputoctets + acctoutputoctets), 0) \
+		FROM radacct \
+		WHERE username = '%{${key}}' \
+		AND acctstarttime >= COALESCE( \
+			(SELECT period_start FROM radius_users WHERE username = '%{${key}}'), \
+			DATE '1970-01-01')"
+}
+
+sqlcounter timecounter {
+	sql_module_instance = sql
+	dialect = ${modules.sql.dialect}
+	counter_name = Max-All-Session-Time
+	check_name = Max-All-Session
+	reply_name = Session-Timeout
+	key = User-Name
+	reset = never
+	query = "\
+		SELECT COALESCE(SUM(acctsessiontime), 0) \
+		FROM radacct \
+		WHERE username = '%{${key}}'"
+}

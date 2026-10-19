@@ -1,0 +1,15 @@
+# Local dictionary for FreeRADIUS Manager. FreeRADIUS loads the standard dictionaries from
+# /usr/share/freeradius first, then this file.
+#
+# Max-Octets (a data cap in bytes) is written to radcheck by the API for plans and vouchers.
+# It is not a standard attribute: without this definition rlm_sql fails to parse the row and
+# REJECTS the user outright. It is enforced by the `datacounter` module (mods-available/quota).
+#
+# The counters themselves (Total-Octets-Used, Max-All-Session-Time) are registered by
+# rlm_sqlcounter at startup and must NOT be defined here.
+#
+# Numbers 3000-3999 are reserved for local, server-internal attributes. They are never put on
+# the wire, so routers never see them.
+ATTRIBUTE	Max-Octets			3101	integer64
+ATTRIBUTE	Octets-Remaining		3103	integer64
+ATTRIBUTE	Max-All-Session			3104	integer

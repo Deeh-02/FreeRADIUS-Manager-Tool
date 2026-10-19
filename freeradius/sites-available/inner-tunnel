@@ -1,7 +1,6 @@
 # Inner (tunnelled) authentication for PEAP/TTLS: the outer EAP handshake in `default`
 # normally hands the inner credentials to this virtual server on loopback. It listens on
-# 127.0.0.1 inside the FreeRADIUS container, so publishing 18120/udp in docker-compose.yml
-# has no effect. EAP relies on the eap module and certificates from the base image's raddb,
+# 127.0.0.1 inside the FreeRADIUS container and is not published. EAP relies on the eap module and certificates from the base image's raddb,
 # which are not part of this repo (EAP/PEAP has not been tested here).
 server inner-tunnel {
     listen {
@@ -25,6 +24,8 @@ server inner-tunnel {
         sql
         expiration
         logintime
+        datacounter
+        timecounter
         pap
     }
 

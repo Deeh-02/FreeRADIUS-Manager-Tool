@@ -1,13 +1,14 @@
 # Request flow for a normal login: listen -> authorize (`sql` loads the user's
-# radcheck/radreply rows; `expiration`/`logintime` act on any Expiration/Login-Time rows;
-# `pap`/`chap`/`mschap` pick how the password will be checked) -> authenticate (compares
-# against radcheck's Cleartext-Password) -> post-auth (`sql` logs to radpostauth).
+# radcheck/radreply rows; `expiration` rejects past an Expiration date and caps
+# Session-Timeout at it; `logintime` acts on Login-Time; `datacounter`/`timecounter`
+# (mods-available/quota) enforce Max-Octets and Max-All-Session; `pap`/`chap`/`mschap` pick
+# how the password will be checked) -> authenticate (compares against radcheck's
+# Cleartext-Password) -> post-auth (`sql` logs to radpostauth).
 # Accounting packets go to `accounting { sql }` -> radacct.
 #
-# What this config does NOT do: it never looks at radius_users (status, account_expiry,
-# plan) or at invoices. A user is blocked only if a radcheck row says so (Auth-Type :=
-# Reject, or an Expiration date). No counter module (e.g. sqlcounter) is called from this
-# site, so data caps (Max-Octets) and time caps written to radcheck are not enforced here.
+# FreeRADIUS never reads radius_users or invoices. The API turns their state into radcheck
+# rows (handlers/access.go): Auth-Type := Reject for suspended/expired customers, Expiration
+# for the paid-until date, Simultaneous-Use for the device limit, Max-Octets for data caps.
 server default {
     listen {
         type   = auth
@@ -34,6 +35,8 @@ server default {
         sql
         expiration
         logintime
+        datacounter
+        timecounter
         pap
     }
 
