@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 )
 
@@ -758,63 +759,83 @@ func (h *Handler) AuditLogs(c *gin.Context) {
 
 // GetSettings returns all system settings.
 func (h *Handler) GetSettings(c *gin.Context) {
-	rows, err := h.db.Query(`SELECT key, value, description FROM system_settings ORDER BY key`)
+	rows, err := h.db.Query(`SELECT key, COALESCE(value,''), COALESCE(description,'') FROM system_settings ORDER BY key`)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to fetch settings")
 		return
 	}
 	defer rows.Close()
 
-	settings := map[string]gin.H{}
+	out := map[string]gin.H{}
 	for rows.Next() {
 		var key, value, desc string
-		rows.Scan(&key, &value, &desc)
-		settings[key] = gin.H{"value": value, "description": desc}
+		if rows.Scan(&key, &value, &desc) != nil {
+			continue
+		}
+		out[key] = gin.H{"value": value, "description": desc}
 	}
 
-	c.JSON(http.StatusOK, settings)
+	c.JSON(http.StatusOK, out)
 }
 
-// UpdateSettings updates one or more system settings.
-// Only existing keys are updated (the UPDATE silently matches nothing for an unknown key),
-// and most keys are informational: the code reads session timeout, rate limit, bcrypt
-// cost, password length, lockout and SMTP from environment variables, not from this
-// table. The only keys read back from system_settings are setup_complete, org_name,
-// org_email, honeypot_enabled and the cs_* thresholds.
+// readOnlySettings cannot be changed through the API. setup_complete in particular: resetting
+// it would reopen the first-run wizard.
+var readOnlySettings = map[string]bool{"setup_complete": true, "radius_default_secret_hint": true}
+
+// UpdateSettings updates one or more existing settings and clears the settings cache, so
+// the change applies within the request. Unknown keys are reported, not created.
 func (h *Handler) UpdateSettings(c *gin.Context) {
 	var updates map[string]string
 	if err := c.ShouldBindJSON(&updates); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	for key, value := range updates {
-		h.db.Exec(`UPDATE system_settings SET value = $1, updated_at = NOW() WHERE key = $2`, value, key)
+	numeric := map[string][2]int{
+		"password_min_length": {8, 128}, "password_expiry_days": {1, 3650}, "session_timeout": {300, 604800},
+		"brute_force_attempts": {1, 100}, "brute_force_lockout": {1, 1440}, "max_device_limit": {1, 500},
+		"invoice_due_days": {0, 365}, "billing_grace_days": {0, 60}, "renewal_invoice_days": {0, 60},
+		"reminder_days": {0, 60}, "portal_max_attempts": {1, 100}, "portal_lockout_minutes": {1, 1440},
+		"backup_retention_days": {0, 3650}, "cs_max_fails": {1, 10000}, "cs_window_secs": {10, 86400},
+		"cs_block_mins": {1, 100000},
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "settings updated successfully"})
-}
+	tx, err := h.db.Begin()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+	unknown := []string{}
+	for key, value := range updates {
+		if readOnlySettings[key] {
+			respondError(c, http.StatusBadRequest, key+" cannot be changed here")
+			return
+		}
+		if r, ok := numeric[key]; ok {
+			var n int
+			if _, err := fmt.Sscanf(value, "%d", &n); err != nil || n < r[0] || n > r[1] {
+				respondError(c, http.StatusBadRequest, fmt.Sprintf("%s must be a number from %d to %d", key, r[0], r[1]))
+				return
+			}
+		}
+		res, err := tx.Exec(`UPDATE system_settings SET value = $1, updated_at = NOW() WHERE key = $2`, value, key)
+		if err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to save settings")
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			unknown = append(unknown, key)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to save settings")
+		return
+	}
+	settings.Invalidate()
 
-// CreateBackup triggers a database dump.
-// NOTE: stub. It builds a filename and returns "backup initiated" but runs no pg_dump and
-// writes no file; RestoreBackup and ListBackups are equally inert, and BACKUP_SCHEDULE /
-// BACKUP_RETENTION_DAYS are never read. The only real backup is the pg_dump that
-// deploy-update.sh takes before an update, so schedule your own (see docs/ARCHITECTURE.md).
-func (h *Handler) CreateBackup(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"message":  "backup initiated",
-		"filename": fmt.Sprintf("radius_backup_%s.sql", time.Now().Format("20060102_150405")),
-	})
-}
-
-// RestoreBackup explains how to restore.
-func (h *Handler) RestoreBackup(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"message": "To restore: docker exec -i radius_postgres psql -U radius_user radius < backup.sql",
-	})
-}
-
-// ListBackups lists available backup files.
-func (h *Handler) ListBackups(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"backups": []interface{}{}})
+	resp := gin.H{"message": "settings updated successfully"}
+	if len(unknown) > 0 {
+		resp["ignored_unknown_keys"] = unknown
+	}
+	c.JSON(http.StatusOK, resp)
 }

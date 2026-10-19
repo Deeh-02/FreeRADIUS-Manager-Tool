@@ -3,7 +3,6 @@ package handlers
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
 )
 
 // APIKey represents an external integration key.
@@ -43,9 +43,10 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	keys := []APIKey{}
 	for rows.Next() {
 		var k APIKey
-		rows.Scan(&k.ID, &k.Name, &k.KeyPrefix, &k.Permissions,
-			&k.CreatedBy, &k.LastUsed, &k.ExpiresAt, &k.IsActive, &k.CreatedAt)
-		keys = append(keys, k)
+		if rows.Scan(&k.ID, &k.Name, &k.KeyPrefix, pq.Array(&k.Permissions),
+			&k.CreatedBy, &k.LastUsed, &k.ExpiresAt, &k.IsActive, &k.CreatedAt) == nil {
+			keys = append(keys, k)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": keys})
 }
@@ -64,32 +65,41 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	if len(req.Permissions) == 0 {
 		req.Permissions = []string{"read"}
 	}
+	for _, p := range req.Permissions {
+		if p != "read" && p != "write" {
+			respondError(c, http.StatusBadRequest, "permissions may only be read and write")
+			return
+		}
+	}
 
 	claims, _ := middleware.GetClaims(c)
 
-	// Generate random 32-byte key
 	raw := make([]byte, 32)
-	rand.Read(raw)
+	if _, err := rand.Read(raw); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to generate key")
+		return
+	}
 	fullKey := "rmk_" + hex.EncodeToString(raw) // prefix + 64 hex chars
 
 	hash := sha256.Sum256([]byte(fullKey))
 	keyHash := hex.EncodeToString(hash[:])
 	keyPrefix := fullKey[:12] // "rmk_" + first 8 hex chars
 
-	// Build permissions array literal for PostgreSQL. Hand-built and unquoted: a
-	// permission containing a comma, brace or quote produces a different array than intended.
-	permsLiteral := "{" + joinStrings(req.Permissions, ",") + "}"
-
 	var expiresAt interface{}
 	if req.ExpiresAt != nil && *req.ExpiresAt != "" {
-		expiresAt = *req.ExpiresAt
+		t, err := time.Parse("2006-01-02", (*req.ExpiresAt)[:min(10, len(*req.ExpiresAt))])
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "expires_at must be YYYY-MM-DD")
+			return
+		}
+		expiresAt = t
 	}
 
 	var id int
 	err := h.db.QueryRow(`
 		INSERT INTO api_keys (name, key_hash, key_prefix, permissions, created_by, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		req.Name, keyHash, keyPrefix, permsLiteral, claims.UserID, expiresAt,
+		req.Name, keyHash, keyPrefix, pq.Array(req.Permissions), claims.UserID, expiresAt,
 	).Scan(&id)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to create API key")
@@ -128,60 +138,15 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "API key deleted"})
 }
 
-// ValidateAPIKey middleware authenticates requests using an API key.
-// Checks Authorization: ApiKey <key> header.
-// NOTE: not mounted on any route in main.go, so issued keys currently grant nothing. If
-// it is wired in, note that it calls c.Next() when the header is absent (it is an
-// "optional" check, not a gate), never compares perms against the route, and scans a
-// text[] column into []string, which lib/pq cannot do without pq.Array.
-func (h *Handler) ValidateAPIKey(c *gin.Context) {
-	authHeader := c.GetHeader("Authorization")
-	if len(authHeader) < 8 || authHeader[:7] != "ApiKey " {
-		c.Next()
-		return
+// Keys are checked by middleware.RequireAuth ("Authorization: ApiKey <key>"): "read" keys
+// may only GET, "write" keys act with the admin role. Keys act as the admin who created
+// them and stop working if that account is disabled.
+
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	rawKey := authHeader[7:]
-	hash := sha256.Sum256([]byte(rawKey))
-	keyHash := hex.EncodeToString(hash[:])
-
-	var keyID int
-	var perms []string
-	var expiresAt *time.Time
-	err := h.db.QueryRow(`
-		SELECT id, permissions, expires_at FROM api_keys
-		WHERE key_hash=$1 AND is_active=true`, keyHash).
-		Scan(&keyID, &perms, &expiresAt)
-
-	if err == sql.ErrNoRows {
-		respondError(c, http.StatusUnauthorized, "invalid API key")
-		c.Abort()
-		return
-	}
-	if expiresAt != nil && expiresAt.Before(time.Now()) {
-		respondError(c, http.StatusUnauthorized, "API key expired")
-		c.Abort()
-		return
-	}
-
-	// Update last_used asynchronously
-	go h.db.Exec(`UPDATE api_keys SET last_used=NOW() WHERE id=$1`, keyID)
-
-	c.Set("api_key_id", keyID)
-	c.Set("api_key_perms", perms)
-	c.Next()
-}
-
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-func joinStrings(ss []string, sep string) string {
-	result := ""
-	for i, s := range ss {
-		if i > 0 {
-			result += sep
-		}
-		result += s
-	}
-	return result
+	return b
 }
 
 // APIKeyStats returns usage statistics.
@@ -193,5 +158,6 @@ func (h *Handler) APIKeyStats(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"total": total, "active": active, "expired": expired,
 		"docs_url": fmt.Sprintf("%s/api/v1", c.Request.Host),
+		"usage":    "send the header  Authorization: ApiKey <key>",
 	})
 }

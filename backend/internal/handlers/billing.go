@@ -3,34 +3,59 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
-// Invoice holds a billing record.
-// Money is float64 here and in the handlers (the database column is NUMERIC(12,2)), so
-// sums use binary floating point; fine for display, not for strict accounting.
-// username/plan_name are copied onto the invoice so history survives deleting the user or plan.
+// Invoice holds a billing record. Amounts are NUMERIC(12,2) in the database; Go carries
+// them as float64 for JSON only, and money arithmetic is done in SQL or rounded to cents
+// (billing_core.go). username/plan_name are copied onto the invoice so history survives
+// deleting the user or plan.
 type Invoice struct {
-	ID            int        `json:"id"`
-	InvoiceNumber string     `json:"invoice_number"`
-	UserID        *int       `json:"user_id"`
-	Username      string     `json:"username"`
-	PlanID        *int       `json:"plan_id"`
-	PlanName      *string    `json:"plan_name"`
-	Amount        float64    `json:"amount"`
-	Currency      string     `json:"currency"`
-	Status        string     `json:"status"`
-	DueDate       *string    `json:"due_date"`
-	PaidAt        *time.Time `json:"paid_at"`
-	Notes         *string    `json:"notes"`
-	CreatedBy     *string    `json:"created_by"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID             int        `json:"id"`
+	InvoiceNumber  string     `json:"invoice_number"`
+	UserID         *int       `json:"user_id"`
+	Username       string     `json:"username"`
+	PlanID         *int       `json:"plan_id"`
+	PlanName       *string    `json:"plan_name"`
+	Amount         float64    `json:"amount"`
+	AmountPaid     float64    `json:"amount_paid"`
+	Discount       float64    `json:"discount_amount"`
+	PromoCode      *string    `json:"promo_code"`
+	Currency       string     `json:"currency"`
+	Status         string     `json:"status"`
+	DueDate        *string    `json:"due_date"`
+	PaidAt         *time.Time `json:"paid_at"`
+	ServiceApplied bool       `json:"service_applied"`
+	PeriodEnd      *string    `json:"period_end"`
+	Notes          *string    `json:"notes"`
+	CreatedBy      *string    `json:"created_by"`
+	CreatedAt      time.Time  `json:"created_at"`
 }
 
-// ListInvoices returns paginated invoices with filters.
+const invoiceColumns = `
+	i.id, i.invoice_number, i.user_id, i.username, i.plan_id, i.plan_name,
+	i.amount, COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id AND p.status = 'confirmed'), 0),
+	i.discount_amount, i.promo_code, i.currency, i.status, i.due_date::text, i.paid_at,
+	i.service_applied, i.period_end::text, i.notes, au.username, i.created_at`
+
+func scanInvoice(scan func(...interface{}) error, inv *Invoice) error {
+	return scan(&inv.ID, &inv.InvoiceNumber, &inv.UserID, &inv.Username, &inv.PlanID, &inv.PlanName,
+		&inv.Amount, &inv.AmountPaid, &inv.Discount, &inv.PromoCode, &inv.Currency, &inv.Status,
+		&inv.DueDate, &inv.PaidAt, &inv.ServiceApplied, &inv.PeriodEnd, &inv.Notes, &inv.CreatedBy, &inv.CreatedAt)
+}
+
+// CurrencyTotal is a money figure for one currency (totals never mix currencies).
+type CurrencyTotal struct {
+	Currency string  `json:"currency"`
+	Amount   float64 `json:"amount"`
+	Count    int     `json:"count"`
+}
+
+// ListInvoices returns paginated invoices with filters, and a summary over all invoices.
 func (h *Handler) ListInvoices(c *gin.Context) {
 	offset, limit := paginationParams(c)
 	status := c.Query("status")
@@ -40,7 +65,9 @@ func (h *Handler) ListInvoices(c *gin.Context) {
 	args := []interface{}{}
 	argN := 1
 
-	if status != "" {
+	if status == "open" {
+		where += " AND i.status IN ('pending','overdue')"
+	} else if status != "" {
 		where += fmt.Sprintf(" AND i.status=$%d", argN)
 		args = append(args, status)
 		argN++
@@ -56,15 +83,14 @@ func (h *Handler) ListInvoices(c *gin.Context) {
 
 	dataArgs := append(args, limit, offset)
 	rows, err := h.db.Query(fmt.Sprintf(`
-		SELECT i.id, i.invoice_number, i.user_id, i.username, i.plan_id, i.plan_name,
-		       i.amount, i.currency, i.status, i.due_date::text, i.paid_at, i.notes,
-		       au.username, i.created_at
+		SELECT %s
 		FROM invoices i
 		LEFT JOIN app_users au ON au.id = i.created_by
 		%s
 		ORDER BY i.created_at DESC
-		LIMIT $%d OFFSET $%d`, where, argN, argN+1), dataArgs...)
+		LIMIT $%d OFFSET $%d`, invoiceColumns, where, argN, argN+1), dataArgs...)
 	if err != nil {
+		h.log.WithError(err).Error("list invoices")
 		respondError(c, http.StatusInternalServerError, "failed to fetch invoices")
 		return
 	}
@@ -73,96 +99,152 @@ func (h *Handler) ListInvoices(c *gin.Context) {
 	invoices := []Invoice{}
 	for rows.Next() {
 		var inv Invoice
-		rows.Scan(&inv.ID, &inv.InvoiceNumber, &inv.UserID, &inv.Username, &inv.PlanID, &inv.PlanName,
-			&inv.Amount, &inv.Currency, &inv.Status, &inv.DueDate, &inv.PaidAt, &inv.Notes,
-			&inv.CreatedBy, &inv.CreatedAt)
+		if err := scanInvoice(rows.Scan, &inv); err != nil {
+			h.log.WithError(err).Warn("scan invoice")
+			continue
+		}
 		invoices = append(invoices, inv)
 	}
 
-	// Revenue summary. Counts every invoice (ignores the filters above) and adds amounts
-	// across currencies without conversion. "Paid" is invoice status, not payment records,
-	// so this figure can differ from /payments/summary.
+	// Summary over all invoices (not the filtered page). "Collected" is the sum of confirmed
+	// payments linked to invoices, per currency, so it matches the Payments page.
 	type Summary struct {
-		TotalRevenue float64 `json:"total_revenue"`
-		Pending      int     `json:"pending"`
-		Paid         int     `json:"paid"`
-		Overdue      int     `json:"overdue"`
+		Collected   []CurrencyTotal `json:"collected"`
+		Outstanding []CurrencyTotal `json:"outstanding"`
+		Pending     int             `json:"pending"`
+		Paid        int             `json:"paid"`
+		Overdue     int             `json:"overdue"`
 	}
-	var sum Summary
-	h.db.QueryRow(`SELECT COALESCE(SUM(amount) FILTER (WHERE status='paid'),0),
-	               COUNT(*) FILTER (WHERE status='pending'),
+	sum := Summary{Collected: []CurrencyTotal{}, Outstanding: []CurrencyTotal{}}
+	h.db.QueryRow(`SELECT COUNT(*) FILTER (WHERE status='pending'),
 	               COUNT(*) FILTER (WHERE status='paid'),
 	               COUNT(*) FILTER (WHERE status='overdue')
-	               FROM invoices`).Scan(&sum.TotalRevenue, &sum.Pending, &sum.Paid, &sum.Overdue)
+	               FROM invoices`).Scan(&sum.Pending, &sum.Paid, &sum.Overdue)
+	sum.Collected = currencyTotals(h, `SELECT p.currency, SUM(p.amount), COUNT(*) FROM payments p
+		WHERE p.status='confirmed' AND p.invoice_id IS NOT NULL GROUP BY p.currency ORDER BY p.currency`)
+	sum.Outstanding = currencyTotals(h, `SELECT i.currency,
+		SUM(i.amount - COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=i.id AND p.status='confirmed'),0)),
+		COUNT(*) FROM invoices i WHERE i.status IN ('pending','overdue') GROUP BY i.currency ORDER BY i.currency`)
 
 	c.JSON(http.StatusOK, gin.H{"data": invoices, "total": total, "summary": sum})
 }
 
-// CreateInvoice creates a new invoice.
+func currencyTotals(h *Handler, query string, args ...interface{}) []CurrencyTotal {
+	out := []CurrencyTotal{}
+	rows, err := h.db.Query(query, args...)
+	if err != nil {
+		h.log.WithError(err).Warn("currency totals")
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var t CurrencyTotal
+		if rows.Scan(&t.Currency, &t.Amount, &t.Count) == nil {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// GetInvoice returns one invoice with its payments.
+func (h *Handler) GetInvoice(c *gin.Context) {
+	id, err := mustInt(c, "id")
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid ID")
+		return
+	}
+	var inv Invoice
+	err = scanInvoice(h.db.QueryRow(fmt.Sprintf(`SELECT %s FROM invoices i
+		LEFT JOIN app_users au ON au.id = i.created_by WHERE i.id = $1`, invoiceColumns), id).Scan, &inv)
+	if err != nil {
+		respondError(c, http.StatusNotFound, "invoice not found")
+		return
+	}
+	payments := listPaymentsWhere(h, "p.invoice_id = $1", id)
+	c.JSON(http.StatusOK, gin.H{"invoice": inv, "payments": payments})
+}
+
+// CreateInvoice creates a manual invoice. With plan_id, paying it adds that plan's period to
+// the customer. promo_code applies a promotion (validated and counted).
 func (h *Handler) CreateInvoice(c *gin.Context) {
 	var req struct {
-		Username string  `json:"username" binding:"required"`
-		PlanID   *int    `json:"plan_id"`
-		Amount   float64 `json:"amount"`
-		Currency string  `json:"currency"`
-		DueDate  string  `json:"due_date"`
-		Notes    string  `json:"notes"`
+		Username  string  `json:"username" binding:"required"`
+		PlanID    *int    `json:"plan_id"`
+		Amount    float64 `json:"amount"`
+		Currency  string  `json:"currency"`
+		DueDate   string  `json:"due_date"`
+		Notes     string  `json:"notes"`
+		PromoCode string  `json:"promo_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.Currency == "" {
-		req.Currency = "USD"
-	}
-
 	claims, _ := middleware.GetClaims(c)
 
-	// Get user ID
-	var userID *int
-	var uid int
-	if err := h.db.QueryRow(`SELECT id FROM radius_users WHERE username=$1`, req.Username).Scan(&uid); err == nil {
-		userID = &uid
-	}
+	in := newInvoice{Username: strings.TrimSpace(req.Username), Amount: req.Amount, Currency: req.Currency,
+		Notes: req.Notes, PromoCode: req.PromoCode, CreatedBy: &claims.UserID}
 
-	// Get plan name
-	var planName *string
+	var uid int
+	if err := h.db.QueryRow(`SELECT id FROM radius_users WHERE username=$1`, in.Username).Scan(&uid); err == nil {
+		in.UserID = &uid
+	}
 	if req.PlanID != nil {
-		var pn string
-		if err := h.db.QueryRow(`SELECT name FROM user_plans WHERE id=$1`, *req.PlanID).Scan(&pn); err == nil {
-			planName = &pn
+		p, err := loadPlan(h.db, *req.PlanID)
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "plan not found")
+			return
+		}
+		if in.UserID == nil {
+			respondError(c, http.StatusBadRequest, "a plan invoice needs an existing RADIUS user")
+			return
+		}
+		in.PlanID, in.PlanName = &p.ID, &p.Name
+		if in.Amount <= 0 {
+			in.Amount = p.Price
+		}
+		if in.Currency == "" {
+			in.Currency = p.Currency
 		}
 	}
-
-	// Number = month + last 6 digits of the clock's nanoseconds. It is not a sequence and
-	// can collide (UNIQUE then rejects it and the caller sees a 500).
-	invoiceNum := fmt.Sprintf("INV-%s-%06d", time.Now().Format("200601"), time.Now().UnixNano()%1000000)
-
-	var dueDate interface{}
+	if in.Amount <= 0 {
+		respondError(c, http.StatusBadRequest, "amount must be greater than zero")
+		return
+	}
 	if req.DueDate != "" {
-		dueDate = req.DueDate
+		d, err := time.Parse("2006-01-02", req.DueDate)
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "due_date must be YYYY-MM-DD")
+			return
+		}
+		in.DueDate = &d
 	}
 
-	var id int
-	err := h.db.QueryRow(`
-		INSERT INTO invoices (invoice_number,user_id,username,plan_id,plan_name,amount,currency,due_date,notes,created_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-		invoiceNum, userID, req.Username, req.PlanID, planName, req.Amount, req.Currency,
-		dueDate, nullableString(req.Notes), claims.UserID,
-	).Scan(&id)
+	tx, err := h.db.Begin()
 	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+	inv, err := createInvoiceTx(tx, in)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to create invoice")
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"id": id, "invoice_number": invoiceNum, "message": "invoice created"})
+	go h.dispatchWebhook("invoice.created", gin.H{"invoice_id": inv.ID, "invoice_number": inv.Number,
+		"username": in.Username, "amount": inv.Amount})
+	c.JSON(http.StatusCreated, gin.H{"id": inv.ID, "invoice_number": inv.Number, "amount": inv.Amount,
+		"discount_amount": inv.Discount, "message": "invoice created"})
 }
 
-// UpdateInvoice updates invoice status / payment.
-// Empty/zero fields mean "leave unchanged" (COALESCE/NULLIF below), so a field cannot be
-// cleared through this endpoint. Setting status=paid here only stamps paid_at: it does
-// not create a payment row, extend the user's expiry or re-activate them. Any status
-// string is accepted by the handler (only the table CHECK rejects unknown ones, and the
-// resulting error is ignored, so the response still says "invoice updated").
+// UpdateInvoice edits an open invoice: due date, notes, amount (only while nothing has been
+// paid), or status overdue/cancelled/pending. An invoice becomes "paid" only by recording
+// payments against it (Payments → Record Payment, or Billing → Record Payment), so
+// revenue, receipts and the customer's paid-until date always agree.
 func (h *Handler) UpdateInvoice(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -173,40 +255,86 @@ func (h *Handler) UpdateInvoice(c *gin.Context) {
 		Status  string  `json:"status"`
 		Amount  float64 `json:"amount"`
 		DueDate string  `json:"due_date"`
-		Notes   string  `json:"notes"`
+		Notes   *string `json:"notes"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	switch req.Status {
+	case "", "pending", "overdue", "cancelled":
+	case "paid":
+		respondError(c, http.StatusBadRequest, "record a payment against the invoice to mark it paid")
+		return
+	default:
+		respondError(c, http.StatusBadRequest, "status must be pending, overdue or cancelled")
+		return
+	}
 
-	var paidAt interface{}
-	if req.Status == "paid" {
-		paidAt = time.Now()
+	var cur string
+	var paid float64
+	if err := h.db.QueryRow(`SELECT status, COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id=$1 AND status='confirmed'),0)
+		FROM invoices WHERE id=$1`, id).Scan(&cur, &paid); err != nil {
+		respondError(c, http.StatusNotFound, "invoice not found")
+		return
+	}
+	if cur == "paid" || cur == "cancelled" {
+		respondError(c, http.StatusConflict, "paid and cancelled invoices cannot be edited; reverse the payment first")
+		return
+	}
+	if paid > 0 && (req.Amount > 0 || req.Status == "cancelled") {
+		respondError(c, http.StatusConflict, "this invoice has payments; reverse them before changing the amount or cancelling")
+		return
 	}
 
 	var dueDate interface{}
 	if req.DueDate != "" {
+		if _, err := time.Parse("2006-01-02", req.DueDate); err != nil {
+			respondError(c, http.StatusBadRequest, "due_date must be YYYY-MM-DD")
+			return
+		}
 		dueDate = req.DueDate
 	}
+	var notes interface{}
+	if req.Notes != nil {
+		notes = *req.Notes
+	}
 
-	h.db.Exec(`UPDATE invoices SET status=COALESCE(NULLIF($1,''),status),
-		amount=CASE WHEN $2>0 THEN $2 ELSE amount END,
+	if _, err := h.db.Exec(`UPDATE invoices SET status=COALESCE(NULLIF($1,''),status),
+		amount=CASE WHEN $2::numeric > 0 THEN $2::numeric ELSE amount END,
 		due_date=COALESCE($3::date,due_date),
-		notes=COALESCE(NULLIF($4,''),notes),
-		paid_at=COALESCE($5,paid_at), updated_at=NOW() WHERE id=$6`,
-		req.Status, req.Amount, dueDate, req.Notes, paidAt, id)
-
+		notes=COALESCE($4,notes),
+		updated_at=NOW() WHERE id=$5`,
+		req.Status, req.Amount, dueDate, notes, id); err != nil {
+		h.log.WithError(err).Error("update invoice")
+		respondError(c, http.StatusInternalServerError, "failed to update invoice")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "invoice updated"})
 }
 
-// DeleteInvoice removes an invoice.
+// DeleteInvoice removes an invoice that has never been paid. Invoices with payments are
+// kept for the record: cancel them (after reversing payments) instead.
 func (h *Handler) DeleteInvoice(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM invoices WHERE id=$1`, id)
+	var payments int
+	h.db.QueryRow(`SELECT COUNT(*) FROM payments WHERE invoice_id=$1`, id).Scan(&payments)
+	if payments > 0 {
+		respondError(c, http.StatusConflict, "invoice has payments recorded; cancel it instead of deleting")
+		return
+	}
+	res, err := h.db.Exec(`DELETE FROM invoices WHERE id=$1`, id)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete invoice")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		respondError(c, http.StatusNotFound, "invoice not found")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "invoice deleted"})
 }

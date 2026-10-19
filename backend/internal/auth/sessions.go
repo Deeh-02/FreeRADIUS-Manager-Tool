@@ -4,9 +4,9 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"os"
-	"strconv"
 	"time"
+
+	"github.com/freeradius-manager/backend/internal/settings"
 )
 
 // A "session" is a login on one device. Its id is copied into the JWT and into every
@@ -22,42 +22,18 @@ func GenerateSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// SessionTimeout returns how long a session stays valid with no API activity before logout.
+// SessionTimeout returns how long a session stays valid with no API activity before logout:
+// Settings page "session_timeout" (seconds), else SESSION_TIMEOUT, else one hour.
 func SessionTimeout() time.Duration {
-	raw := os.Getenv("SESSION_TIMEOUT")
-	if raw == "" {
-		return time.Hour
-	}
-	secs, err := strconv.Atoi(raw)
-	if err != nil || secs < 60 {
-		return time.Hour
+	secs := settings.Int("session_timeout", "SESSION_TIMEOUT", 3600)
+	if secs < 60 {
+		secs = 3600
 	}
 	return time.Duration(secs) * time.Second
 }
 
-// NOTE: SessionConcurrentBlock / HasActiveSession implement the older "single active
-// session" rule. Login (handlers/auth.go) no longer calls HasActiveSession since
-// multi-device login was enabled, so this pair is currently unused.
-//
-// SessionConcurrentBlock returns how recently the account must have been used to
-// reject a second login. After this idle period the previous session is treated
-// as closed (browser tab closed without sign-out).
-func SessionConcurrentBlock() time.Duration {
-	raw := os.Getenv("SESSION_CONCURRENT_BLOCK")
-	if raw == "" {
-		return 5 * time.Minute
-	}
-	if d, err := time.ParseDuration(raw); err == nil && d >= time.Minute {
-		return d
-	}
-	if secs, err := strconv.Atoi(raw); err == nil && secs >= 60 {
-		return time.Duration(secs) * time.Second
-	}
-	return 5 * time.Minute
-}
-
-// RevokeAllUserSessions invalidates every active session for a user (currently unused;
-// ChangePassword does the same revoke with its own inline UPDATE).
+// RevokeAllUserSessions invalidates every active session for a user (password change,
+// account disabled, MFA reset).
 func RevokeAllUserSessions(db *sql.DB, userID int) {
 	db.Exec(`UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1 AND revoked = FALSE`, userID)
 }
@@ -73,40 +49,40 @@ func RevokeSession(db *sql.DB, userID int, sessionID string) {
 		userID, sessionID)
 }
 
-// HasActiveSession reports whether the user is actively signed in elsewhere
-// (API activity within the concurrent block window).
-func HasActiveSession(db *sql.DB, userID int) (bool, error) {
-	cutoff := time.Now().Add(-SessionConcurrentBlock())
-	var exists bool
-	err := db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM refresh_tokens
-			WHERE user_id = $1
-			  AND revoked = FALSE
-			  AND session_id <> ''
-			  AND expires_at > NOW()
-			  AND last_activity > $2
-		)`, userID, cutoff).Scan(&exists)
-	return exists, err
+// SessionState is the live account state behind a valid JWT.
+type SessionState struct {
+	Active     bool   // session unrevoked, not idle-expired, and the account is enabled
+	Role       string // current role from app_users (a demotion applies immediately)
+	MFAEnabled bool
 }
 
-// ValidateSession checks that the JWT session is still valid (not revoked or idle-expired).
-func ValidateSession(db *sql.DB, userID int, sessionID string) (bool, error) {
+// ValidateSession checks that the JWT session is still valid (not revoked or idle-expired)
+// and that the account is still enabled, returning its current role.
+func ValidateSession(db *sql.DB, userID int, sessionID string) (SessionState, error) {
+	var st SessionState
 	if sessionID == "" {
-		return false, nil
+		return st, nil
 	}
 	idleCutoff := time.Now().Add(-SessionTimeout())
-	var exists bool
 	err := db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM refresh_tokens
-			WHERE user_id = $1
-			  AND session_id = $2
-			  AND revoked = FALSE
-			  AND expires_at > NOW()
-			  AND last_activity > $3
-		)`, userID, sessionID, idleCutoff).Scan(&exists)
-	return exists, err
+		SELECT au.role, au.mfa_enabled
+		FROM refresh_tokens rt
+		JOIN app_users au ON au.id = rt.user_id
+		WHERE rt.user_id = $1
+		  AND rt.session_id = $2
+		  AND rt.revoked = FALSE
+		  AND rt.expires_at > NOW()
+		  AND rt.last_activity > $3
+		  AND au.is_active = TRUE
+		LIMIT 1`, userID, sessionID, idleCutoff).Scan(&st.Role, &st.MFAEnabled)
+	if err == sql.ErrNoRows {
+		return st, nil
+	}
+	if err != nil {
+		return st, err
+	}
+	st.Active = true
+	return st, nil
 }
 
 // TouchSession updates last_activity for the active session.

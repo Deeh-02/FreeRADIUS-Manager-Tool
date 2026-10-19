@@ -23,7 +23,7 @@ type HotspotZone struct {
 // ListZones returns all hotspot zones with live stats.
 // Active users are matched by comparing radacct.nasipaddress (as text) to nas.nasname, so a
 // NAS registered by hostname or CIDR instead of its plain IP never matches and shows 0.
-// max_clients is stored but not enforced anywhere. The nas.zone_id column is not in init-db.sql.
+// max_clients is stored but not enforced anywhere. (nas.zone_id is added by migration 010.)
 func (h *Handler) ListZones(c *gin.Context) {
 	rows, err := h.db.Query(`
 		SELECT z.id, z.name, z.description, z.location, z.max_clients, z.is_active, z.created_at,

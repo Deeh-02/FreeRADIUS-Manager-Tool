@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -108,16 +110,52 @@ func RefreshExpiry() time.Duration {
 	return d
 }
 
-// getJWTSecret falls back to a hard-coded string when JWT_SECRET is unset. Anyone who
-// knows that string can forge admin tokens, so production must always set JWT_SECRET
-// (docker-compose also supplies a well-known default if .env omits it).
-func getJWTSecret() string {
-	s := os.Getenv("JWT_SECRET")
-	if s == "" {
-		return "change-this-in-production-very-insecure"
-	}
-	return s
+// knownWeakSecrets are values that have shipped in this repository's examples and defaults.
+// Anyone who knows the signing key can forge an admin token, so these are refused.
+var knownWeakSecrets = map[string]bool{
+	"change-this-in-production-very-insecure":                        true,
+	"change-this-super-secret-jwt-key-in-production":                 true,
+	"CHANGE_ME_GENERATE_WITH_openssl_rand_base64_48":                 true,
+	"your-super-secret-jwt-key-change-in-production":                 true,
+	"change-this-to-a-very-long-random-secret-key-at-least-64-chars": true,
+	"changeme": true,
+	"secret":   true,
 }
+
+// CheckJWTSecret reports why JWT_SECRET is unusable, or nil. main() refuses to start on an
+// error unless APP_ENV=development.
+func CheckJWTSecret() error {
+	s := os.Getenv("JWT_SECRET")
+	switch {
+	case s == "":
+		return errors.New("JWT_SECRET is not set")
+	case knownWeakSecrets[s], strings.HasPrefix(strings.ToUpper(s), "CHANGE_ME"):
+		return errors.New("JWT_SECRET is a published example value")
+	case len(s) < 32:
+		return errors.New("JWT_SECRET must be at least 32 characters")
+	}
+	return nil
+}
+
+// getJWTSecret returns JWT_SECRET. In development only (CheckJWTSecret is skipped there) an
+// unset secret falls back to a per-process random key, so tokens die on restart instead of
+// being forgeable.
+func getJWTSecret() string {
+	if s := os.Getenv("JWT_SECRET"); s != "" {
+		return s
+	}
+	devSecretOnce.Do(func() {
+		b := make([]byte, 32)
+		rand.Read(b)
+		devSecret = hex.EncodeToString(b)
+	})
+	return devSecret
+}
+
+var (
+	devSecret     string
+	devSecretOnce sync.Once
+)
 
 // AccessExpiry returns the access token duration.
 func AccessExpiry() time.Duration {

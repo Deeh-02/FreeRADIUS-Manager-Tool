@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"strconv"
 	strs "strings"
 	"time"
@@ -13,8 +14,30 @@ import (
 	"github.com/freeradius-manager/backend/internal/auth"
 	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/freeradius-manager/backend/internal/models"
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 )
+
+// radiusUserColumns are selected by List/Get. Nullable text columns are COALESCEd: scanning
+// NULL into a Go string fails, which used to drop such users from the list silently.
+const radiusUserColumns = `
+	ru.id, ru.username, COALESCE(ru.email,''), COALESCE(ru.full_name,''), COALESCE(ru.department,''),
+	COALESCE(ru.phone,''), COALESCE(ru.notes,''),
+	ru.status, ru.device_limit, ru.account_expiry, ru.password_expiry,
+	COALESCE(ru.force_password_change,false), ru.plan_id, up.name, up.price, up.currency,
+	(SELECT COUNT(*) FROM invoices i WHERE i.user_id = ru.id AND i.status IN ('pending','overdue')),
+	ru.created_by, au.username, ru.created_at, ru.updated_at,
+	(SELECT COUNT(*) FROM radacct ra WHERE ra.username = ru.username AND ra.acctstoptime IS NULL)`
+
+func scanRadiusUser(scan func(...interface{}) error, u *models.RadiusUser) error {
+	var createdBy sql.NullString
+	err := scan(&u.ID, &u.Username, &u.Email, &u.FullName, &u.Department, &u.Phone, &u.Notes,
+		&u.Status, &u.DeviceLimit, &u.AccountExpiry, &u.PasswordExpiry,
+		&u.ForcePasswordChange, &u.PlanID, &u.PlanName, &u.PlanPrice, &u.PlanCurrency, &u.OpenInvoices,
+		&u.CreatedBy, &createdBy, &u.CreatedAt, &u.UpdatedAt, &u.ActiveSessions)
+	u.CreatedByUsername = createdBy.String
+	return err
+}
 
 // ListRadiusUsers returns paginated RADIUS users with optional filters.
 func (h *Handler) ListRadiusUsers(c *gin.Context) {
@@ -23,15 +46,14 @@ func (h *Handler) ListRadiusUsers(c *gin.Context) {
 	status := c.Query("status")
 	department := c.Query("department")
 
-	// Build WHERE clause and shared args
 	where := "WHERE 1=1"
 	filterArgs := []interface{}{}
 	argN := 1
 
 	if search != "" {
 		where += fmt.Sprintf(
-			` AND (ru.username ILIKE $%d OR ru.email ILIKE $%d OR ru.full_name ILIKE $%d)`,
-			argN, argN, argN,
+			` AND (ru.username ILIKE $%d OR ru.email ILIKE $%d OR ru.full_name ILIKE $%d OR ru.phone ILIKE $%d)`,
+			argN, argN, argN, argN,
 		)
 		filterArgs = append(filterArgs, "%"+search+"%")
 		argN++
@@ -47,28 +69,18 @@ func (h *Handler) ListRadiusUsers(c *gin.Context) {
 		argN++
 	}
 
-	// Count query
-	countSQL := fmt.Sprintf(`SELECT COUNT(*) FROM radius_users ru %s`, where)
 	var total int
-	h.db.QueryRow(countSQL, filterArgs...).Scan(&total)
+	h.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM radius_users ru %s`, where), filterArgs...).Scan(&total)
 
-	// Data query
 	dataArgs := append(filterArgs, limit, offset)
-	dataSQL := fmt.Sprintf(`
-		SELECT ru.id, ru.username, ru.email, ru.full_name, ru.department,
-		       ru.status, ru.device_limit, ru.account_expiry, ru.password_expiry,
-		       ru.force_password_change, ru.created_by, au.username,
-		       ru.created_at, ru.updated_at,
-		       COUNT(ra.radacctid) FILTER (WHERE ra.acctstoptime IS NULL)
+	rows, err := h.db.Query(fmt.Sprintf(`
+		SELECT %s
 		FROM radius_users ru
 		LEFT JOIN app_users au ON au.id = ru.created_by
-		LEFT JOIN radacct ra ON ra.username = ru.username
+		LEFT JOIN user_plans up ON up.id = ru.plan_id
 		%s
-		GROUP BY ru.id, au.username
 		ORDER BY ru.created_at DESC
-		LIMIT $%d OFFSET $%d`, where, argN, argN+1)
-
-	rows, err := h.db.Query(dataSQL, dataArgs...)
+		LIMIT $%d OFFSET $%d`, radiusUserColumns, where, argN, argN+1), dataArgs...)
 	if err != nil {
 		h.log.WithError(err).Error("list radius users query failed")
 		respondError(c, http.StatusInternalServerError, "failed to fetch users")
@@ -79,17 +91,10 @@ func (h *Handler) ListRadiusUsers(c *gin.Context) {
 	users := []models.RadiusUser{}
 	for rows.Next() {
 		var u models.RadiusUser
-		var createdByUsername sql.NullString
-		if err := rows.Scan(
-			&u.ID, &u.Username, &u.Email, &u.FullName, &u.Department,
-			&u.Status, &u.DeviceLimit, &u.AccountExpiry, &u.PasswordExpiry,
-			&u.ForcePasswordChange, &u.CreatedBy, &createdByUsername,
-			&u.CreatedAt, &u.UpdatedAt, &u.ActiveSessions,
-		); err != nil {
+		if err := scanRadiusUser(rows.Scan, &u); err != nil {
 			h.log.WithError(err).Warn("scan radius user row")
 			continue
 		}
-		u.CreatedByUsername = createdByUsername.String
 		users = append(users, u)
 	}
 
@@ -108,46 +113,64 @@ func (h *Handler) GetRadiusUser(c *gin.Context) {
 	}
 
 	var u models.RadiusUser
-	var createdByUsername sql.NullString
-	err = h.db.QueryRow(`
-		SELECT ru.id, ru.username, ru.email, ru.full_name, ru.department,
-		       ru.status, ru.device_limit, ru.account_expiry, ru.password_expiry,
-		       ru.force_password_change, ru.created_by, au.username,
-		       ru.created_at, ru.updated_at
+	err = scanRadiusUser(h.db.QueryRow(fmt.Sprintf(`
+		SELECT %s
 		FROM radius_users ru
 		LEFT JOIN app_users au ON au.id = ru.created_by
-		WHERE ru.id = $1`, id,
-	).Scan(
-		&u.ID, &u.Username, &u.Email, &u.FullName, &u.Department,
-		&u.Status, &u.DeviceLimit, &u.AccountExpiry, &u.PasswordExpiry,
-		&u.ForcePasswordChange, &u.CreatedBy, &createdByUsername,
-		&u.CreatedAt, &u.UpdatedAt,
-	)
+		LEFT JOIN user_plans up ON up.id = ru.plan_id
+		WHERE ru.id = $1`, radiusUserColumns), id).Scan, &u)
 
 	if err == sql.ErrNoRows {
 		respondError(c, http.StatusNotFound, "user not found")
 		return
 	}
 	if err != nil {
+		h.log.WithError(err).Error("get radius user")
 		respondError(c, http.StatusInternalServerError, "database error")
 		return
 	}
-	u.CreatedByUsername = createdByUsername.String
-
 	c.JSON(http.StatusOK, u)
 }
 
-// CreateRadiusUser creates a new RADIUS network-access user.
+func validEmail(s string) bool {
+	if s == "" {
+		return true
+	}
+	a, err := mail.ParseAddress(s)
+	return err == nil && a.Address == s
+}
+
+func parseDateParam(s string) (*time.Time, error) {
+	if s == "" {
+		return nil, nil
+	}
+	t, err := time.Parse("2006-01-02", s)
+	if err != nil {
+		return nil, fmt.Errorf("date must be YYYY-MM-DD")
+	}
+	return &t, nil
+}
+
+// CreateRadiusUser creates a new RADIUS network-access user, optionally on a plan (plan_id,
+// start_now, promo_code as in AssignPlan).
 func (h *Handler) CreateRadiusUser(c *gin.Context) {
 	var req models.CreateRadiusUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	// RADIUS users use plain password validation (min 6 chars enforced by binding tag)
+	req.Username = strs.TrimSpace(req.Username)
 	if req.DeviceLimit == 0 {
 		req.DeviceLimit = 1
+	}
+	if max := settings.Int("max_device_limit", "", 500); max > 0 && req.DeviceLimit > max {
+		respondError(c, http.StatusBadRequest, fmt.Sprintf("device limit cannot exceed %d (Settings → max_device_limit)", max))
+		return
+	}
+	expiry, err := parseDateParam(derefStr(req.AccountExpiry))
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "account_expiry: "+err.Error())
+		return
 	}
 
 	hashedPw, err := auth.HashPassword(req.Password)
@@ -155,18 +178,8 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "failed to hash password")
 		return
 	}
-
 	claims, _ := middleware.GetClaims(c)
-
-	var accountExpiry interface{}
-	if req.AccountExpiry != nil && *req.AccountExpiry != "" {
-		accountExpiry = *req.AccountExpiry
-	}
-
-	// Default password expiry (from settings, fallback 90 days).
-	// NOTE: always 90 days — the password_expiry_days setting is never read. Nothing in this
-	// repo enforces password_expiry or force_password_change when a RADIUS user connects.
-	passwordExpiry := time.Now().AddDate(0, 0, 90).Format("2006-01-02")
+	passwordExpiry := time.Now().AddDate(0, 0, settings.Int("password_expiry_days", "", 90)).Format("2006-01-02")
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -177,14 +190,14 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 
 	var newID int
 	err = tx.QueryRow(`
-		INSERT INTO radius_users (username, password, email, full_name, department,
+		INSERT INTO radius_users (username, password, email, full_name, department, phone, notes,
 		    device_limit, account_expiry, password_expiry, force_password_change, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id`,
-		req.Username, hashedPw, req.Email, req.FullName, req.Department,
-		req.DeviceLimit, accountExpiry, passwordExpiry, req.ForcePasswordChange, claims.UserID,
+		req.Username, hashedPw, nullableString(req.Email), nullableString(req.FullName),
+		nullableString(req.Department), nullableString(req.Phone), nullableString(req.Notes),
+		req.DeviceLimit, expiry, passwordExpiry, req.ForcePasswordChange, claims.UserID,
 	).Scan(&newID)
-
 	if err != nil {
 		if isUniqueViolation(err) {
 			respondError(c, http.StatusConflict, "username already exists")
@@ -195,47 +208,48 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 		return
 	}
 
-	// Insert into radcheck for FreeRADIUS (Cleartext-Password for PAP/CHAP/EAP).
-	// The bcrypt hash in radius_users.password only serves the self-service portal and
-	// password history; this plaintext copy is what FreeRADIUS authenticates against, so
-	// anyone who can read radcheck can read every customer's network password.
-	_, err = tx.Exec(`
-		INSERT INTO radcheck (username, attribute, op, value)
-		VALUES ($1, 'Cleartext-Password', ':=', $2)
-		ON CONFLICT (username, attribute) DO UPDATE SET value = $2`,
-		req.Username, req.Password,
-	)
-	if err != nil {
-		h.log.WithError(err).Error("insert radcheck failed")
+	// Cleartext-Password is what FreeRADIUS authenticates against (PAP/CHAP/MS-CHAP need the
+	// plain password). The bcrypt hash in radius_users.password only serves the self-service
+	// portal and password history, so protect read access to radcheck accordingly.
+	if err := setCheck(tx, req.Username, "Cleartext-Password", ":=", req.Password); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to configure RADIUS attributes")
+		return
+	}
+	if err := syncAccess(tx, req.Username); err != nil {
+		h.log.WithError(err).Error("sync access")
 		respondError(c, http.StatusInternalServerError, "failed to configure RADIUS attributes")
 		return
 	}
 
-	// Simultaneous-Use for device limiting. Enforced by FreeRADIUS, not this API:
-	// sites-available/default runs `session { sql }`, which compares the open radacct
-	// rows for the user (simul_count_query) against this value.
-	_, err = tx.Exec(`
-		INSERT INTO radcheck (username, attribute, op, value)
-		VALUES ($1, 'Simultaneous-Use', ':=', $2)
-		ON CONFLICT (username, attribute) DO UPDATE SET value = $2`,
-		req.Username, strconv.Itoa(req.DeviceLimit),
-	)
-	if err != nil {
-		h.log.WithError(err).Warn("insert Simultaneous-Use failed")
+	msg := "RADIUS user created successfully"
+	var invoiceID int
+	if req.PlanID != nil {
+		res, err := assignPlanTx(tx, newID, req.Username, *req.PlanID, req.StartNow, req.PromoCode, &claims.UserID)
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "plan: "+err.Error())
+			return
+		}
+		msg, invoiceID = res.Message, res.InvoiceID
 	}
 
 	if err := tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to save user")
 		return
 	}
-
-	c.JSON(http.StatusCreated, gin.H{
-		"id":      newID,
-		"message": "RADIUS user created successfully",
-	})
+	go h.dispatchWebhook("user.created", gin.H{"id": newID, "username": req.Username, "plan_id": req.PlanID})
+	c.JSON(http.StatusCreated, gin.H{"id": newID, "message": msg, "invoice_id": invoiceID})
 }
 
-// UpdateRadiusUser updates a RADIUS user's non-password fields.
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// UpdateRadiusUser updates a RADIUS user's non-password fields. Changing the expiry or
+// device limit is written to radcheck in the same transaction; moving the expiry into the
+// future re-activates an expired account.
 func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -248,8 +262,17 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.Email != nil && !validEmail(strs.TrimSpace(*req.Email)) {
+		respondError(c, http.StatusBadRequest, "invalid email address")
+		return
+	}
+	if req.DeviceLimit != nil {
+		if max := settings.Int("max_device_limit", "", 500); max > 0 && *req.DeviceLimit > max {
+			respondError(c, http.StatusBadRequest, fmt.Sprintf("device limit cannot exceed %d", max))
+			return
+		}
+	}
 
-	// Fetch current username for radcheck update
 	var username string
 	if err := h.db.QueryRow(`SELECT username FROM radius_users WHERE id = $1`, id).Scan(&username); err != nil {
 		if err == sql.ErrNoRows {
@@ -260,6 +283,19 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 		return
 	}
 
+	setExpiry, clearExpiry := false, false
+	var expiry *time.Time
+	if req.AccountExpiry != nil {
+		if *req.AccountExpiry == "" {
+			clearExpiry = true
+		} else if expiry, err = parseDateParam(*req.AccountExpiry); err != nil {
+			respondError(c, http.StatusBadRequest, "account_expiry: "+err.Error())
+			return
+		} else {
+			setExpiry = true
+		}
+	}
+
 	tx, err := h.db.Begin()
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to begin transaction")
@@ -267,40 +303,55 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
+	text := func(p *string) interface{} {
+		if p == nil {
+			return nil
+		}
+		return strs.TrimSpace(*p)
+	}
 	_, err = tx.Exec(`
 		UPDATE radius_users
-		SET email                = COALESCE(NULLIF($1, ''), email),
-		    full_name            = COALESCE(NULLIF($2, ''), full_name),
-		    department           = COALESCE(NULLIF($3, ''), department),
-		    device_limit         = COALESCE($4, device_limit),
-		    account_expiry       = COALESCE($5::date, account_expiry),
-		    force_password_change = COALESCE($6, force_password_change),
-		    updated_at           = NOW()
-		WHERE id = $7`,
-		req.Email, req.FullName, req.Department,
-		req.DeviceLimit, req.AccountExpiry,
-		req.ForcePasswordChange, id,
+		SET email                 = CASE WHEN $1::text IS NULL THEN email ELSE NULLIF($1, '') END,
+		    full_name             = CASE WHEN $2::text IS NULL THEN full_name ELSE NULLIF($2, '') END,
+		    department            = CASE WHEN $3::text IS NULL THEN department ELSE NULLIF($3, '') END,
+		    phone                 = CASE WHEN $4::text IS NULL THEN phone ELSE NULLIF($4, '') END,
+		    notes                 = CASE WHEN $5::text IS NULL THEN notes ELSE NULLIF($5, '') END,
+		    device_limit          = COALESCE($6, device_limit),
+		    account_expiry        = CASE WHEN $7 THEN NULL WHEN $8 THEN $9::date ELSE account_expiry END,
+		    force_password_change = COALESCE($10, force_password_change),
+		    updated_at            = NOW()
+		WHERE id = $11`,
+		text(req.Email), text(req.FullName), text(req.Department), text(req.Phone), text(req.Notes),
+		req.DeviceLimit, clearExpiry, setExpiry, expiry, req.ForcePasswordChange, id,
 	)
 	if err != nil {
+		h.log.WithError(err).Error("update radius user")
 		respondError(c, http.StatusInternalServerError, "failed to update user")
 		return
 	}
-
-	// Update Simultaneous-Use if device_limit changed
-	if req.DeviceLimit != nil {
-		tx.Exec(`
-			INSERT INTO radcheck (username, attribute, op, value)
-			VALUES ($1, 'Simultaneous-Use', ':=', $2)
-			ON CONFLICT (username, attribute) DO UPDATE SET value = $2`,
-			username, strconv.Itoa(*req.DeviceLimit),
-		)
+	// An expiry moved into the future (or cleared) lifts an automatic expiry block; a manual
+	// suspension stays until Activate is pressed.
+	if setExpiry || clearExpiry {
+		if _, err := tx.Exec(`UPDATE radius_users SET status = 'active'
+			WHERE id = $1 AND status = 'expired' AND (account_expiry IS NULL OR account_expiry + $2::int >= CURRENT_DATE)`,
+			id, graceDays()); err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to update status")
+			return
+		}
 	}
-
-	tx.Commit()
+	if err := syncAccess(tx, username); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update RADIUS attributes")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to save user")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "user updated successfully"})
 }
 
-// DeleteRadiusUser removes a RADIUS user and all associated RADIUS attributes.
+// DeleteRadiusUser removes a RADIUS user and all associated RADIUS attributes. Invoices and
+// payments keep the username for the record.
 func (h *Handler) DeleteRadiusUser(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -317,6 +368,8 @@ func (h *Handler) DeleteRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "database error")
 		return
 	}
+	// Kick any live session first; otherwise the router keeps the user online.
+	disconnectUserSessions(h.db, username, true)
 
 	tx, err := h.db.Begin()
 	if err != nil {
@@ -324,18 +377,15 @@ func (h *Handler) DeleteRadiusUser(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-
-	tx.Exec(`DELETE FROM radcheck WHERE username = $1`, username)
-	tx.Exec(`DELETE FROM radreply WHERE username = $1`, username)
-	tx.Exec(`DELETE FROM radusergroup WHERE username = $1`, username)
-	tx.Exec(`DELETE FROM radius_user_password_history WHERE user_id = $1`, id)
-	tx.Exec(`DELETE FROM radius_users WHERE id = $1`, id)
-
+	if err := deleteRadiusUserTx(tx, id, username); err != nil {
+		h.log.WithError(err).Error("delete radius user")
+		respondError(c, http.StatusInternalServerError, "failed to delete user")
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to delete user")
 		return
 	}
-
 	c.JSON(http.StatusOK, gin.H{"message": "user deleted successfully"})
 }
 
@@ -353,22 +403,27 @@ func (h *Handler) ResetRadiusUserPassword(c *gin.Context) {
 		return
 	}
 
-	// Check password history
-	rows, _ := h.db.Query(`
+	var username, oldHash string
+	if err := h.db.QueryRow(`SELECT username, password FROM radius_users WHERE id = $1`, id).Scan(&username, &oldHash); err != nil {
+		respondError(c, http.StatusNotFound, "user not found")
+		return
+	}
+
+	// The new password may not be the current one or one of the last five.
+	history := []string{oldHash}
+	rows, err := h.db.Query(`
 		SELECT password_hash FROM radius_user_password_history
 		WHERE user_id = $1
-		ORDER BY changed_at DESC LIMIT 5`, id,
-	)
-	var history []string
-	if rows != nil {
+		ORDER BY changed_at DESC LIMIT 5`, id)
+	if err == nil {
 		for rows.Next() {
-			var h string
-			rows.Scan(&h)
-			history = append(history, h)
+			var hh string
+			if rows.Scan(&hh) == nil {
+				history = append(history, hh)
+			}
 		}
 		rows.Close()
 	}
-
 	if err := auth.CheckPasswordHistory(req.NewPassword, history); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
@@ -380,32 +435,44 @@ func (h *Handler) ResetRadiusUserPassword(c *gin.Context) {
 		return
 	}
 
-	var username string
-	var oldHash string
-	h.db.QueryRow(`SELECT username, password FROM radius_users WHERE id = $1`, id).Scan(&username, &oldHash)
-
-	tx, _ := h.db.Begin()
+	tx, err := h.db.Begin()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "transaction failed")
+		return
+	}
 	defer tx.Rollback()
-
-	tx.Exec(`UPDATE radius_users SET password = $1, password_expiry = NOW() + INTERVAL '90 days', updated_at = NOW() WHERE id = $2`,
-		newHash, id)
-	tx.Exec(`UPDATE radcheck SET value = $1 WHERE username = $2 AND attribute = 'Cleartext-Password'`,
-		req.NewPassword, username)
-	// Save old password to history. The check above compares only against past hashes,
-	// never the current password, so resetting to the same password is accepted.
-	tx.Exec(`INSERT INTO radius_user_password_history (user_id, password_hash) VALUES ($1, $2)`,
-		id, oldHash)
-
-	tx.Commit()
+	days := settings.Int("password_expiry_days", "", 90)
+	for _, step := range []struct {
+		q    string
+		args []interface{}
+	}{
+		{`UPDATE radius_users SET password = $1, password_expiry = CURRENT_DATE + $2::int, updated_at = NOW() WHERE id = $3`,
+			[]interface{}{newHash, days, id}},
+		{`INSERT INTO radius_user_password_history (user_id, password_hash) VALUES ($1, $2)`, []interface{}{id, oldHash}},
+	} {
+		if _, err := tx.Exec(step.q, step.args...); err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to reset password")
+			return
+		}
+	}
+	if err := setCheck(tx, username, "Cleartext-Password", ":=", req.NewPassword); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to reset password")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to reset password")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "password reset successfully"})
 }
 
-// SuspendRadiusUser sets a user's status to suspended.
+// SuspendRadiusUser blocks a user at the RADIUS server and disconnects their sessions.
 func (h *Handler) SuspendRadiusUser(c *gin.Context) {
 	h.setRadiusUserStatus(c, "suspended")
 }
 
-// ActivateRadiusUser sets a user's status to active.
+// ActivateRadiusUser lifts a suspension. A customer whose paid-until date has passed stays
+// blocked (status expired) until they pay or their expiry is changed.
 func (h *Handler) ActivateRadiusUser(c *gin.Context) {
 	h.setRadiusUserStatus(c, "active")
 }
@@ -416,36 +483,58 @@ func (h *Handler) setRadiusUserStatus(c *gin.Context, status string) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-
-	var username string
-	if err := h.db.QueryRow(`SELECT username FROM radius_users WHERE id = $1`, id).Scan(&username); err != nil {
-		if err == sql.ErrNoRows {
-			respondError(c, http.StatusNotFound, "user not found")
-			return
-		}
-		respondError(c, http.StatusInternalServerError, "database error")
+	username, newStatus, err := setUserStatus(h.db, id, status)
+	if err == sql.ErrNoRows {
+		respondError(c, http.StatusNotFound, "user not found")
 		return
 	}
-
-	h.db.Exec(`UPDATE radius_users SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
-
-	// Add/remove Auth-Type := Reject in radcheck to block login.
-	// This row is the only thing that blocks a suspended user at the RADIUS server —
-	// FreeRADIUS never reads radius_users.status. The scheduler's 'expired' status does
-	// NOT write this row, so an expired account can still authenticate (see scheduler.go).
-	if status == "suspended" {
-		h.db.Exec(`
-			INSERT INTO radcheck (username, attribute, op, value)
-			VALUES ($1, 'Auth-Type', ':=', 'Reject')
-			ON CONFLICT (username, attribute) DO UPDATE SET value = 'Reject'`, username)
-	} else {
-		h.db.Exec(`DELETE FROM radcheck WHERE username = $1 AND attribute = 'Auth-Type'`, username)
+	if err != nil {
+		h.log.WithError(err).Error("set user status")
+		respondError(c, http.StatusInternalServerError, "failed to change status")
+		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("user %s successfully", status)})
+	msg := fmt.Sprintf("user %s", newStatus)
+	if status == "suspended" {
+		closed, _ := disconnectUserSessions(h.db, username, false)
+		if closed > 0 {
+			msg += fmt.Sprintf("; %d session(s) disconnected", closed)
+		}
+		go h.dispatchWebhook("user.suspended", gin.H{"id": id, "username": username})
+	} else if newStatus == "expired" {
+		msg = "suspension lifted, but the customer's paid-until date has passed: they stay blocked until they pay"
+	}
+	c.JSON(http.StatusOK, gin.H{"message": msg, "status": newStatus})
 }
 
-// DisconnectRadiusUser sends a RADIUS Disconnect-Request to terminate active sessions.
+// setUserStatus applies suspend/activate and syncs radcheck in one transaction. Activating
+// an account whose paid-until date (plus grace) has passed leaves it 'expired'.
+func setUserStatus(db interface {
+	Begin() (*sql.Tx, error)
+}, id int, status string) (string, string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", "", err
+	}
+	defer tx.Rollback()
+	var username, newStatus string
+	err = tx.QueryRow(`
+		UPDATE radius_users SET status = CASE
+		    WHEN $1 = 'active' AND account_expiry IS NOT NULL AND account_expiry + $3::int < CURRENT_DATE THEN 'expired'
+		    ELSE $1 END,
+		  updated_at = NOW()
+		WHERE id = $2 RETURNING username, status`, status, id, graceDays()).Scan(&username, &newStatus)
+	if err != nil {
+		return "", "", err
+	}
+	if err := syncAccess(tx, username); err != nil {
+		return "", "", err
+	}
+	return username, newStatus, tx.Commit()
+}
+
+// DisconnectRadiusUser sends an RFC 5176 Disconnect-Request to the router for each of the
+// user's open sessions. Rows are closed when the router acknowledges; with ?force=true they
+// are closed regardless (for sessions that ended without a Stop packet).
 func (h *Handler) DisconnectRadiusUser(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -458,35 +547,12 @@ func (h *Handler) DisconnectRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "user not found")
 		return
 	}
-
-	// Get active sessions to find the NAS
-	rows, err := h.db.Query(`
-		SELECT acctsessionid, nasipaddress::text, callingstationid
-		FROM radacct
-		WHERE username = $1 AND acctstoptime IS NULL`, username)
-	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to get sessions")
-		return
-	}
-	defer rows.Close()
-
-	disconnected := 0
-	for rows.Next() {
-		var sessionID, nasIP, callingStation string
-		rows.Scan(&sessionID, &nasIP, &callingStation)
-		// In production: send CoA/Disconnect-Request to NAS
-		// For now, mark session as stopped in DB.
-		// NOTE: no packet is sent, so the user stays connected until the NAS drops
-		// them; only the accounting row is closed (the "disconnected N" count is DB rows).
-		h.db.Exec(`
-			UPDATE radacct SET acctstoptime = NOW(), acctterminatecause = 'Admin-Reset'
-			WHERE acctsessionid = $1`, sessionID)
-		disconnected++
-	}
-
+	force := c.Query("force") == "true"
+	closed, msgs := disconnectUserSessions(h.db, username, force)
 	c.JSON(http.StatusOK, gin.H{
-		"message":      fmt.Sprintf("disconnected %d active session(s)", disconnected),
-		"disconnected": disconnected,
+		"message":      fmt.Sprintf("%d session(s) closed", closed),
+		"disconnected": closed,
+		"details":      msgs,
 	})
 }
 
@@ -499,12 +565,15 @@ func (h *Handler) RadiusUserSessions(c *gin.Context) {
 	}
 
 	var username string
-	h.db.QueryRow(`SELECT username FROM radius_users WHERE id = $1`, id).Scan(&username)
+	if err := h.db.QueryRow(`SELECT username FROM radius_users WHERE id = $1`, id).Scan(&username); err != nil {
+		respondError(c, http.StatusNotFound, "user not found")
+		return
+	}
 
 	rows, err := h.db.Query(`
-		SELECT acctsessionid, username, nasipaddress::text, nasportid,
-		       framedipaddress::text, callingstationid, calledstationid,
-		       acctstarttime, acctsessiontime, acctinputoctets, acctoutputoctets,
+		SELECT acctsessionid, username, host(nasipaddress), nasportid,
+		       host(framedipaddress), callingstationid, calledstationid,
+		       acctstarttime, COALESCE(acctsessiontime,0), COALESCE(acctinputoctets,0), COALESCE(acctoutputoctets,0),
 		       acctstoptime, acctterminatecause
 		FROM radacct
 		WHERE username = $1
@@ -536,12 +605,14 @@ func (h *Handler) RadiusUserSessions(c *gin.Context) {
 	sessions := []Session{}
 	for rows.Next() {
 		var s Session
-		rows.Scan(
+		if err := rows.Scan(
 			&s.SessionID, &s.Username, &s.NASIPAddress, &s.NASPortID,
 			&s.FramedIP, &s.CallingStation, &s.CalledStation,
 			&s.StartTime, &s.Duration, &s.InputBytes, &s.OutputBytes,
 			&s.StopTime, &s.TermCause,
-		)
+		); err != nil {
+			continue
+		}
 		s.Active = s.StopTime == nil
 		sessions = append(sessions, s)
 	}
@@ -550,6 +621,12 @@ func (h *Handler) RadiusUserSessions(c *gin.Context) {
 }
 
 // ImportRadiusUsers handles bulk CSV import of RADIUS users.
+//
+// Required columns: username, password. Optional: email, full_name, department, phone,
+// device_limit, expiry (YYYY-MM-DD), validity_days (used when expiry is empty; blank or 0
+// means never expires), plan_name, data_limit_mb, notes (or description). With plan_name the
+// plan's limits are applied; its period is NOT billed or started (set expiry for that).
+// Each row is its own transaction, so one bad row does not stop the rest.
 func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 	file, _, err := c.Request.FormFile("file")
 	if err != nil {
@@ -562,8 +639,8 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 
 	reader := csv.NewReader(file)
 	reader.TrimLeadingSpace = true
+	reader.FieldsPerRecord = -1
 
-	// Read header
 	header, err := reader.Read()
 	if err != nil {
 		respondError(c, http.StatusBadRequest, "failed to read CSV header")
@@ -572,15 +649,13 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 
 	colIdx := map[string]int{}
 	for i, col := range header {
-		colIdx[strs.ToLower(strs.TrimSpace(col))] = i
+		colIdx[strs.ToLower(strs.TrimSpace(strs.TrimPrefix(col, "\ufeff")))] = i
 	}
-	if _, ok := colIdx["username"]; !ok {
-		respondError(c, http.StatusBadRequest, "CSV must have a 'username' column")
-		return
-	}
-	if _, ok := colIdx["password"]; !ok {
-		respondError(c, http.StatusBadRequest, "CSV must have a 'password' column")
-		return
+	for _, need := range []string{"username", "password"} {
+		if _, ok := colIdx[need]; !ok {
+			respondError(c, http.StatusBadRequest, fmt.Sprintf("CSV must have a '%s' column", need))
+			return
+		}
 	}
 
 	type RowResult struct {
@@ -593,6 +668,7 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 	results := []RowResult{}
 	created, skipped, failed := 0, 0, 0
 	rowNum := 1
+	passwordExpiry := time.Now().AddDate(0, 0, settings.Int("password_expiry_days", "", 90)).Format("2006-01-02")
 
 	for {
 		record, err := reader.Read()
@@ -601,9 +677,14 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 		}
 		rowNum++
 		if err != nil {
-			results = append(results, RowResult{rowNum, "", "error", "parse error"})
+			results = append(results, RowResult{rowNum, "", "error", "parse error: " + err.Error()})
 			failed++
 			continue
+		}
+		if rowNum > 10001 {
+			results = append(results, RowResult{rowNum, "", "error", "import stops at 10000 rows"})
+			failed++
+			break
 		}
 
 		get := func(col string) string {
@@ -616,82 +697,112 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 
 		username := get("username")
 		password := get("password")
-		if username == "" || password == "" {
+		switch {
+		case username == "" || password == "":
 			results = append(results, RowResult{rowNum, username, "skip", "empty username or password"})
 			skipped++
 			continue
-		}
-		if len(password) < 6 {
+		case len(password) < 6:
 			results = append(results, RowResult{rowNum, username, "skip", "password too short (min 6)"})
+			skipped++
+			continue
+		case strs.ContainsAny(username, " '\"\\"):
+			results = append(results, RowResult{rowNum, username, "skip", "username may not contain spaces or quotes"})
+			skipped++
+			continue
+		case !validEmail(get("email")):
+			results = append(results, RowResult{rowNum, username, "skip", "invalid email"})
 			skipped++
 			continue
 		}
 
-		hash, _ := auth.HashPassword(password)
-		email := get("email")
-		description := get("description")
-		validityStr := get("validity_days")
-		dataLimitStr := get("data_limit_mb")
-
-		validityDays := 30
-		if validityStr != "" {
-			fmt.Sscanf(validityStr, "%d", &validityDays)
-		}
-		var dataLimitMB *int64
-		if dataLimitStr != "" {
-			var dm int64
-			fmt.Sscanf(dataLimitStr, "%d", &dm)
-			if dm > 0 {
-				dataLimitMB = &dm
+		deviceLimit := 1
+		if v := get("device_limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 500 {
+				deviceLimit = n
 			}
 		}
-
-		var accountExpiry *string
-		if validityDays > 0 {
-			exp := time.Now().AddDate(0, 0, validityDays).Format("2006-01-02")
-			accountExpiry = &exp
-		}
-
-		var planID *int
-		if planName := get("plan_name"); planName != "" {
-			var pid int
-			if err := h.db.QueryRow(`SELECT id FROM user_plans WHERE LOWER(name)=LOWER($1)`, planName).Scan(&pid); err == nil {
-				planID = &pid
-			}
-		}
-
-		var newID int
-		// NOTE: this INSERT names a `description` column, but radius_users has none in
-		// init-db.sql or any migration, so it is expected to fail for every row (reported as
-		// "error" per row). The import also skips Simultaneous-Use, password_expiry and the
-		// plan's own radcheck/radreply attributes (it only sets plan_id).
-		insertErr := h.db.QueryRow(`
-			INSERT INTO radius_users (username, email, password, description, status, account_expiry, plan_id, created_by)
-			VALUES ($1,$2,$3,$4,'active',$5,$6,$7) RETURNING id`,
-			username, nullableString(email), hash,
-			nullableString(description), accountExpiry, planID, claims.UserID,
-		).Scan(&newID)
-
-		if insertErr != nil {
-			if isUniqueViolation(insertErr) {
-				results = append(results, RowResult{rowNum, username, "skip", "username already exists"})
+		var expiry *time.Time
+		if v := get("expiry"); v != "" {
+			if expiry, err = parseDateParam(v); err != nil {
+				results = append(results, RowResult{rowNum, username, "skip", "expiry must be YYYY-MM-DD"})
 				skipped++
 				continue
 			}
-			results = append(results, RowResult{rowNum, username, "error", insertErr.Error()})
+		} else if v := get("validity_days"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				t := time.Now().AddDate(0, 0, n)
+				expiry = &t
+			}
+		}
+		var plan *planRow
+		if planName := get("plan_name"); planName != "" {
+			var pid int
+			if err := h.db.QueryRow(`SELECT id FROM user_plans WHERE LOWER(name)=LOWER($1)`, planName).Scan(&pid); err != nil {
+				results = append(results, RowResult{rowNum, username, "skip", "unknown plan_name " + planName})
+				skipped++
+				continue
+			}
+			plan, _ = loadPlan(h.db, pid)
+		}
+		notes := get("notes")
+		if notes == "" {
+			notes = get("description")
+		}
+
+		hash, err := auth.HashPassword(password)
+		if err != nil {
+			results = append(results, RowResult{rowNum, username, "error", "hash failed"})
 			failed++
 			continue
 		}
 
-		h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Cleartext-Password',':=',$2)
-			ON CONFLICT (username,attribute) DO UPDATE SET value=$2`, username, password)
-
-		if dataLimitMB != nil {
-			h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Max-Octets',':=',$2)
-				ON CONFLICT (username,attribute) DO UPDATE SET value=$2`,
-				username, fmt.Sprintf("%d", *dataLimitMB*1024*1024))
+		rowErr := func() error {
+			tx, err := h.db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			var newID int
+			if err := tx.QueryRow(`
+				INSERT INTO radius_users (username, email, password, full_name, department, phone, notes,
+				    status, device_limit, account_expiry, password_expiry, created_by)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,$11) RETURNING id`,
+				username, nullableString(get("email")), hash, nullableString(get("full_name")),
+				nullableString(get("department")), nullableString(get("phone")), nullableString(notes),
+				deviceLimit, expiry, passwordExpiry, claims.UserID).Scan(&newID); err != nil {
+				return err
+			}
+			if err := setCheck(tx, username, "Cleartext-Password", ":=", password); err != nil {
+				return err
+			}
+			if plan != nil {
+				if err := applyPlanLimits(tx, newID, username, plan); err != nil {
+					return err
+				}
+			}
+			if v := get("data_limit_mb"); v != "" {
+				if mb, err := strconv.ParseInt(v, 10, 64); err == nil && mb > 0 {
+					if err := setCheck(tx, username, "Max-Octets", ":=", strconv.FormatInt(mb*1024*1024, 10)); err != nil {
+						return err
+					}
+				}
+			}
+			if err := syncAccess(tx, username); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}()
+		if rowErr != nil {
+			if isUniqueViolation(rowErr) {
+				results = append(results, RowResult{rowNum, username, "skip", "username already exists"})
+				skipped++
+				continue
+			}
+			results = append(results, RowResult{rowNum, username, "error", rowErr.Error()})
+			failed++
+			continue
 		}
-
 		results = append(results, RowResult{rowNum, username, "created", ""})
 		created++
 	}
@@ -703,13 +814,15 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 	})
 }
 
-// ExportRadiusUsers exports all RADIUS users as a CSV file.
+// ExportRadiusUsers exports all RADIUS users as a CSV file (no passwords). The columns match
+// what ImportRadiusUsers reads, apart from the password.
 func (h *Handler) ExportRadiusUsers(c *gin.Context) {
 	rows, err := h.db.Query(`
-		SELECT username, email, full_name, department, status, device_limit,
-		       COALESCE(account_expiry::text, ''), created_at
-		FROM radius_users
-		ORDER BY username`)
+		SELECT ru.username, COALESCE(ru.email,''), COALESCE(ru.full_name,''), COALESCE(ru.department,''),
+		       COALESCE(ru.phone,''), ru.status, ru.device_limit, COALESCE(ru.account_expiry::text, ''),
+		       COALESCE(up.name,''), ru.created_at
+		FROM radius_users ru LEFT JOIN user_plans up ON up.id = ru.plan_id
+		ORDER BY ru.username`)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "export failed")
 		return
@@ -720,13 +833,26 @@ func (h *Handler) ExportRadiusUsers(c *gin.Context) {
 	c.Header("Content-Disposition", "attachment; filename=radius_users_export.csv")
 
 	writer := csv.NewWriter(c.Writer)
-	writer.Write([]string{"username", "email", "full_name", "department", "status", "device_limit", "account_expiry", "created_at"})
+	writer.Write([]string{"username", "email", "full_name", "department", "phone", "status", "device_limit", "expiry", "plan_name", "created_at"})
 
 	for rows.Next() {
-		var username, email, fullName, department, status, expiry, createdAt string
+		var username, email, fullName, department, phone, status, expiry, plan string
+		var createdAt time.Time
 		var deviceLimit int
-		rows.Scan(&username, &email, &fullName, &department, &status, &deviceLimit, &expiry, &createdAt)
-		writer.Write([]string{username, email, fullName, department, status, strconv.Itoa(deviceLimit), expiry, createdAt})
+		if rows.Scan(&username, &email, &fullName, &department, &phone, &status, &deviceLimit, &expiry, &plan, &createdAt) != nil {
+			continue
+		}
+		writer.Write([]string{csvSafe(username), csvSafe(email), csvSafe(fullName), csvSafe(department), csvSafe(phone),
+			status, strconv.Itoa(deviceLimit), expiry, csvSafe(plan), createdAt.Format(time.RFC3339)})
 	}
 	writer.Flush()
+}
+
+// csvSafe stops spreadsheet formula injection: a cell starting with = + - @ is prefixed
+// with a quote so Excel/LibreOffice show it as text.
+func csvSafe(s string) string {
+	if s != "" && strs.ContainsAny(s[:1], "=+-@\t\r") {
+		return "'" + s
+	}
+	return s
 }

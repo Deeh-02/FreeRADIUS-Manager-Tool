@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,8 +16,7 @@ import (
 // A customer record is separate contact data (including a national ID number and address)
 // that is linked to a RADIUS login only by the free-text `username`; creating one does not
 // create a RADIUS user, and deleting either side does not touch the other. The country
-// default is hard-coded to "Zimbabwe". The customers/tickets tables are not defined in this
-// repo's SQL files.
+// default comes from the DEFAULT_COUNTRY environment variable (empty if unset).
 
 type Customer struct {
 	ID            int        `json:"id"`
@@ -42,7 +42,7 @@ func (h *Handler) ListCustomers(c *gin.Context) {
 	offset, limit := paginationParams(c)
 
 	query := `SELECT c.id, c.username, c.full_name, c.email, c.phone,
-		c.id_number, c.address, c.city, COALESCE(c.country,'Zimbabwe'),
+		c.id_number, c.address, c.city, COALESCE(c.country,''),
 		c.org_id, c.contract_start::text, c.contract_end::text, c.notes, c.created_at,
 		COUNT(t.id) FILTER (WHERE t.status NOT IN ('resolved','closed')) AS open_tickets
 		FROM customers c
@@ -88,7 +88,7 @@ func (h *Handler) GetCustomer(c *gin.Context) {
 
 	var cust Customer
 	err = h.db.QueryRow(`SELECT c.id, c.username, c.full_name, c.email, c.phone,
-		c.id_number, c.address, c.city, COALESCE(c.country,'Zimbabwe'),
+		c.id_number, c.address, c.city, COALESCE(c.country,''),
 		c.org_id, c.contract_start::text, c.contract_end::text, c.notes, c.created_at,
 		0 FROM customers c WHERE c.id=$1`, id).
 		Scan(&cust.ID, &cust.Username, &cust.FullName, &cust.Email, &cust.Phone,
@@ -143,7 +143,7 @@ func (h *Handler) CreateCustomer(c *gin.Context) {
 		return
 	}
 	if req.Country == "" {
-		req.Country = "Zimbabwe"
+		req.Country = os.Getenv("DEFAULT_COUNTRY")
 	}
 	var id int
 	err := h.db.QueryRow(`
@@ -316,10 +316,13 @@ func (h *Handler) CreateTicket(c *gin.Context) {
 		req.Priority = "medium"
 	}
 	var id int
-	h.db.QueryRow(`INSERT INTO tickets (customer_id,username,title,description,priority,assigned_to)
+	if err := h.db.QueryRow(`INSERT INTO tickets (customer_id,username,title,description,priority,assigned_to)
 		VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
 		req.CustomerID, nullableString(req.Username), req.Title,
-		nullableString(req.Description), req.Priority, req.AssignedTo).Scan(&id)
+		nullableString(req.Description), req.Priority, req.AssignedTo).Scan(&id); err != nil {
+		respondError(c, http.StatusBadRequest, "failed to create ticket (priority must be low, medium, high or urgent)")
+		return
+	}
 
 	go h.dispatchWebhook("ticket.created", gin.H{"id": id, "title": req.Title, "priority": req.Priority})
 
@@ -344,20 +347,23 @@ func (h *Handler) UpdateTicket(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	resolvedAt := "NULL"
-	if req.Status == "resolved" || req.Status == "closed" {
-		resolvedAt = "NOW()"
-	}
-	h.db.Exec(fmt.Sprintf(`UPDATE tickets SET
+	// resolved_at is stamped when the status becomes resolved/closed, cleared when it is
+	// re-opened, and left alone by edits that do not change the status.
+	if _, err := h.db.Exec(`UPDATE tickets SET
 		status=COALESCE(NULLIF($1,''),status),
 		priority=COALESCE(NULLIF($2,''),priority),
 		assigned_to=COALESCE($3,assigned_to),
 		title=COALESCE(NULLIF($4,''),title),
 		description=COALESCE(NULLIF($5,''),description),
-		resolved_at=CASE WHEN $1 IN ('resolved','closed') THEN NOW() ELSE %s END,
+		resolved_at=CASE WHEN $1 IN ('resolved','closed') THEN COALESCE(resolved_at, NOW())
+		                 WHEN $1 IN ('open','in_progress') THEN NULL
+		                 ELSE resolved_at END,
 		updated_at=NOW()
-		WHERE id=$6`, resolvedAt),
-		req.Status, req.Priority, req.AssignedTo, req.Title, req.Description, id)
+		WHERE id=$6`,
+		req.Status, req.Priority, req.AssignedTo, req.Title, req.Description, id); err != nil {
+		respondError(c, http.StatusBadRequest, "failed to update ticket (check status and priority values)")
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "ticket updated"})
 }

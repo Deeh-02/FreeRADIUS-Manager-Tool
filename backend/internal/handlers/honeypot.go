@@ -24,10 +24,8 @@ var honeypotMu sync.Mutex
 
 // StartHoneypot starts a fake RADIUS listener on port 11812 that logs all packets.
 // It is a decoy for scanners, not part of real authentication. docker-compose.yml does not
-// publish UDP 11812, so it only sees traffic from inside the Docker network unless the
-// port is published. Every packet costs a DB insert and count (no rate limit), and the
-// alert `details` JSON is built with Sprintf from attacker-controlled User-Name without
-// escaping, so a username containing a quote makes that insert fail instead of raising the alert.
+// publish UDP 11812 by default, so it only sees traffic from inside the Docker network
+// until that port is published. Every packet costs a DB insert and count (no rate limit).
 func StartHoneypot(db *database.DB, log *logrus.Logger) {
 	honeypotMu.Lock()
 	if honeypotRunning {
@@ -90,10 +88,10 @@ func StartHoneypot(db *database.DB, log *logrus.Logger) {
 			var existingCount int
 			db.QueryRow(`SELECT COUNT(*) FROM honeypot_logs WHERE source_ip=$1`, srcIP).Scan(&existingCount)
 			if existingCount <= 1 {
+				details, _ := json.Marshal(map[string]string{"source": srcIP, "username": username, "honeypot_port": port})
 				db.Exec(`INSERT INTO security_alerts (alert_type,severity,ip_address,username,details)
 					VALUES ('honeypot_probe','high',$1,$2,$3::jsonb)`,
-					srcIP, nullableString(username),
-					fmt.Sprintf(`{"source":"%s","username":"%s","honeypot_port":"%s"}`, srcIP, username, port))
+					srcIP, nullableString(username), string(details))
 			}
 
 			// Respond with Access-Reject to keep scanners busy
@@ -136,11 +134,6 @@ func buildRejectPacket(id byte, reqAuth []byte) []byte {
 	auth := h.Sum(nil)
 	copy(pkt[4:], auth)
 	return pkt
-}
-
-func computeMD5(data []byte) []byte {
-	h := md5.Sum(data)
-	return h[:]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

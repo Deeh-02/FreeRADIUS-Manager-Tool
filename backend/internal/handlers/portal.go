@@ -6,16 +6,17 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 )
 
-// PortalLogin authenticates a RADIUS user and returns a short-lived portal token.
-// Checks the bcrypt copy in radius_users.password (not radcheck). Customer passwords can be
-// as short as 6 characters and the only brake on guessing is the global per-IP rate limit
-// (which is spoofable, see middleware/ratelimit.go): there is no per-account lockout here.
-// Only 'suspended' is refused; an 'expired' customer can still sign in and see their data.
-// Tokens live 24h in portal_sessions, a table that is not created by init-db.sql.
+// PortalLogin authenticates a RADIUS user and returns a portal token valid for 24 hours.
+// It checks the bcrypt copy in radius_users.password (not radcheck). Brakes on guessing:
+// the blocked-IP/GeoIP guard, a per-account lockout (portal_max_attempts failures lock the
+// account's portal login for portal_lockout_minutes; the network login is unaffected) and
+// the per-IP credential-stuffing window. Suspended customers are refused; expired ones may
+// sign in so they can see what they owe.
 func (h *Handler) PortalLogin(c *gin.Context) {
 	var req struct {
 		Username string `json:"username" binding:"required"`
@@ -25,40 +26,62 @@ func (h *Handler) PortalLogin(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !h.loginGuard(c, req.Username) {
+		return
+	}
 
-	// Look up user
-	var userID int
+	var userID, failed int
 	var storedHash, status string
-	var phone, email *string
+	var lockedUntil *time.Time
 	err := h.db.QueryRow(`
-		SELECT id, password, status, phone, email
+		SELECT id, password, status, portal_failed_attempts, portal_locked_until
 		FROM radius_users WHERE username=$1`, req.Username).
-		Scan(&userID, &storedHash, &status, &phone, &email)
+		Scan(&userID, &storedHash, &status, &failed, &lockedUntil)
 	if err != nil {
+		bcrypt.CompareHashAndPassword([]byte(dummyHash), []byte(req.Password))
+		CheckCredStuffing(h, c.ClientIP(), req.Username)
 		respondError(c, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
+	if lockedUntil != nil && time.Now().Before(*lockedUntil) {
+		respondError(c, http.StatusTooManyRequests, "too many failed attempts; try again later")
+		return
+	}
+	if lockedUntil != nil {
+		failed = 0
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password)); err != nil {
+		failed++
+		var lock interface{}
+		if failed >= settings.Int("portal_max_attempts", "", 5) {
+			lock = time.Now().Add(time.Duration(settings.Int("portal_lockout_minutes", "", 15)) * time.Minute)
+		}
+		h.db.Exec(`UPDATE radius_users SET portal_failed_attempts=$1, portal_locked_until=$2 WHERE id=$3`, failed, lock, userID)
+		CheckCredStuffing(h, c.ClientIP(), req.Username)
 		respondError(c, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 	if status == "suspended" {
-		respondError(c, http.StatusForbidden, "account suspended — contact your administrator")
+		respondError(c, http.StatusForbidden, "account suspended — contact your provider")
 		return
 	}
+	h.db.Exec(`UPDATE radius_users SET portal_failed_attempts=0, portal_locked_until=NULL WHERE id=$1`, userID)
 
-	// Generate portal session token (32-byte hex)
 	raw := make([]byte, 32)
-	rand.Read(raw)
+	if _, err := rand.Read(raw); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 	token := hex.EncodeToString(raw)
 	expiresAt := time.Now().Add(24 * time.Hour)
 
-	h.db.Exec(`
+	if _, err := h.db.Exec(`
 		INSERT INTO portal_sessions (token, username, expires_at)
-		VALUES ($1,$2,$3)`, token, req.Username, expiresAt)
-
-	// Clean up old expired sessions
-	go h.db.Exec(`DELETE FROM portal_sessions WHERE expires_at < NOW()`)
+		VALUES ($1,$2,$3)`, token, req.Username, expiresAt); err != nil {
+		h.log.WithError(err).Error("portal session")
+		respondError(c, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"token":      token,
@@ -139,8 +162,8 @@ func (h *Handler) PortalDashboard(c *gin.Context) {
 	}
 	sessions := []Session{}
 	rows, _ := h.db.Query(`
-		SELECT COALESCE(nasipaddress,''),
-		       framedipaddress,
+		SELECT host(nasipaddress),
+		       host(framedipaddress),
 		       TO_CHAR(acctstarttime,'YYYY-MM-DD HH24:MI:SS'),
 		       EXTRACT(EPOCH FROM (NOW()-acctstarttime))::BIGINT,
 		       acctinputoctets/1048576.0,
@@ -167,7 +190,7 @@ func (h *Handler) PortalDashboard(c *gin.Context) {
 	}
 	history := []HistSession{}
 	hrows, _ := h.db.Query(`
-		SELECT COALESCE(nasipaddress,''),
+		SELECT host(nasipaddress),
 		       TO_CHAR(acctstarttime,'YYYY-MM-DD HH24:MI'),
 		       TO_CHAR(acctstoptime,'YYYY-MM-DD HH24:MI'),
 		       (acctinputoctets+acctoutputoctets)/1048576.0,
@@ -188,12 +211,46 @@ func (h *Handler) PortalDashboard(c *gin.Context) {
 	var assignedIP *string
 	h.db.QueryRow(`SELECT value FROM radreply WHERE username=$1 AND attribute='Framed-IP-Address'`, username).Scan(&assignedIP)
 
+	// Invoices (read-only; payment is made to the provider, who records it).
+	type PortalInvoice struct {
+		Number   string  `json:"invoice_number"`
+		PlanName *string `json:"plan_name"`
+		Amount   float64 `json:"amount"`
+		Paid     float64 `json:"amount_paid"`
+		Currency string  `json:"currency"`
+		Status   string  `json:"status"`
+		DueDate  *string `json:"due_date"`
+		Created  string  `json:"created_at"`
+	}
+	invoices := []PortalInvoice{}
+	irows, err := h.db.Query(`
+		SELECT i.invoice_number, i.plan_name, i.amount,
+		       COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id=i.id AND p.status='confirmed'),0),
+		       i.currency, i.status, i.due_date::text, TO_CHAR(i.created_at,'YYYY-MM-DD')
+		FROM invoices i JOIN radius_users ru ON ru.id = i.user_id
+		WHERE ru.username = $1 AND i.status <> 'cancelled'
+		ORDER BY i.created_at DESC LIMIT 12`, username)
+	if err == nil {
+		for irows.Next() {
+			var pi PortalInvoice
+			if irows.Scan(&pi.Number, &pi.PlanName, &pi.Amount, &pi.Paid, &pi.Currency, &pi.Status, &pi.DueDate, &pi.Created) == nil {
+				invoices = append(invoices, pi)
+			}
+		}
+		irows.Close()
+	}
+	var org, orgEmail string
+	h.db.QueryRow(`SELECT COALESCE(value,'') FROM system_settings WHERE key='org_name'`).Scan(&org)
+	h.db.QueryRow(`SELECT COALESCE(value,'') FROM system_settings WHERE key='org_email'`).Scan(&orgEmail)
+
 	c.JSON(http.StatusOK, gin.H{
-		"user":           u,
-		"usage":          usage,
+		"user":            u,
+		"usage":           usage,
 		"active_sessions": sessions,
 		"session_history": history,
-		"assigned_ip":    assignedIP,
+		"assigned_ip":     assignedIP,
+		"invoices":        invoices,
+		"provider":        gin.H{"name": org, "email": orgEmail},
 	})
 }
 

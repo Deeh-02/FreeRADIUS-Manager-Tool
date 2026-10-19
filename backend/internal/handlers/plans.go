@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"database/sql"
 	"fmt"
 	"net/http"
 	"time"
@@ -80,7 +79,11 @@ func (h *Handler) CreatePlan(c *gin.Context) {
 		req.MaxDevices = 1
 	}
 	if req.Currency == "" {
-		req.Currency = "USD"
+		req.Currency = defaultCurrency()
+	}
+	if req.Price < 0 {
+		respondError(c, http.StatusBadRequest, "price cannot be negative")
+		return
 	}
 	isActive := true
 	if req.IsActive != nil {
@@ -90,7 +93,7 @@ func (h *Handler) CreatePlan(c *gin.Context) {
 	err := h.db.QueryRow(`
 		INSERT INTO user_plans (name,description,price,currency,data_limit_mb,validity_days,
 		    bandwidth_profile_id,max_devices,is_active)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+		VALUES ($1,$2,$3,UPPER($4),$5,$6,$7,$8,$9) RETURNING id`,
 		req.Name, nullableString(req.Description), req.Price, req.Currency,
 		req.DataLimitMB, req.ValidityDays, req.BandwidthProfileID, req.MaxDevices, isActive,
 	).Scan(&id)
@@ -131,8 +134,21 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 	if req.IsActive != nil {
 		isActive = *req.IsActive
 	}
-	_, err = h.db.Exec(`
-		UPDATE user_plans SET name=$1, description=$2, price=$3, currency=$4,
+	if req.ValidityDays <= 0 {
+		req.ValidityDays = 30
+	}
+	if req.MaxDevices <= 0 {
+		req.MaxDevices = 1
+	}
+	if req.Price < 0 {
+		respondError(c, http.StatusBadRequest, "price cannot be negative")
+		return
+	}
+	if req.Currency == "" {
+		req.Currency = defaultCurrency()
+	}
+	res, err := h.db.Exec(`
+		UPDATE user_plans SET name=COALESCE(NULLIF($1,''), name), description=$2, price=$3, currency=UPPER($4),
 		    data_limit_mb=$5, validity_days=$6, bandwidth_profile_id=$7,
 		    max_devices=$8, is_active=$9, updated_at=NOW()
 		WHERE id=$10`,
@@ -140,41 +156,47 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 		req.DataLimitMB, req.ValidityDays, req.BandwidthProfileID,
 		req.MaxDevices, isActive, id)
 	if err != nil {
+		if isUniqueViolation(err) {
+			respondError(c, http.StatusConflict, "plan name already exists")
+			return
+		}
 		respondError(c, http.StatusInternalServerError, "failed to update plan")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "plan updated"})
+	if n, _ := res.RowsAffected(); n == 0 {
+		respondError(c, http.StatusNotFound, "plan not found")
+		return
+	}
+	// Existing customers on the plan get the new device limit, data cap and speed.
+	go h.reapplyPlan(id)
+	c.JSON(http.StatusOK, gin.H{"message": "plan updated; limits are being re-applied to its users"})
 }
 
-// DeletePlan removes a plan (unlinking users first).
-// Users keep whatever radcheck/radreply attributes the plan already gave them (device
-// limit, Max-Octets, rate limit); only the plan_id link is cleared.
+// DeletePlan removes a plan. It is refused while customers are on it (deactivate it
+// instead); invoices keep their copy of the plan name.
 func (h *Handler) DeletePlan(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE radius_users SET plan_id=NULL WHERE plan_id=$1`, id)
-	h.db.Exec(`UPDATE invoices SET plan_id=NULL WHERE plan_id=$1`, id)
-	h.db.Exec(`DELETE FROM user_plans WHERE id=$1`, id)
+	var users int
+	h.db.QueryRow(`SELECT COUNT(*) FROM radius_users WHERE plan_id=$1`, id).Scan(&users)
+	if users > 0 {
+		respondError(c, http.StatusConflict, fmt.Sprintf("%d customer(s) are on this plan; move them or deactivate the plan instead", users))
+		return
+	}
+	if _, err := h.db.Exec(`DELETE FROM user_plans WHERE id=$1`, id); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete plan")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "plan deleted"})
 }
 
-// AssignPlan assigns a plan to a RADIUS user and applies plan attributes.
-//
-// Billing behaviour worth knowing before relying on it:
-//   - Not transactional: each step below is a separate statement and errors are ignored,
-//     so a failure part-way leaves the user half-configured with a 200 response.
-//   - Expiry is reset to today + validity_days; it does not extend from the current
-//     expiry, so renewing early forfeits the remaining days.
-//   - An invoice is created on EVERY assignment of a paid plan, including re-assigning the
-//     same plan. Nothing links a promotion to it (see promotions.go).
-//   - The invoice number uses the clock's nanoseconds mod 1e6; a collision violates
-//     invoices.invoice_number UNIQUE and the INSERT's error is ignored, so no invoice.
-//   - Max-Octets is only a radcheck row; FreeRADIUS has no counter module configured here
-//     to enforce it (see freeradius/sites-available/default).
-//   - No UI calls this endpoint (plansAPI.assignToUser is unused in the frontend).
+// AssignPlan assigns a plan to a RADIUS user, applies its limits and bills it.
+// Body: plan_id (null removes the plan link), start_now (give the period before payment),
+// promo_code. Billing rules are in billing_core.go (assignPlanTx); everything happens in
+// one transaction.
 func (h *Handler) AssignPlan(c *gin.Context) {
 	userID, err := mustInt(c, "id")
 	if err != nil {
@@ -182,7 +204,9 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 		return
 	}
 	var body struct {
-		PlanID *int `json:"plan_id"`
+		PlanID    *int   `json:"plan_id"`
+		StartNow  bool   `json:"start_now"`
+		PromoCode string `json:"promo_code"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
@@ -195,77 +219,70 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 		return
 	}
 
-	claims, _ := middleware.GetClaims(c)
-	h.db.Exec(`UPDATE radius_users SET plan_id=$1, updated_at=NOW() WHERE id=$2`, body.PlanID, userID)
-
 	if body.PlanID == nil {
-		c.JSON(http.StatusOK, gin.H{"message": "plan removed from user"})
+		if _, err := h.db.Exec(`UPDATE radius_users SET plan_id=NULL, updated_at=NOW() WHERE id=$1`, userID); err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to update user")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "plan removed from user (limits already applied are kept)"})
 		return
 	}
 
-	var plan UserPlan
-	err = h.db.QueryRow(`
-		SELECT id, name, price, currency, data_limit_mb, validity_days, bandwidth_profile_id, max_devices
-		FROM user_plans WHERE id=$1`, *body.PlanID).
-		Scan(&plan.ID, &plan.Name, &plan.Price, &plan.Currency, &plan.DataLimitMB, &plan.ValidityDays, &plan.BandwidthProfileID, &plan.MaxDevices)
-	if err == sql.ErrNoRows {
-		respondError(c, http.StatusNotFound, "plan not found")
+	claims, _ := middleware.GetClaims(c)
+	tx, err := h.db.Begin()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to begin transaction")
 		return
 	}
+	defer tx.Rollback()
 
-	// Set account expiry from plan validity
-	if plan.ValidityDays > 0 {
-		expiry := time.Now().AddDate(0, 0, plan.ValidityDays).Format("2006-01-02")
-		h.db.Exec(`UPDATE radius_users SET account_expiry=$1 WHERE id=$2`, expiry, userID)
+	res, err := assignPlanTx(tx, userID, username, *body.PlanID, body.StartNow, body.PromoCode, &claims.UserID)
+	if err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
 	}
-
-	// Set device limit
-	h.db.Exec(`UPDATE radius_users SET device_limit=$1 WHERE id=$2`, plan.MaxDevices, userID)
-	h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Simultaneous-Use',':=',$2)
-		ON CONFLICT (username,attribute) DO UPDATE SET value=$2`, username, fmt.Sprintf("%d", plan.MaxDevices))
-
-	// Set data limit
-	if plan.DataLimitMB != nil {
-		h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Max-Octets',':=',$2)
-			ON CONFLICT (username,attribute) DO UPDATE SET value=$2`,
-			username, fmt.Sprintf("%d", *plan.DataLimitMB*1024*1024))
-	} else {
-		h.db.Exec(`DELETE FROM radcheck WHERE username=$1 AND attribute='Max-Octets'`, username)
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to save plan assignment")
+		return
 	}
-
-	// Apply bandwidth profile if linked
-	if plan.BandwidthProfileID != nil {
-		go h.ApplyBandwidthProfileDirect(userID, *plan.BandwidthProfileID)
+	if res.InvoiceID != 0 {
+		go h.dispatchWebhook("invoice.created", gin.H{"invoice_id": res.InvoiceID, "invoice_number": res.Invoice,
+			"username": username, "amount": res.Amount})
 	}
-
-	// Auto-generate invoice for paid plans
-	if plan.Price > 0 {
-		invoiceNum := fmt.Sprintf("INV-%s-%06d", time.Now().Format("200601"), time.Now().UnixNano()%1000000)
-		h.db.Exec(`INSERT INTO invoices (invoice_number,user_id,username,plan_id,plan_name,amount,currency,due_date,created_by)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,CURRENT_DATE+7,$8)`,
-			invoiceNum, userID, username, body.PlanID, plan.Name, plan.Price, plan.Currency, claims.UserID)
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("plan '%s' assigned to %s", plan.Name, username)})
+	c.JSON(http.StatusOK, gin.H{
+		"message":        res.Message,
+		"invoice_id":     res.InvoiceID,
+		"invoice_number": res.Invoice,
+		"account_expiry": res.Expiry,
+	})
 }
 
-// ApplyBandwidthProfileDirect applies a profile directly (called internally).
-func (h *Handler) ApplyBandwidthProfileDirect(userID, profileID int) {
-	var username string
-	if err := h.db.QueryRow(`SELECT username FROM radius_users WHERE id=$1`, userID).Scan(&username); err != nil {
-		return
+// reapplyPlan re-writes a plan's limits for every customer on it (after the plan changed).
+func (h *Handler) reapplyPlan(planID int) error {
+	p, err := loadPlan(h.db, planID)
+	if err != nil {
+		return err
 	}
-	var p BandwidthProfile
-	if err := h.db.QueryRow(`SELECT id,name,upload_kbps,download_kbps,mikrotik_rate_limit FROM bandwidth_profiles WHERE id=$1`, profileID).
-		Scan(&p.ID, &p.Name, &p.UploadKbps, &p.DownloadKbps, &p.MikrotikRateLimit); err != nil {
-		return
+	rows, err := h.db.Query(`SELECT id, username FROM radius_users WHERE plan_id = $1`, planID)
+	if err != nil {
+		return err
 	}
-	rl := kbpsToMikrotik(p.UploadKbps, p.DownloadKbps)
-	if p.MikrotikRateLimit != nil && *p.MikrotikRateLimit != "" {
-		rl = *p.MikrotikRateLimit
+	type u struct {
+		id   int
+		name string
 	}
-	h.db.Exec(`DELETE FROM radreply WHERE username=$1 AND attribute IN ('Mikrotik-Rate-Limit','WISPr-Bandwidth-Max-Up','WISPr-Bandwidth-Max-Down')`, username)
-	h.db.Exec(`INSERT INTO radreply (username,attribute,op,value) VALUES ($1,'Mikrotik-Rate-Limit','=',$2)`, username, rl)
-	h.db.Exec(`INSERT INTO radreply (username,attribute,op,value) VALUES ($1,'WISPr-Bandwidth-Max-Up','=',$2)`, username, fmt.Sprintf("%d", p.UploadKbps*1000))
-	h.db.Exec(`INSERT INTO radreply (username,attribute,op,value) VALUES ($1,'WISPr-Bandwidth-Max-Down','=',$2)`, username, fmt.Sprintf("%d", p.DownloadKbps*1000))
+	var users []u
+	for rows.Next() {
+		var x u
+		if rows.Scan(&x.id, &x.name) == nil {
+			users = append(users, x)
+		}
+	}
+	rows.Close()
+	for _, x := range users {
+		if err := applyPlanLimits(h.db, x.id, x.name, p); err != nil {
+			h.log.WithError(err).Warnf("re-apply plan %d to %s", planID, x.name)
+		}
+	}
+	return nil
 }

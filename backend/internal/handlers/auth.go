@@ -3,27 +3,29 @@ package handlers
 import (
 	"database/sql"
 	"net/http"
-	"os"
-	"strconv"
 	"time"
 
 	"github.com/freeradius-manager/backend/internal/auth"
 	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/freeradius-manager/backend/internal/models"
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"
 )
 
 // Login authenticates an app user and issues JWT tokens.
-// Lockout is per account (failed_attempts/locked_until), not per IP. failed_attempts is
-// not reset when a lock expires, so the first wrong password after a lockout re-locks the
-// account immediately. Disabled and locked accounts are reported before the password is
-// checked, which reveals that a username exists. Each login opens a new session; there is
-// no limit on concurrent sessions per user.
+// Protections, in order: blocked IP / GeoIP rules (loginGuard), per-account lockout after
+// brute_force_attempts failures for brute_force_lockout minutes (Settings page), and the
+// per-IP credential-stuffing window (CheckCredStuffing). A disabled account is only reported
+// after the correct password, so the response does not reveal which usernames exist. Each
+// login opens a new session; several devices can be signed in at once.
 func (h *Handler) Login(c *gin.Context) {
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "invalid request: "+err.Error())
+		return
+	}
+	if !h.loginGuard(c, req.Username) {
 		return
 	}
 
@@ -42,6 +44,9 @@ func (h *Handler) Login(c *gin.Context) {
 	)
 
 	if err == sql.ErrNoRows {
+		// Same cost as a real check, so response time does not reveal unknown usernames.
+		auth.CheckPassword(dummyHash, req.Password)
+		CheckCredStuffing(h, c.ClientIP(), req.Username)
 		respondError(c, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -51,17 +56,15 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	// Check if account is active
-	if !user.IsActive {
-		respondError(c, http.StatusForbidden, "account is disabled")
-		return
-	}
-
 	// Check lockout
 	maxAttempts := getBruteForceAttempts()
 	if user.LockedUntil != nil && time.Now().Before(*user.LockedUntil) {
 		respondError(c, http.StatusTooManyRequests, "account temporarily locked due to too many failed attempts")
 		return
+	}
+	// A lock that has run out starts a fresh count.
+	if user.LockedUntil != nil {
+		user.FailedAttempts = 0
 	}
 
 	// Verify password
@@ -80,8 +83,14 @@ func (h *Handler) Login(c *gin.Context) {
 			WHERE id = $3`,
 			newAttempts, lockUntil, user.ID,
 		)
+		CheckCredStuffing(h, c.ClientIP(), req.Username)
 
 		respondError(c, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+
+	if !user.IsActive {
+		respondError(c, http.StatusForbidden, "account is disabled")
 		return
 	}
 
@@ -92,6 +101,15 @@ func (h *Handler) Login(c *gin.Context) {
 			return
 		}
 		if !totp.Validate(req.MFACode, user.MFASecret) {
+			// A wrong code counts like a wrong password, so the 6 digits cannot be brute-forced.
+			newAttempts := user.FailedAttempts + 1
+			var lockUntil interface{}
+			if newAttempts >= maxAttempts {
+				lockUntil = time.Now().Add(time.Duration(getBruteForceLockout()) * time.Minute)
+			}
+			h.db.Exec(`UPDATE app_users SET failed_attempts = $1, locked_until = $2 WHERE id = $3`,
+				newAttempts, lockUntil, user.ID)
+			CheckCredStuffing(h, c.ClientIP(), req.Username)
 			respondError(c, http.StatusUnauthorized, "invalid MFA code")
 			return
 		}
@@ -125,11 +143,15 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	expiry := time.Now().Add(auth.RefreshExpiry())
-	h.db.Exec(`
+	if _, err := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, expires_at, session_id, client_ip, user_agent, last_activity)
 		VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
 		user.ID, refreshHash, expiry, sessionID, c.ClientIP(), c.GetHeader("User-Agent"),
-	)
+	); err != nil {
+		h.log.WithError(err).Error("store session")
+		respondError(c, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 
 	user.PasswordHash = ""
 	user.MFASecret = ""
@@ -161,8 +183,9 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		WHERE rt.token_hash = $1
 		  AND rt.revoked = FALSE
 		  AND rt.expires_at > NOW()
+		  AND rt.last_activity > $2
 		  AND au.is_active = TRUE`,
-		hash,
+		hash, time.Now().Add(-auth.SessionTimeout()),
 	).Scan(&userID, &username, &role, &sessionID)
 
 	if err == sql.ErrNoRows {
@@ -312,21 +335,30 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`UPDATE app_users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
-		newHash, claims.UserID)
+	if _, err := h.db.Exec(`UPDATE app_users SET password_hash = $1, updated_at = NOW() WHERE id = $2`,
+		newHash, claims.UserID); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to change password")
+		return
+	}
 
-	// Revoke all refresh tokens (force re-login everywhere)
-	h.db.Exec(`UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1`, claims.UserID)
+	// Force re-login everywhere.
+	auth.RevokeAllUserSessions(h.db.DB, claims.UserID)
 
-	c.JSON(http.StatusOK, gin.H{"message": "password changed successfully"})
+	c.JSON(http.StatusOK, gin.H{"message": "password changed successfully; sign in again"})
 }
 
-// MFASetup generates and returns a TOTP secret and QR code URI.
-// The new secret overwrites the stored one immediately, even when MFA is already enabled,
-// and it is kept unencrypted in app_users.mfa_secret. The "MFA required" setting is
-// stored by the wizard/settings page but nothing enforces it at login.
+// MFASetup generates and returns a TOTP secret and QR code URI. It is refused while MFA is
+// enabled (a super admin can reset it on the Admin Users page), so a stolen session cannot
+// replace the second factor. The secret is stored unencrypted in app_users.mfa_secret.
+// The "mfa_required" setting is enforced by middleware.RequireAuth.
 func (h *Handler) MFASetup(c *gin.Context) {
 	claims, _ := middleware.GetClaims(c)
+	var enabled bool
+	h.db.QueryRow(`SELECT mfa_enabled FROM app_users WHERE id = $1`, claims.UserID).Scan(&enabled)
+	if enabled {
+		respondError(c, http.StatusConflict, "MFA is already enabled; ask a super admin to reset it first")
+		return
+	}
 
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      "FreeRADIUS Manager",
@@ -375,20 +407,21 @@ func (h *Handler) MFAVerify(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "MFA enabled successfully"})
 }
 
+// dummyHash is compared against when the username does not exist (bcrypt of a random string).
+var dummyHash, _ = auth.HashPassword("unused-placeholder-password-for-timing")
+
+// getBruteForceAttempts: Settings page "brute_force_attempts", else BRUTE_FORCE_ATTEMPTS, else 5.
 func getBruteForceAttempts() int {
-	if raw := os.Getenv("BRUTE_FORCE_ATTEMPTS"); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
-			return v
-		}
+	if v := settings.Int("brute_force_attempts", "BRUTE_FORCE_ATTEMPTS", 5); v > 0 {
+		return v
 	}
 	return 5
 }
 
+// getBruteForceLockout (minutes): "brute_force_lockout", else BRUTE_FORCE_LOCKOUT, else 15.
 func getBruteForceLockout() int {
-	if raw := os.Getenv("BRUTE_FORCE_LOCKOUT"); raw != "" {
-		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
-			return v
-		}
+	if v := settings.Int("brute_force_lockout", "BRUTE_FORCE_LOCKOUT", 15); v > 0 {
+		return v
 	}
 	return 15
 }

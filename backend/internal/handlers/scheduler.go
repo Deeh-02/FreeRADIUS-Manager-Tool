@@ -1,27 +1,50 @@
 package handlers
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/freeradius-manager/backend/internal/database"
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
 
 // ScheduledTask represents an automated background job.
 type ScheduledTask struct {
-	ID         int        `json:"id"`
-	Name       string     `json:"name"`
-	TaskType   string     `json:"task_type"`
-	Schedule   string     `json:"schedule"`
-	IsActive   bool       `json:"is_active"`
-	LastRun    *time.Time `json:"last_run"`
-	NextRun    *time.Time `json:"next_run"`
-	LastResult *string    `json:"last_result"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID          int        `json:"id"`
+	Name        string     `json:"name"`
+	TaskType    string     `json:"task_type"`
+	Description string     `json:"description"`
+	Schedule    string     `json:"schedule"`
+	IsActive    bool       `json:"is_active"`
+	LastRun     *time.Time `json:"last_run"`
+	NextRun     *time.Time `json:"next_run"`
+	LastResult  *string    `json:"last_result"`
+	CreatedAt   time.Time  `json:"created_at"`
 }
+
+// taskDescriptions is shown on the Scheduler page.
+var taskDescriptions = map[string]string{
+	"expire_accounts":       "Marks customers past their paid-until date (+ grace days) as expired, blocks them at the RADIUS server and disconnects their sessions.",
+	"mark_overdue_invoices": "Moves unpaid invoices past their due date to overdue. With the suspend_overdue setting, also blocks customers whose service was started on credit.",
+	"cleanup_sessions":      "Closes accounting sessions that have had no update for 24 hours (the router never sent a Stop), so they stop counting against the device limit.",
+	"daily_report":          "Counts active customers, open sessions, today's traffic and today's payments; emails it to the report_email setting if set.",
+	"renew_plans":           "Raises the next invoice for customers on a paid plan whose paid-until date is within renewal_invoice_days. Free plans are extended automatically.",
+	"expiry_reminders":      "Sends one SMS (phone + SMS gateway) and/or email (address + SMTP) per period, reminder_days before the paid-until date.",
+	"voucher_housekeeping":  "Marks vouchers used after their first session and expired after their expiry date.",
+	"enforce_quota":         "Sends a Disconnect-Request for online sessions of customers who have used up their data cap (the cap is otherwise checked only at login).",
+	"backup_database":       "Writes a pg_dump to BACKUP_DIR and deletes dumps older than backup_retention_days.",
+	"purge_logs":            "Deletes login logs (radpostauth) older than 180 days, honeypot logs older than 30 days, and expired portal sessions.",
+}
+
+var validSchedules = map[string]bool{"hourly": true, "daily": true, "weekly": true}
 
 // ListScheduledTasks returns all configured tasks.
 func (h *Handler) ListScheduledTasks(c *gin.Context) {
@@ -37,8 +60,10 @@ func (h *Handler) ListScheduledTasks(c *gin.Context) {
 	tasks := []ScheduledTask{}
 	for rows.Next() {
 		var t ScheduledTask
-		rows.Scan(&t.ID, &t.Name, &t.TaskType, &t.Schedule, &t.IsActive, &t.LastRun, &t.NextRun, &t.LastResult, &t.CreatedAt)
-		tasks = append(tasks, t)
+		if rows.Scan(&t.ID, &t.Name, &t.TaskType, &t.Schedule, &t.IsActive, &t.LastRun, &t.NextRun, &t.LastResult, &t.CreatedAt) == nil {
+			t.Description = taskDescriptions[t.TaskType]
+			tasks = append(tasks, t)
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": tasks})
 }
@@ -50,8 +75,12 @@ func (h *Handler) ToggleTask(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE scheduled_tasks SET is_active = NOT is_active WHERE id=$1`, id)
-	c.JSON(http.StatusOK, gin.H{"message": "task toggled"})
+	var active bool
+	if err := h.db.QueryRow(`UPDATE scheduled_tasks SET is_active = NOT is_active WHERE id=$1 RETURNING is_active`, id).Scan(&active); err != nil {
+		respondError(c, http.StatusNotFound, "task not found")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "task toggled", "is_active": active})
 }
 
 // RunTaskNow forces immediate execution of a task.
@@ -67,9 +96,13 @@ func (h *Handler) RunTaskNow(c *gin.Context) {
 		return
 	}
 
-	result, count := runTask(h.db, taskType)
+	result, count, ran := runTaskLocked(h.db, h.log, id, taskType)
+	if !ran {
+		respondError(c, http.StatusConflict, "this task is already running")
+		return
+	}
 	h.db.Exec(`UPDATE scheduled_tasks SET last_run=NOW(), last_result=$1 WHERE id=$2`,
-		fmt.Sprintf("%s: affected %d rows", result, count), id)
+		fmt.Sprintf("%s (%d)", result, count), id)
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":  result,
@@ -77,7 +110,7 @@ func (h *Handler) RunTaskNow(c *gin.Context) {
 	})
 }
 
-// UpdateTaskSchedule changes the schedule of a task.
+// UpdateTaskSchedule changes the schedule of a task (hourly, daily or weekly).
 func (h *Handler) UpdateTaskSchedule(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -91,25 +124,35 @@ func (h *Handler) UpdateTaskSchedule(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !validSchedules[req.Schedule] {
+		respondError(c, http.StatusBadRequest, "schedule must be hourly, daily or weekly")
+		return
+	}
 	nextRun := nextRunTime(req.Schedule)
-	h.db.Exec(`UPDATE scheduled_tasks SET schedule=$1, next_run=$2 WHERE id=$3`, req.Schedule, nextRun, id)
+	res, err := h.db.Exec(`UPDATE scheduled_tasks SET schedule=$1, next_run=$2 WHERE id=$3`, req.Schedule, nextRun, id)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update schedule")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		respondError(c, http.StatusNotFound, "task not found")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "schedule updated", "next_run": nextRun})
 }
 
 // StartScheduler launches the background task runner.
-// It is a simple in-process poller, not cron: every 10 minutes it runs the active tasks
-// whose next_run is empty or past. "daily" therefore means "24h after the last run", not a
-// fixed time of day, and a task can start up to 10 minutes late. With several backend
-// replicas each one would run every task (nothing takes a lock).
+// It is an in-process poller, not cron: every 10 minutes it runs the active tasks whose
+// next_run is empty or past. "daily" therefore means "24h after the last run", not a fixed
+// time of day. Each task takes a PostgreSQL advisory lock while it runs, so if several
+// backend copies run the scheduler, a task still runs only once at a time.
 func StartScheduler(db *database.DB, log *logrus.Logger) {
 	go func() {
 		log.Info("Scheduler started — checking tasks every 10 minutes")
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 
-		// Run once at startup
 		runDueTasks(db, log)
-
 		for range ticker.C {
 			runDueTasks(db, log)
 		}
@@ -119,11 +162,12 @@ func StartScheduler(db *database.DB, log *logrus.Logger) {
 func runDueTasks(db *database.DB, log *logrus.Logger) {
 	rows, err := db.Query(`
 		SELECT id, task_type, schedule FROM scheduled_tasks
-		WHERE is_active=true AND (next_run IS NULL OR next_run <= NOW())`)
+		WHERE is_active=true AND (next_run IS NULL OR next_run <= NOW())
+		ORDER BY id`)
 	if err != nil {
+		log.WithError(err).Warn("scheduler: cannot read tasks")
 		return
 	}
-	defer rows.Close()
 
 	type task struct {
 		id       int
@@ -133,41 +177,73 @@ func runDueTasks(db *database.DB, log *logrus.Logger) {
 	tasks := []task{}
 	for rows.Next() {
 		var t task
-		rows.Scan(&t.id, &t.taskType, &t.schedule)
-		tasks = append(tasks, t)
+		if rows.Scan(&t.id, &t.taskType, &t.schedule) == nil {
+			tasks = append(tasks, t)
+		}
 	}
+	rows.Close()
 
 	for _, t := range tasks {
-		result, count := runTask(db, t.taskType)
-		nextRun := nextRunTime(t.schedule)
+		result, count, ran := runTaskLocked(db, log, t.id, t.taskType)
+		if !ran {
+			continue
+		}
 		db.Exec(`UPDATE scheduled_tasks SET last_run=NOW(), next_run=$1, last_result=$2 WHERE id=$3`,
-			nextRun, fmt.Sprintf("%s (%d rows)", result, count), t.id)
-		log.Infof("Scheduler: ran '%s' — %s (%d rows)", t.taskType, result, count)
+			nextRunTime(t.schedule), fmt.Sprintf("%s (%d)", result, count), t.id)
+		log.Infof("Scheduler: ran '%s' — %s (%d)", t.taskType, result, count)
 	}
 }
 
-// runTask executes the logic for a given task type.
-// Returns a description and number of affected rows.
-//
-// Important for billing: these tasks only change columns in the app's own tables.
-// FreeRADIUS never reads radius_users.status or account_expiry (its SQL queries read only
-// radcheck/radreply), so "expiring" an account here does not by itself stop that
-// customer from connecting. Enforcement requires a radcheck row such as Auth-Type :=
-// Reject or Expiration, which only the suspend actions and the bulk "set_expiry" write.
-func runTask(db *database.DB, taskType string) (string, int) {
+var localTaskLocks sync.Map
+
+// runTaskLocked runs a task unless it is already running (in this process or, through the
+// advisory lock, in another backend). ran is false if it was skipped.
+func runTaskLocked(db *database.DB, log *logrus.Logger, id int, taskType string) (string, int, bool) {
+	mu, _ := localTaskLocks.LoadOrStore(id, &sync.Mutex{})
+	if !mu.(*sync.Mutex).TryLock() {
+		return "", 0, false
+	}
+	defer mu.(*sync.Mutex).Unlock()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return "failed: " + err.Error(), 0, true
+	}
+	defer conn.Close()
+	var got bool
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(727501, $1)`, id).Scan(&got); err != nil || !got {
+		return "", 0, false
+	}
+	defer conn.ExecContext(ctx, `SELECT pg_advisory_unlock(727501, $1)`, id)
+
+	result, count := runTask(db, log, taskType)
+	return result, count, true
+}
+
+// runTask executes the logic for a given task type and returns a description and a count.
+func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int) {
 	switch taskType {
 
 	case "expire_accounts":
-		res, err := db.Exec(`
+		rows, err := db.Query(`
 			UPDATE radius_users SET status='expired', updated_at=NOW()
 			WHERE status='active'
 			  AND account_expiry IS NOT NULL
-			  AND account_expiry < CURRENT_DATE`)
+			  AND account_expiry + $1::int < CURRENT_DATE
+			RETURNING id, username`, graceDays())
 		if err != nil {
 			return "expire_accounts failed: " + err.Error(), 0
 		}
-		n, _ := res.RowsAffected()
-		return "expired accounts", int(n)
+		users := collectUsers(rows)
+		for _, u := range users {
+			if err := syncAccess(db, u.name); err != nil {
+				log.WithError(err).Warnf("expire: sync %s", u.name)
+			}
+			disconnectUserSessions(db, u.name, false)
+			go dispatchWebhookDB(db, "user.expired", gin.H{"id": u.id, "username": u.name})
+		}
+		return "accounts expired and blocked", len(users)
 
 	case "mark_overdue_invoices":
 		res, err := db.Exec(`
@@ -179,19 +255,33 @@ func runTask(db *database.DB, taskType string) (string, int) {
 			return "mark_overdue failed: " + err.Error(), 0
 		}
 		n, _ := res.RowsAffected()
-		return "invoices marked overdue", int(n)
+		if !settings.Bool("suspend_overdue", "", false) {
+			return "invoices marked overdue", int(n)
+		}
+		// Postpaid customers (service given before payment) are blocked while overdue.
+		rows, err := db.Query(`
+			UPDATE radius_users ru SET status='expired', updated_at=NOW()
+			WHERE ru.status='active' AND EXISTS (
+			    SELECT 1 FROM invoices i
+			    WHERE i.user_id = ru.id AND i.status='overdue' AND i.service_applied
+			      AND i.due_date + $1::int < CURRENT_DATE)
+			RETURNING ru.id, ru.username`, graceDays())
+		if err != nil {
+			return "suspend overdue failed: " + err.Error(), int(n)
+		}
+		users := collectUsers(rows)
+		for _, u := range users {
+			syncAccess(db, u.name)
+			disconnectUserSessions(db, u.name, false)
+		}
+		return fmt.Sprintf("invoices marked overdue; %d customer(s) blocked for non-payment", len(users)), int(n)
 
 	case "cleanup_sessions":
-		// Close radacct sessions that haven't had an update in >24h (stale).
-		// Sessions with acctupdatetime NULL never match (NULL < x is not true). Because the
-		// accounting_update_query in queries.conf appears to name a non-existent column
-		// (see that file), interim updates may not refresh acctupdatetime, in which case
-		// genuinely connected users would be closed here 24h after they connected.
 		res, err := db.Exec(`
 			UPDATE radacct SET acctstoptime=NOW(),
-			       acctterminatecause='Session-Timeout'
+			       acctterminatecause='Stale-Session'
 			WHERE acctstoptime IS NULL
-			  AND acctupdatetime < NOW() - INTERVAL '24 hours'`)
+			  AND COALESCE(acctupdatetime, acctstarttime) < NOW() - INTERVAL '24 hours'`)
 		if err != nil {
 			return "cleanup_sessions failed: " + err.Error(), 0
 		}
@@ -199,37 +289,278 @@ func runTask(db *database.DB, taskType string) (string, int) {
 		return "stale sessions closed", int(n)
 
 	case "daily_report":
-		// Count key stats for the report. The numbers are only written to last_result;
-		// nothing is emailed or stored as a report.
-		var users, sessions, traffic int
+		var users, sessions int
+		var traffic int64
 		db.QueryRow(`SELECT COUNT(*) FROM radius_users WHERE status='active'`).Scan(&users)
 		db.QueryRow(`SELECT COUNT(*) FROM radacct WHERE acctstoptime IS NULL`).Scan(&sessions)
 		db.QueryRow(`SELECT COALESCE(SUM(acctinputoctets+acctoutputoctets),0) FROM radacct WHERE acctstarttime >= CURRENT_DATE`).Scan(&traffic)
-		return fmt.Sprintf("daily report: %d active users, %d sessions, %d bytes today", users, sessions, traffic), 1
+		var pay []string
+		if rows, err := db.Query(`SELECT currency, SUM(amount), COUNT(*) FROM payments
+			WHERE status='confirmed' AND created_at >= CURRENT_DATE - 1 AND created_at < CURRENT_DATE
+			GROUP BY currency ORDER BY currency`); err == nil {
+			for rows.Next() {
+				var cur string
+				var sum float64
+				var cnt int
+				if rows.Scan(&cur, &sum, &cnt) == nil {
+					pay = append(pay, fmt.Sprintf("%s %.2f (%d)", cur, sum, cnt))
+				}
+			}
+			rows.Close()
+		}
+		if len(pay) == 0 {
+			pay = []string{"none"}
+		}
+		report := fmt.Sprintf("%d active customers, %d open sessions, %.1f MB today; payments yesterday: %s",
+			users, sessions, float64(traffic)/1048576, strings.Join(pay, ", "))
+		if to := settings.String("report_email", "", ""); to != "" && os.Getenv("SMTP_HOST") != "" {
+			if err := sendEmail(to, "[RADIUS Manager] Daily report "+time.Now().Format("2006-01-02"), report); err != nil {
+				report += " (email failed: " + err.Error() + ")"
+			} else {
+				report += " (emailed)"
+			}
+		}
+		return report, 1
 
 	case "renew_plans":
-		// Find users with expired plans and valid billing — extend for another period.
-		// WARNING: despite the comment above, no billing check exists: every active user
-		// whose expiry is within a day of today is extended a full period for free, and no
-		// invoice is raised. It ships disabled (migrations/009_billing.sql); do not enable
-		// it until it is tied to a paid invoice. Also, expire_accounts flips status to
-		// 'expired' for expiry < today, and this query only touches status 'active'.
-		res, err := db.Exec(`
-			UPDATE radius_users ru SET
-			  account_expiry = CURRENT_DATE + up.validity_days,
-			  updated_at     = NOW()
-			FROM user_plans up
-			WHERE ru.plan_id = up.id
-			  AND ru.status  = 'active'
-			  AND ru.account_expiry BETWEEN CURRENT_DATE-1 AND CURRENT_DATE+1`)
-		if err != nil {
-			return "renew_plans failed: " + err.Error(), 0
+		return raiseRenewalInvoices(db, log)
+
+	case "expiry_reminders":
+		return sendExpiryReminders(db, log)
+
+	case "voucher_housekeeping":
+		used, _ := db.Exec(`
+			UPDATE vouchers v SET status='used', redeemed_by=v.code,
+			       redeemed_at=(SELECT MIN(acctstarttime) FROM radacct ra WHERE ra.username=v.code),
+			       updated_at=NOW()
+			WHERE v.status='active' AND EXISTS (SELECT 1 FROM radacct ra WHERE ra.username=v.code)`)
+		expired, _ := db.Exec(`
+			UPDATE vouchers SET status='expired', updated_at=NOW()
+			WHERE status IN ('active','used') AND expires_at IS NOT NULL AND expires_at < NOW()`)
+		var nu, ne int64
+		if used != nil {
+			nu, _ = used.RowsAffected()
 		}
-		n, _ := res.RowsAffected()
-		return "plans renewed", int(n)
+		if expired != nil {
+			ne, _ = expired.RowsAffected()
+		}
+		return fmt.Sprintf("%d voucher(s) marked used, %d expired", nu, ne), int(nu + ne)
+
+	case "enforce_quota":
+		rows, err := db.Query(`
+			SELECT DISTINCT rc.username FROM radcheck rc
+			LEFT JOIN radius_users ru ON ru.username = rc.username
+			WHERE rc.attribute = 'Max-Octets' AND rc.value ~ '^[0-9]+$'
+			  AND EXISTS (SELECT 1 FROM radacct o WHERE o.username = rc.username AND o.acctstoptime IS NULL)
+			  AND (SELECT COALESCE(SUM(acctinputoctets + acctoutputoctets), 0) FROM radacct ra
+			       WHERE ra.username = rc.username
+			         AND ra.acctstarttime >= COALESCE(ru.period_start, DATE '1970-01-01')) >= rc.value::numeric`)
+		if err != nil {
+			return "enforce_quota failed: " + err.Error(), 0
+		}
+		var names []string
+		for rows.Next() {
+			var u string
+			if rows.Scan(&u) == nil {
+				names = append(names, u)
+			}
+		}
+		rows.Close()
+		closed := 0
+		for _, u := range names {
+			n, _ := disconnectUserSessions(db, u, false)
+			closed += n
+		}
+		return fmt.Sprintf("%d over-quota user(s), %d session(s) disconnected", len(names), closed), closed
+
+	case "backup_database":
+		name, err := runBackup()
+		if err != nil {
+			return "backup failed: " + err.Error(), 0
+		}
+		removed := pruneBackups(settings.Int("backup_retention_days", "BACKUP_RETENTION_DAYS", 14))
+		return fmt.Sprintf("wrote %s, removed %d old backup(s)", name, removed), 1
+
+	case "purge_logs":
+		total := 0
+		for _, q := range []string{
+			`DELETE FROM radpostauth WHERE authdate < NOW() - INTERVAL '180 days'`,
+			`DELETE FROM honeypot_logs WHERE created_at < NOW() - INTERVAL '30 days'`,
+			`DELETE FROM portal_sessions WHERE expires_at < NOW()`,
+			`DELETE FROM geoip_cache WHERE looked_up_at < NOW() - INTERVAL '2 days'`,
+			`DELETE FROM webhook_logs WHERE created_at < NOW() - INTERVAL '90 days'`,
+			`DELETE FROM refresh_tokens WHERE expires_at < NOW() - INTERVAL '7 days'`,
+		} {
+			if res, err := db.Exec(q); err == nil {
+				n, _ := res.RowsAffected()
+				total += int(n)
+			}
+		}
+		return "old log rows deleted", total
 	}
 
 	return "unknown task", 0
+}
+
+type userRef struct {
+	id   int
+	name string
+}
+
+func collectUsers(rows *sql.Rows) []userRef {
+	defer rows.Close()
+	var out []userRef
+	for rows.Next() {
+		var u userRef
+		if rows.Scan(&u.id, &u.name) == nil {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// raiseRenewalInvoices prepares the next period for customers on a plan. Paid plans get an
+// invoice due on the paid-until date (the period is added when it is paid); free plans are
+// extended directly. Nothing is ever extended for free on a paid plan.
+func raiseRenewalInvoices(db *database.DB, log *logrus.Logger) (string, int) {
+	days := settings.Int("renewal_invoice_days", "", 3)
+	rows, err := db.Query(`
+		SELECT ru.id, ru.username, ru.plan_id, ru.account_expiry
+		FROM radius_users ru
+		JOIN user_plans up ON up.id = ru.plan_id AND up.is_active
+		WHERE ru.status = 'active'
+		  AND ru.account_expiry IS NOT NULL
+		  AND ru.account_expiry BETWEEN CURRENT_DATE - 1 AND CURRENT_DATE + $1::int
+		  AND NOT EXISTS (SELECT 1 FROM invoices i
+		                  WHERE i.user_id = ru.id AND i.status IN ('pending','overdue'))`, days)
+	if err != nil {
+		return "renew_plans failed: " + err.Error(), 0
+	}
+	type cand struct {
+		id, planID int
+		name       string
+		expiry     time.Time
+	}
+	var list []cand
+	for rows.Next() {
+		var c cand
+		if rows.Scan(&c.id, &c.name, &c.planID, &c.expiry) == nil {
+			list = append(list, c)
+		}
+	}
+	rows.Close()
+
+	invoices, extended := 0, 0
+	for _, c := range list {
+		err := func() error {
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			p, err := loadPlan(tx, c.planID)
+			if err != nil {
+				return err
+			}
+			if p.Price <= 0 {
+				if _, _, err := grantPlanPeriod(tx, c.id, p); err != nil {
+					return err
+				}
+				extended++
+				return tx.Commit()
+			}
+			due := c.expiry
+			if due.Before(time.Now().Truncate(24 * time.Hour)) {
+				due = time.Now()
+			}
+			inv, err := createInvoiceTx(tx, newInvoice{UserID: &c.id, Username: c.name, PlanID: &p.ID,
+				PlanName: &p.Name, Amount: p.Price, Currency: p.Currency, DueDate: &due,
+				Notes: "Renewal for the period after " + c.expiry.Format("2006-01-02")})
+			if err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			invoices++
+			go dispatchWebhookDB(db, "invoice.created", gin.H{"invoice_id": inv.ID, "invoice_number": inv.Number,
+				"username": c.name, "amount": inv.Amount, "renewal": true})
+			return nil
+		}()
+		if err != nil {
+			log.WithError(err).Warnf("renewal for %s", c.name)
+		}
+	}
+	return fmt.Sprintf("%d renewal invoice(s) raised, %d free plan(s) extended", invoices, extended), invoices + extended
+}
+
+// sendExpiryReminders texts/emails customers whose paid-until date is within reminder_days,
+// once per paid-until date (radius_users.last_reminder_for). Customers with no reachable
+// channel are skipped and retried on the next run.
+func sendExpiryReminders(db *database.DB, log *logrus.Logger) (string, int) {
+	days := settings.Int("reminder_days", "", 3)
+	sms, email := smsConfigured(), os.Getenv("SMTP_HOST") != ""
+	if !sms && !email {
+		return "no SMS gateway or SMTP configured; nothing sent", 0
+	}
+	tmpl := settings.String("reminder_message", "",
+		"Dear {username}, your internet subscription expires on {expiry}. Please pay {amount} to stay connected.")
+	org := settings.String("org_name", "", "")
+
+	rows, err := db.Query(`
+		SELECT ru.username, COALESCE(ru.phone,''), COALESCE(ru.email,''), ru.account_expiry,
+		       COALESCE(up.name,''),
+		       COALESCE((SELECT i.currency || ' ' || to_char(i.amount, 'FM999999990.00') FROM invoices i
+		                 WHERE i.user_id = ru.id AND i.status IN ('pending','overdue') ORDER BY i.id DESC LIMIT 1),
+		                up.currency || ' ' || to_char(up.price, 'FM999999990.00'), '')
+		FROM radius_users ru
+		LEFT JOIN user_plans up ON up.id = ru.plan_id
+		WHERE ru.status = 'active' AND ru.account_expiry BETWEEN CURRENT_DATE AND CURRENT_DATE + $1::int
+		  AND (ru.last_reminder_for IS NULL OR ru.last_reminder_for <> ru.account_expiry)`, days)
+	if err != nil {
+		return "expiry_reminders failed: " + err.Error(), 0
+	}
+	type cust struct {
+		user, phone, mail, plan, amount string
+		expiry                          time.Time
+	}
+	var list []cust
+	for rows.Next() {
+		var c cust
+		if rows.Scan(&c.user, &c.phone, &c.mail, &c.expiry, &c.plan, &c.amount) == nil {
+			list = append(list, c)
+		}
+	}
+	rows.Close()
+
+	sent := 0
+	for _, c := range list {
+		msg := strings.NewReplacer("{username}", c.user, "{expiry}", c.expiry.Format("2006-01-02"),
+			"{amount}", c.amount, "{plan}", c.plan, "{org}", org).Replace(tmpl)
+		ok := false
+		if sms && c.phone != "" {
+			ref, err := sendSMSGateway(c.phone, msg)
+			status := "sent"
+			if err != nil {
+				status = "failed"
+			} else {
+				ok = true
+			}
+			logSMS(db, c.phone, msg, status, ref, c.user)
+		}
+		if email && c.mail != "" {
+			if err := sendEmail(c.mail, "Your internet subscription expires on "+c.expiry.Format("2 Jan 2006"), msg); err == nil {
+				ok = true
+			} else {
+				log.WithError(err).Warnf("reminder email to %s", c.user)
+			}
+		}
+		if ok {
+			db.Exec(`UPDATE radius_users SET last_reminder_for = account_expiry WHERE username = $1`, c.user)
+			sent++
+		}
+	}
+	return fmt.Sprintf("%d reminder(s) sent", sent), sent
 }
 
 func nextRunTime(schedule string) time.Time {

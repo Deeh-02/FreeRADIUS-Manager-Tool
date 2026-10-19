@@ -2,10 +2,7 @@ package handlers
 
 import (
 	"context"
-	"crypto/md5"
-	"crypto/rand"
 	"database/sql"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"net/http"
@@ -14,6 +11,7 @@ import (
 	strs "strings"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/freeradius-manager/backend/internal/models"
 	"github.com/gin-gonic/gin"
 )
@@ -23,7 +21,9 @@ func (h *Handler) ListNAS(c *gin.Context) {
 	offset, limit := paginationParams(c)
 
 	rows, err := h.db.Query(`
-		SELECT id, nasname, shortname, type, ports, secret, server, community, description, status, created_at, updated_at
+		SELECT id, nasname, COALESCE(shortname, ''), COALESCE(type, 'other'), ports, '***',
+		       COALESCE(server, ''), '', COALESCE(description, ''), COALESCE(status, 'active'),
+		       created_at, updated_at
 		FROM nas
 		ORDER BY created_at DESC
 		LIMIT $1 OFFSET $2`, limit, offset)
@@ -36,9 +36,11 @@ func (h *Handler) ListNAS(c *gin.Context) {
 	list := []models.NAS{}
 	for rows.Next() {
 		var n models.NAS
-		rows.Scan(&n.ID, &n.NASName, &n.ShortName, &n.Type, &n.Ports, &n.Secret,
-			&n.Server, &n.Community, &n.Description, &n.Status, &n.CreatedAt, &n.UpdatedAt)
-		n.Secret = "***"
+		if err := rows.Scan(&n.ID, &n.NASName, &n.ShortName, &n.Type, &n.Ports, &n.Secret,
+			&n.Server, &n.Community, &n.Description, &n.Status, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			h.log.WithError(err).Warn("scan nas row")
+			continue
+		}
 		list = append(list, n)
 	}
 
@@ -48,11 +50,10 @@ func (h *Handler) ListNAS(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": list, "total": total})
 }
 
-// GetNAS returns a single NAS client by ID.
-// Unlike ListNAS (which masks it as "***"), this returns the shared secret in clear, and
-// the route is open to the operator role, so operators can read every NAS secret.
+// GetNAS returns a single NAS client by ID. The shared secret and SNMP community are only
+// returned to admins; operators see them masked.
 // FreeRADIUS reads NAS clients from the nas table at startup (read_clients = yes), so a
-// new or changed NAS only takes effect after FreeRADIUS is restarted/reloaded.
+// new or changed NAS only takes effect after FreeRADIUS is restarted.
 func (h *Handler) GetNAS(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -62,10 +63,12 @@ func (h *Handler) GetNAS(c *gin.Context) {
 
 	var n models.NAS
 	err = h.db.QueryRow(`
-		SELECT id, nasname, shortname, type, ports, secret, server, community, description, status, created_at, updated_at
+		SELECT id, nasname, COALESCE(shortname, ''), COALESCE(type, 'other'), ports, secret,
+		       COALESCE(server, ''), COALESCE(community, ''), COALESCE(description, ''),
+		       COALESCE(status, 'active'), coa_port, created_at, updated_at
 		FROM nas WHERE id = $1`, id,
 	).Scan(&n.ID, &n.NASName, &n.ShortName, &n.Type, &n.Ports, &n.Secret,
-		&n.Server, &n.Community, &n.Description, &n.Status, &n.CreatedAt, &n.UpdatedAt)
+		&n.Server, &n.Community, &n.Description, &n.Status, &n.CoAPort, &n.CreatedAt, &n.UpdatedAt)
 
 	if err == sql.ErrNoRows {
 		respondError(c, http.StatusNotFound, "NAS not found")
@@ -74,6 +77,12 @@ func (h *Handler) GetNAS(c *gin.Context) {
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "database error")
 		return
+	}
+	if claims, ok := middleware.GetClaims(c); !ok || claims.Role == "operator" {
+		n.Secret = "***"
+		if n.Community != "" {
+			n.Community = "***"
+		}
 	}
 
 	c.JSON(http.StatusOK, n)
@@ -90,14 +99,17 @@ func (h *Handler) CreateNAS(c *gin.Context) {
 	if req.Type == "" {
 		req.Type = "other"
 	}
+	if req.CoAPort == 0 {
+		req.CoAPort = 3799
+	}
 
 	var newID int
 	err := h.db.QueryRow(`
-		INSERT INTO nas (nasname, shortname, type, ports, secret, server, community, description)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO nas (nasname, shortname, type, ports, secret, server, community, description, coa_port)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING id`,
 		req.NASName, req.ShortName, req.Type, req.Ports, req.Secret,
-		req.Server, req.Community, req.Description,
+		nullableString(req.Server), nullableString(req.Community), req.Description, req.CoAPort,
 	).Scan(&newID)
 
 	if err != nil {
@@ -110,7 +122,10 @@ func (h *Handler) CreateNAS(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{"id": newID, "message": "NAS device added successfully"})
+	c.JSON(http.StatusCreated, gin.H{
+		"id":      newID,
+		"message": "NAS device added. Restart FreeRADIUS (docker compose restart freeradius) for it to accept this device's own secret.",
+	})
 }
 
 // UpdateNAS updates an existing NAS client.
@@ -137,17 +152,22 @@ func (h *Handler) UpdateNAS(c *gin.Context) {
 		    community   = COALESCE(NULLIF($6, ''), community),
 		    description = COALESCE(NULLIF($7, ''), description),
 		    status      = COALESCE(NULLIF($8, ''), status),
+		    coa_port    = COALESCE($10, coa_port),
 		    updated_at  = NOW()
 		WHERE id = $9`,
 		req.ShortName, req.Type, req.Ports, req.Secret, req.Server,
-		req.Community, req.Description, req.Status, id,
+		req.Community, req.Description, req.Status, id, req.CoAPort,
 	)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to update NAS")
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "NAS updated successfully"})
+	msg := "NAS updated successfully"
+	if req.Secret != "" || req.Status != "" {
+		msg += ". Restart FreeRADIUS for a changed secret or status to take effect."
+	}
+	c.JSON(http.StatusOK, gin.H{"message": msg})
 }
 
 // DeleteNAS removes a NAS client.
@@ -259,9 +279,6 @@ func (h *Handler) TestRADIUS(c *gin.Context) {
 	}
 
 	secret := os.Getenv("RADIUS_SECRET")
-	if secret == "" {
-		secret = "testing123"
-	}
 
 	port := getRadiusPort()
 	start := time.Now()
@@ -322,9 +339,6 @@ func (h *Handler) DiscoverNAS(c *gin.Context) {
 	}
 
 	secret := os.Getenv("RADIUS_SECRET")
-	if secret == "" {
-		secret = "testing123"
-	}
 
 	port := getRadiusPort()
 	discovered := []gin.H{}
@@ -351,110 +365,6 @@ func (h *Handler) DiscoverNAS(c *gin.Context) {
 		"discovered": discovered,
 		"count":      len(discovered),
 	})
-}
-
-// ─── RADIUS packet helpers (pure Go, no external library) ────────────────────
-
-// buildAccessRequest constructs a minimal RADIUS Access-Request packet.
-// Hand-rolled to avoid a RADIUS library dependency. It carries no Message-Authenticator;
-// that is why freeradius/clients.conf sets require_message_authenticator = no — a stricter
-// setting would make the server drop these probes.
-func buildAccessRequest(username, password, secret string) []byte {
-	// Random authenticator (16 bytes)
-	authenticator := make([]byte, 16)
-	rand.Read(authenticator)
-
-	// Random identifier
-	idByte := make([]byte, 1)
-	rand.Read(idByte)
-	id := idByte[0]
-
-	// Encode User-Password: RFC 2865 §5.2
-	encPw := encodePassword(password, secret, authenticator)
-
-	// Build attributes
-	attrs := []byte{}
-
-	// User-Name attribute (type=1)
-	attrs = appendAttr(attrs, 1, []byte(username))
-	// User-Password attribute (type=2)
-	attrs = appendAttr(attrs, 2, encPw)
-	// NAS-IP-Address attribute (type=4) — use 127.0.0.1
-	nasIP := net.ParseIP("127.0.0.1").To4()
-	attrs = appendAttr(attrs, 4, nasIP)
-
-	// Total length = 20 (header) + len(attrs)
-	totalLen := uint16(20 + len(attrs))
-	packet := make([]byte, 20)
-	packet[0] = 1 // Code: Access-Request
-	packet[1] = id
-	binary.BigEndian.PutUint16(packet[2:4], totalLen)
-	copy(packet[4:20], authenticator)
-	packet = append(packet, attrs...)
-
-	return packet
-}
-
-// encodePassword encodes the User-Password per RFC 2865 §5.2.
-func encodePassword(password, secret string, authenticator []byte) []byte {
-	pw := []byte(password)
-	// Pad to multiple of 16 bytes
-	for len(pw)%16 != 0 {
-		pw = append(pw, 0)
-	}
-	if len(pw) == 0 {
-		pw = make([]byte, 16)
-	}
-
-	result := make([]byte, len(pw))
-	prev := authenticator
-	for i := 0; i < len(pw); i += 16 {
-		h := md5.New()
-		h.Write([]byte(secret))
-		h.Write(prev)
-		b := h.Sum(nil)
-		for j := 0; j < 16; j++ {
-			result[i+j] = pw[i+j] ^ b[j]
-		}
-		prev = result[i : i+16]
-	}
-	return result
-}
-
-// appendAttr appends a RADIUS TLV attribute (type, length, value).
-func appendAttr(buf []byte, attrType byte, value []byte) []byte {
-	buf = append(buf, attrType)
-	buf = append(buf, byte(2+len(value)))
-	buf = append(buf, value...)
-	return buf
-}
-
-// sendRADIUSPacket sends a RADIUS packet over UDP and waits for a response.
-func sendRADIUSPacket(ctx context.Context, addr string, packet []byte, timeout time.Duration) ([]byte, error) {
-	conn, err := net.DialTimeout("udp", addr, timeout)
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	// Set deadline from context or timeout
-	deadline := time.Now().Add(timeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
-	conn.SetDeadline(deadline)
-
-	if _, err := conn.Write(packet); err != nil {
-		return nil, err
-	}
-
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	return buf[:n], nil
 }
 
 // sendTestRADIUS sends a probe packet and returns a connectivity result.

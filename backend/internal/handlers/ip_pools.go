@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -91,12 +92,17 @@ func (h *Handler) CreateIPPool(c *gin.Context) {
 		isActive = *req.IsActive
 	}
 
-	// Validate CIDR
+	// Validate CIDR (IPv4 only: Framed-IP-Address is an IPv4 attribute)
 	_, ipNet, err := net.ParseCIDR(req.Network)
-	if err != nil {
-		respondError(c, http.StatusBadRequest, "invalid network CIDR (e.g. 10.10.0.0/24)")
+	if err != nil || ipNet.IP.To4() == nil {
+		respondError(c, http.StatusBadRequest, "invalid IPv4 network CIDR (e.g. 10.10.0.0/24)")
 		return
 	}
+	if ones, _ := ipNet.Mask.Size(); ones < 16 || ones > 30 {
+		respondError(c, http.StatusBadRequest, "pool size must be between /16 and /30")
+		return
+	}
+	req.Network = ipNet.String()
 
 	// Auto-derive gateway if not provided
 	if req.Gateway == "" {
@@ -119,23 +125,39 @@ func (h *Handler) CreateIPPool(c *gin.Context) {
 		return
 	}
 
-	// Populate IPs (skip network addr, broadcast, and gateway)
+	// Populate IPs (skip network addr, broadcast, and gateway). Addresses already in another
+	// pool are skipped, so overlapping pools never hand out the same IP twice.
 	ips := enumerateIPs(ipNet)
-	tx, _ := h.db.Begin()
 	count := 0
-	for _, ip := range ips {
-		if ip == req.Gateway {
-			continue // skip gateway
+	err = h.inTx(func(tx *sql.Tx) error {
+		for _, ip := range ips {
+			if ip == req.Gateway {
+				continue
+			}
+			res, err := tx.Exec(`INSERT INTO ip_pool_assignments (pool_id,ip_address) VALUES ($1,$2)
+				ON CONFLICT (ip_address) DO NOTHING`, poolID, ip)
+			if err != nil {
+				return err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				count++
+			}
 		}
-		tx.Exec(`INSERT INTO ip_pool_assignments (pool_id,ip_address) VALUES ($1,$2)
-			ON CONFLICT (ip_address) DO NOTHING`, poolID, ip)
-		count++
+		return nil
+	})
+	if err != nil {
+		h.db.Exec(`DELETE FROM ip_pools WHERE id=$1`, poolID)
+		respondError(c, http.StatusInternalServerError, "failed to populate pool addresses")
+		return
 	}
-	tx.Commit()
 
+	msg := fmt.Sprintf("pool created with %d addresses", count)
+	if len(ips) >= 1023 {
+		msg += " (large networks are capped at 1023 addresses)"
+	}
 	c.JSON(http.StatusCreated, gin.H{
 		"id":       poolID,
-		"message":  fmt.Sprintf("pool created with %d addresses", count),
+		"message":  msg,
 		"ip_count": count,
 	})
 }
@@ -189,12 +211,9 @@ func (h *Handler) ListPoolIPs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": list})
 }
 
-// AssignIP assigns a specific IP to a user (or auto-picks a free one).
-// NOTE: the radreply write below uses ON CONFLICT (username,attribute), but init-db.sql
-// creates radreply_username as a plain (non-unique) index, so Postgres has no matching
-// constraint and the INSERT is expected to error. The error is ignored, so the API
-// reports success and the pool table is updated while FreeRADIUS never receives a
-// Framed-IP-Address. (Read from the schema; not run against a database.)
+// AssignIP assigns a specific IP to a user (or auto-picks a free one) and writes it as the
+// user's Framed-IP-Address reply, in one transaction. The router hands out that address on
+// the user's next login.
 func (h *Handler) AssignIP(c *gin.Context) {
 	var req struct {
 		Username  string  `json:"username" binding:"required"`
@@ -207,49 +226,48 @@ func (h *Handler) AssignIP(c *gin.Context) {
 		return
 	}
 
-	// Get user ID
 	var userID int
-	h.db.QueryRow(`SELECT id FROM radius_users WHERE username=$1`, req.Username).Scan(&userID)
+	if err := h.db.QueryRow(`SELECT id FROM radius_users WHERE username=$1`, req.Username).Scan(&userID); err != nil {
+		respondError(c, http.StatusNotFound, "user not found")
+		return
+	}
 
 	var ip string
-	if req.IPAddress != nil && *req.IPAddress != "" {
-		ip = *req.IPAddress
-		// Verify it belongs to the pool
-		var exists bool
-		h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ip_pool_assignments WHERE pool_id=$1 AND ip_address=$2)`,
-			req.PoolID, ip).Scan(&exists)
-		if !exists {
-			respondError(c, http.StatusBadRequest, "IP does not belong to this pool")
-			return
+	err := h.inTx(func(tx *sql.Tx) error {
+		if req.IPAddress != nil && *req.IPAddress != "" {
+			// The address must belong to the pool and be free (or already this user's).
+			var owner sql.NullString
+			if err := tx.QueryRow(`SELECT username FROM ip_pool_assignments WHERE pool_id=$1 AND ip_address=$2 FOR UPDATE`,
+				req.PoolID, *req.IPAddress).Scan(&owner); err != nil {
+				return fmt.Errorf("IP does not belong to this pool")
+			}
+			if owner.Valid && owner.String != req.Username {
+				return fmt.Errorf("IP is already assigned to %s", owner.String)
+			}
+			ip = *req.IPAddress
+		} else if err := tx.QueryRow(`SELECT ip_address FROM ip_pool_assignments
+			WHERE pool_id=$1 AND username IS NULL ORDER BY inet(ip_address) LIMIT 1 FOR UPDATE SKIP LOCKED`,
+			req.PoolID).Scan(&ip); err != nil {
+			return fmt.Errorf("no free IPs available in pool")
 		}
-	} else {
-		// Auto-pick first free IP
-		err := h.db.QueryRow(`SELECT ip_address FROM ip_pool_assignments
-			WHERE pool_id=$1 AND username IS NULL ORDER BY inet(ip_address) LIMIT 1`, req.PoolID).Scan(&ip)
-		if err != nil {
-			respondError(c, http.StatusConflict, "no free IPs available in pool")
-			return
+		if _, err := tx.Exec(`UPDATE ip_pool_assignments SET username=NULL, user_id=NULL, leased_at=NULL
+			WHERE username=$1 AND ip_address<>$2`, req.Username, ip); err != nil {
+			return err
 		}
+		if _, err := tx.Exec(`UPDATE ip_pool_assignments
+			SET username=$1, user_id=$2, is_static=$3, leased_at=NOW()
+			WHERE ip_address=$4`, req.Username, userID, req.IsStatic, ip); err != nil {
+			return err
+		}
+		return setReply(tx, req.Username, "Framed-IP-Address", "=", ip)
+	})
+	if err != nil {
+		respondError(c, http.StatusConflict, err.Error())
+		return
 	}
-
-	// Release old assignment if user had one
-	var oldIP string
-	if err := h.db.QueryRow(`SELECT ip_address FROM ip_pool_assignments WHERE username=$1`, req.Username).Scan(&oldIP); err == nil {
-		h.db.Exec(`UPDATE ip_pool_assignments SET username=NULL, user_id=NULL, leased_at=NULL WHERE ip_address=$1`, oldIP)
-		h.db.Exec(`DELETE FROM radreply WHERE username=$1 AND attribute='Framed-IP-Address'`, req.Username)
-	}
-
-	// Assign
-	h.db.Exec(`UPDATE ip_pool_assignments
-		SET username=$1, user_id=$2, is_static=$3, leased_at=NOW()
-		WHERE ip_address=$4`, req.Username, userID, req.IsStatic, ip)
-
-	// Set RADIUS Framed-IP-Address
-	h.db.Exec(`INSERT INTO radreply (username,attribute,op,value) VALUES ($1,'Framed-IP-Address','=',$2)
-		ON CONFLICT (username,attribute) DO UPDATE SET value=$2`, req.Username, ip)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":    fmt.Sprintf("IP %s assigned to %s", ip, req.Username),
+		"message":    fmt.Sprintf("IP %s assigned to %s (applies at the next login)", ip, req.Username),
 		"ip_address": ip,
 		"username":   req.Username,
 	})
@@ -264,8 +282,15 @@ func (h *Handler) ReleaseIP(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.db.Exec(`UPDATE ip_pool_assignments SET username=NULL, user_id=NULL, leased_at=NULL WHERE username=$1`, req.Username)
-	h.db.Exec(`DELETE FROM radreply WHERE username=$1 AND attribute='Framed-IP-Address'`, req.Username)
+	if err := h.inTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE ip_pool_assignments SET username=NULL, user_id=NULL, leased_at=NULL WHERE username=$1`, req.Username); err != nil {
+			return err
+		}
+		return deleteReply(tx, req.Username, "Framed-IP-Address")
+	}); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to release IP")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "IP released"})
 }
 

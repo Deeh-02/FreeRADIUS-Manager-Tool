@@ -35,6 +35,8 @@ type UpdateAdminUserRequest struct {
 	FullName string `json:"full_name"`
 	Role     string `json:"role" binding:"omitempty,oneof=super_admin admin operator"`
 	IsActive *bool  `json:"is_active"`
+	ResetMFA bool   `json:"reset_mfa"` // turn off the user's MFA so they can enrol again
+	Unlock   bool   `json:"unlock"`    // clear a brute-force lockout
 }
 
 // LoginRequest is the login payload.

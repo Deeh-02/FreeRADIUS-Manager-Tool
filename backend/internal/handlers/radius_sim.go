@@ -2,9 +2,9 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -57,13 +57,10 @@ func (h *Handler) SimulateAuth(c *gin.Context) {
 		req.NASIP = radiusHost
 	}
 	if req.NASPort == 0 {
-		req.NASPort = 1812
+		req.NASPort = getRadiusPort()
 	}
 	if req.Secret == "" {
 		req.Secret = os.Getenv("RADIUS_SECRET")
-		if req.Secret == "" {
-			req.Secret = "testing123"
-		}
 	}
 	if req.TimeoutMs == 0 {
 		req.TimeoutMs = 5000
@@ -98,14 +95,11 @@ func (h *Handler) SimulateBatch(c *gin.Context) {
 	secret := req.Secret
 	if secret == "" {
 		secret = os.Getenv("RADIUS_SECRET")
-		if secret == "" {
-			secret = "testing123"
-		}
 	}
 
 	results := []SimResult{}
 	for _, pair := range req.Pairs {
-		r := runRADIUSSimulation(radiusHost, 1812, secret, pair.Username, pair.Password, "", "", 3*time.Second)
+		r := runRADIUSSimulation(radiusHost, getRadiusPort(), secret, pair.Username, pair.Password, "", "", 3*time.Second)
 		results = append(results, r)
 	}
 
@@ -124,78 +118,74 @@ func (h *Handler) SimulateBatch(c *gin.Context) {
 }
 
 // runRADIUSSimulation builds an Access-Request and decodes the reply.
-// Uses the existing low-level sendRADIUSPacket from nas.go.
 func runRADIUSSimulation(host string, port int, secret, username, password, calledID, callingID string, timeout time.Duration) SimResult {
 	result := SimResult{
 		RequestAttrs: map[string]string{},
 		ReplyAttrs:   map[string]string{},
 	}
 
-	id := byte(rand.Intn(256))
 	authenticator := make([]byte, 16)
 	rand.Read(authenticator)
 
-	var attrs []byte
-	attrs = appendAttr(attrs, 1, []byte(username))
-	encPw := xorPassword([]byte(password), []byte(secret), authenticator)
-	attrs = appendAttr(attrs, 2, encPw)
-
-	// NAS-IP-Address (4)
+	attrs := []radAttr{
+		{attrUserName, []byte(username)},
+		{attrUserPassword, encodePassword(password, secret, authenticator)},
+	}
 	if ip := net.ParseIP(host); ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
-			attrs = appendAttr(attrs, 4, ip4)
+			attrs = append(attrs, radAttr{attrNASIPAddress, ip4})
 		}
 	}
-	// NAS-Port (5)
 	portBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(portBytes, 1)
-	attrs = appendAttr(attrs, 5, portBytes)
-	// Service-Type (6) = Framed-User (2)
-	attrs = appendAttr(attrs, 6, []byte{0, 0, 0, 2})
+	attrs = append(attrs, radAttr{attrNASPort, portBytes}, radAttr{attrServiceType, []byte{0, 0, 0, 2}})
 	if calledID != "" {
-		attrs = appendAttr(attrs, 30, []byte(calledID))
+		attrs = append(attrs, radAttr{attrCalledStationID, []byte(calledID)})
 	}
 	if callingID != "" {
-		attrs = appendAttr(attrs, 31, []byte(callingID))
+		attrs = append(attrs, radAttr{attrCallingStationID, []byte(callingID)})
 	}
-
-	length := uint16(20 + len(attrs))
-	pkt := []byte{1, id, byte(length >> 8), byte(length)}
-	pkt = append(pkt, authenticator...)
-	pkt = append(pkt, attrs...)
+	pkt, err := buildPacket(codeAccessRequest, secret, attrs, authenticator)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
 
 	result.RawRequest = fmt.Sprintf("%x", pkt)
 	result.RequestAttrs["User-Name"] = username
 	result.RequestAttrs["NAS-IP-Address"] = host
 	result.RequestAttrs["Service-Type"] = "Framed-User"
+	result.RequestAttrs["Message-Authenticator"] = "(signed)"
 	if calledID != "" {
 		result.RequestAttrs["Called-Station-Id"] = calledID
 	}
+	if callingID != "" {
+		result.RequestAttrs["Calling-Station-Id"] = callingID
+	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, fmt.Sprint(port))
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	reply, err := sendRADIUSPacket(ctx, addr, pkt, timeout)
 	if err != nil {
-		result.Error = "no reply (timeout or unreachable): " + err.Error()
+		result.Error = "no reply (timeout, unreachable, or wrong shared secret): " + err.Error()
 		return result
 	}
 
 	result.RawReply = fmt.Sprintf("%x", reply)
-	result.Success = true
-
-	if len(reply) < 4 {
-		result.Error = "malformed reply"
+	if err := verifyResponse(pkt, reply, secret); err != nil {
+		result.Error = err.Error()
 		return result
 	}
+	result.Success = true
 
 	switch reply[0] {
-	case 2:
+	case codeAccessAccept:
 		result.Reply = "Access-Accept"
-	case 3:
+	case codeAccessReject:
 		result.Reply = "Access-Reject"
-	case 11:
+	case codeAccessChallenge:
 		result.Reply = "Access-Challenge"
 	default:
 		result.Reply = fmt.Sprintf("Code-%d", reply[0])
@@ -208,32 +198,11 @@ func runRADIUSSimulation(host string, port int, secret, username, password, call
 	return result
 }
 
-// xorPassword implements RFC 2865 User-Password encryption.
-func xorPassword(password, secret, auth []byte) []byte {
-	padLen := ((len(password) + 15) / 16) * 16
-	if padLen == 0 {
-		padLen = 16
-	}
-	padded := make([]byte, padLen)
-	copy(padded, password)
-
-	result := make([]byte, padLen)
-	prev := auth
-	for i := 0; i < padLen; i += 16 {
-		h := computeMD5(append(secret, prev...))
-		for j := 0; j < 16; j++ {
-			result[i+j] = padded[i+j] ^ h[j]
-		}
-		prev = result[i : i+16]
-	}
-	return result
-}
-
 // decodeReplyAttrs parses RADIUS TLV attributes into a human-readable map.
 func decodeReplyAttrs(data []byte, attrs map[string]string) {
 	attrNames := map[byte]string{
 		1: "User-Name", 4: "NAS-IP-Address", 5: "NAS-Port",
-		6: "Service-Type", 8: "Framed-IP-Address", 18: "Reply-Message",
+		6: "Service-Type", 8: "Framed-IP-Address", 18: "Reply-Message", 80: "Message-Authenticator",
 		25: "Class", 26: "Vendor-Specific", 27: "Session-Timeout",
 		28: "Idle-Timeout", 30: "Called-Station-Id", 31: "Calling-Station-Id",
 	}

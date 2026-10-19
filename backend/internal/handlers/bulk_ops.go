@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,15 +15,17 @@ import (
 // Bulk User Operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-// BulkOperation performs an action on multiple RADIUS users.
-// Each username is processed independently (no transaction, errors are reported per user
-// but statement errors inside an action are often ignored). Actions are not equivalent to
-// their single-user counterparts: "change_plan" only sets plan_id — it does not apply the
-// plan's attributes, expiry or invoice like AssignPlan does — and "apply_template" uses
-// ON CONFLICT on radreply, which has no unique index (see AssignIP).
+// BulkOperation performs an action on multiple RADIUS users. Each username is processed in
+// its own transaction with the same helpers the single-user endpoints use, so a bulk
+// suspend/expiry/plan change has exactly the same effect on the network as doing it one by
+// one. Errors are reported per user.
+//
+// Actions: suspend, activate, delete, change_plan {plan_id, start_now}, set_expiry {expiry:
+// YYYY-MM-DD or ""}, apply_template {template_id}, reset_attributes (removes speed, fixed IP,
+// data and time caps; the device limit and expiry are re-written from the user record).
 func (h *Handler) BulkOperation(c *gin.Context) {
 	var req struct {
-		Usernames []string               `json:"usernames" binding:"required,min=1"`
+		Usernames []string               `json:"usernames" binding:"required,min=1,max=5000"`
 		Action    string                 `json:"action"    binding:"required"`
 		Params    map[string]interface{} `json:"params"`
 	}
@@ -38,6 +41,33 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 		performedBy = &id
 	}
 
+	intParam := func(name string) int {
+		if req.Params == nil {
+			return 0
+		}
+		if fv, ok := req.Params[name].(float64); ok {
+			return int(fv)
+		}
+		return 0
+	}
+	strParam := func(name string) (string, bool) {
+		if req.Params == nil {
+			return "", false
+		}
+		v, ok := req.Params[name].(string)
+		return v, ok
+	}
+
+	var templateAttrs []AttributeEntry
+	if req.Action == "apply_template" {
+		var attrsRaw []byte
+		if err := h.db.QueryRow(`SELECT attributes FROM radius_templates WHERE id=$1 AND is_active`, intParam("template_id")).Scan(&attrsRaw); err != nil {
+			respondError(c, http.StatusBadRequest, "template not found or inactive")
+			return
+		}
+		json.Unmarshal(attrsRaw, &templateAttrs)
+	}
+
 	type Result struct {
 		Username string `json:"username"`
 		Success  bool   `json:"success"`
@@ -48,111 +78,94 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 	successCount, failCount := 0, 0
 
 	for _, username := range req.Usernames {
+		var userID int
 		var msg string
-		var opErr error
+		opErr := h.db.QueryRow(`SELECT id FROM radius_users WHERE username=$1`, username).Scan(&userID)
+		if opErr == sql.ErrNoRows {
+			opErr = fmt.Errorf("user not found")
+		}
 
-		switch req.Action {
-		case "suspend":
-			_, opErr = h.db.Exec(`UPDATE radius_users SET status='suspended' WHERE username=$1`, username)
-			if opErr == nil {
-				h.db.Exec(`DELETE FROM radcheck WHERE username=$1 AND attribute='Auth-Type'`, username)
-				h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Auth-Type',':=','Reject')`, username)
-				msg = "suspended"
-			}
+		if opErr == nil {
+			switch req.Action {
+			case "suspend", "activate":
+				target := map[string]string{"suspend": "suspended", "activate": "active"}[req.Action]
+				var st string
+				_, st, opErr = setUserStatus(h.db, userID, target)
+				msg = st
+				if opErr == nil && target == "suspended" {
+					disconnectUserSessions(h.db, username, false)
+				}
 
-		case "activate":
-			_, opErr = h.db.Exec(`UPDATE radius_users SET status='active' WHERE username=$1`, username)
-			if opErr == nil {
-				h.db.Exec(`DELETE FROM radcheck WHERE username=$1 AND attribute='Auth-Type' AND value='Reject'`, username)
-				msg = "activated"
-			}
+			case "delete":
+				disconnectUserSessions(h.db, username, true)
+				opErr = h.inTx(func(tx *sql.Tx) error { return deleteRadiusUserTx(tx, userID, username) })
+				msg = "deleted"
 
-		case "delete":
-			h.db.Exec(`DELETE FROM radcheck WHERE username=$1`, username)
-			h.db.Exec(`DELETE FROM radreply WHERE username=$1`, username)
-			h.db.Exec(`DELETE FROM radusergroup WHERE username=$1`, username)
-			_, opErr = h.db.Exec(`DELETE FROM radius_users WHERE username=$1`, username)
-			msg = "deleted"
-
-		case "change_plan":
-			planID := 0
-			if req.Params != nil {
-				if v, ok := req.Params["plan_id"]; ok {
-					if fv, ok := v.(float64); ok {
-						planID = int(fv)
+			case "change_plan":
+				planID := intParam("plan_id")
+				startNow, _ := req.Params["start_now"].(bool)
+				if planID == 0 {
+					opErr = fmt.Errorf("plan_id required in params")
+					break
+				}
+				opErr = h.inTx(func(tx *sql.Tx) error {
+					res, err := assignPlanTx(tx, userID, username, planID, startNow, "", performedBy)
+					if err == nil {
+						msg = res.Message
 					}
-				}
-			}
-			if planID == 0 {
-				opErr = fmt.Errorf("plan_id required in params")
-			} else {
-				_, opErr = h.db.Exec(`UPDATE radius_users SET plan_id=$1 WHERE username=$2`, planID, username)
-				msg = fmt.Sprintf("plan changed to #%d", planID)
-			}
+					return err
+				})
 
-		case "set_expiry":
-			expiry := ""
-			if req.Params != nil {
-				if v, ok := req.Params["expiry"]; ok {
-					expiry, _ = v.(string)
+			case "set_expiry":
+				expiry, ok := strParam("expiry")
+				if !ok {
+					opErr = fmt.Errorf("expiry required in params (YYYY-MM-DD, or empty for never)")
+					break
 				}
-			}
-			if expiry == "" {
-				opErr = fmt.Errorf("expiry required in params")
-			} else {
-				_, opErr = h.db.Exec(`UPDATE radius_users SET account_expiry=$1 WHERE username=$2`, expiry, username)
-				if opErr == nil {
-					// The only code path that writes the radcheck Expiration attribute the FreeRADIUS
-					// `expiration` module enforces. The value is an ISO date (YYYY-MM-DD); I could not
-					// confirm that FreeRADIUS parses that format (it documents e.g. "Dec 31 2026").
-					h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Expiration',':=',$2)
-						ON CONFLICT (username,attribute) DO UPDATE SET value=$2`, username, expiry)
-					msg = "expiry updated to " + expiry
+				var d *time.Time
+				if d, opErr = parseDateParam(expiry); opErr != nil {
+					break
 				}
-			}
-
-		case "apply_template":
-			templateID := 0
-			if req.Params != nil {
-				if v, ok := req.Params["template_id"]; ok {
-					if fv, ok := v.(float64); ok {
-						templateID = int(fv)
+				opErr = h.inTx(func(tx *sql.Tx) error {
+					if _, err := tx.Exec(`UPDATE radius_users SET account_expiry=$1,
+						status = CASE WHEN status='expired' AND ($1::date IS NULL OR $1::date + $3::int >= CURRENT_DATE) THEN 'active' ELSE status END,
+						updated_at=NOW() WHERE id=$2`, d, userID, graceDays()); err != nil {
+						return err
 					}
+					return syncAccess(tx, username)
+				})
+				if expiry == "" {
+					msg = "expiry cleared (never expires)"
+				} else {
+					msg = "expiry set to " + expiry
 				}
-			}
-			if templateID == 0 {
-				opErr = fmt.Errorf("template_id required in params")
-			} else {
-				var attrsRaw []byte
-				opErr = h.db.QueryRow(`SELECT attributes FROM radius_templates WHERE id=$1`, templateID).Scan(&attrsRaw)
-				if opErr == nil {
-					var attrs []AttributeEntry
-					json.Unmarshal(attrsRaw, &attrs)
-					for _, attr := range attrs {
-						if attr.Table == "reply" || attr.Table == "" {
-							h.db.Exec(`INSERT INTO radreply (username,attribute,op,value) VALUES ($1,$2,$3,$4)
-								ON CONFLICT (username,attribute) DO UPDATE SET value=$4`,
-								username, attr.Attribute, attr.Op, attr.Value)
-						} else {
-							h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,$2,$3,$4)
-								ON CONFLICT (username,attribute) DO UPDATE SET value=$4`,
-								username, attr.Attribute, attr.Op, attr.Value)
-						}
+
+			case "apply_template":
+				opErr = h.inTx(func(tx *sql.Tx) error { return applyTemplateTx(tx, username, templateAttrs) })
+				msg = fmt.Sprintf("template #%d applied", intParam("template_id"))
+
+			case "reset_attributes":
+				opErr = h.inTx(func(tx *sql.Tx) error {
+					if err := deleteReply(tx, username, "Mikrotik-Rate-Limit", "WISPr-Bandwidth-Max-Up",
+						"WISPr-Bandwidth-Max-Down", "Framed-IP-Address", "Session-Timeout"); err != nil {
+						return err
 					}
-					msg = fmt.Sprintf("template #%d applied", templateID)
-				}
+					if err := deleteCheck(tx, username, "Max-Octets", "Max-All-Session", "Session-Timeout"); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(`UPDATE radius_users SET bandwidth_profile_id=NULL WHERE id=$1`, userID); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(`UPDATE ip_pool_assignments SET username=NULL, user_id=NULL, leased_at=NULL WHERE username=$1`, username); err != nil {
+						return err
+					}
+					return syncAccess(tx, username)
+				})
+				msg = "RADIUS attributes reset"
+
+			default:
+				opErr = fmt.Errorf("unknown action: %s", req.Action)
 			}
-
-		case "reset_attributes":
-			h.db.Exec(`DELETE FROM radreply WHERE username=$1 AND attribute IN
-				('Mikrotik-Rate-Limit','WISPr-Bandwidth-Max-Up','WISPr-Bandwidth-Max-Down','Framed-IP-Address')`, username)
-			h.db.Exec(`DELETE FROM radcheck WHERE username=$1 AND attribute IN
-				('Max-Octets','Session-Timeout','Expiration','Simultaneous-Use')`, username)
-			_, opErr = h.db.Exec(`SELECT 1 FROM radius_users WHERE username=$1`, username)
-			msg = "RADIUS attributes reset"
-
-		default:
-			opErr = fmt.Errorf("unknown action: %s", req.Action)
 		}
 
 		success := opErr == nil
@@ -170,9 +183,11 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 
 	// Log bulk operation
 	paramsJSON, _ := json.Marshal(req.Params)
-	h.db.Exec(`INSERT INTO bulk_operations (operation,target_count,success_count,fail_count,params,performed_by)
+	if _, err := h.db.Exec(`INSERT INTO bulk_operations (operation,target_count,success_count,fail_count,params,performed_by)
 		VALUES ($1,$2,$3,$4,$5::jsonb,$6)`,
-		req.Action, len(req.Usernames), successCount, failCount, string(paramsJSON), performedBy)
+		req.Action, len(req.Usernames), successCount, failCount, string(paramsJSON), performedBy); err != nil {
+		h.log.WithError(err).Warn("record bulk operation")
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"action":        req.Action,
@@ -194,15 +209,19 @@ func (h *Handler) ListBulkOpHistory(c *gin.Context) {
 		PerformedBy  *string   `json:"performed_by"`
 		CreatedAt    time.Time `json:"created_at"`
 	}
-	rows, _ := h.db.Query(`
+	rows, err := h.db.Query(`
 		SELECT bo.id, bo.operation, bo.target_count, bo.success_count, bo.fail_count,
 		       u.username, bo.created_at
 		FROM bulk_operations bo
 		LEFT JOIN app_users u ON u.id = bo.performed_by
 		ORDER BY bo.created_at DESC LIMIT 50`)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to fetch history")
+		return
+	}
 
 	ops := []BulkOp{}
-	if rows != nil {
+	{
 		defer rows.Close()
 		for rows.Next() {
 			var op BulkOp
@@ -211,4 +230,17 @@ func (h *Handler) ListBulkOpHistory(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": ops})
+}
+
+// inTx runs fn in a transaction, committing only if it returns nil.
+func (h *Handler) inTx(fn func(*sql.Tx) error) error {
+	tx, err := h.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

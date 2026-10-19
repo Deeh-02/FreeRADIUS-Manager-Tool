@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -24,9 +25,10 @@ func New() (*DB, error) {
 	dbname := getEnv("DB_NAME", "radius")
 	sslMode := getEnv("DB_SSL_MODE", "disable")
 
+	// Values are quoted so a password containing spaces or quotes still parses.
 	dsn := fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
-		host, port, user, password, dbname, sslMode,
+		dsnQuote(host), dsnQuote(port), dsnQuote(user), dsnQuote(password), dsnQuote(dbname), dsnQuote(sslMode),
 	)
 
 	db, err := sql.Open("postgres", dsn)
@@ -57,6 +59,11 @@ func New() (*DB, error) {
 	}
 
 	return &DB{db}, nil
+}
+
+// dsnQuote quotes a libpq key=value connection-string value.
+func dsnQuote(v string) string {
+	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(v) + "'"
 }
 
 func getEnv(key, fallback string) string {

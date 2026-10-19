@@ -1,45 +1,57 @@
 package handlers
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"net/http"
+	"os"
 	"strconv"
 
 	"github.com/freeradius-manager/backend/internal/auth"
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 )
 
-// SetupStatus reports whether the first-run wizard has been completed.
-func (h *Handler) SetupStatus(c *gin.Context) {
+// SetupRequired reports whether the first-run wizard may run: setup_complete is not "true"
+// AND no staff account exists. The second condition means a reset setup_complete flag can
+// never reopen the wizard on a system that already has admins.
+func SetupRequired(db *sql.DB) bool {
 	var value string
-	err := h.db.QueryRow(`SELECT value FROM system_settings WHERE key = 'setup_complete'`).Scan(&value)
-	if err == sql.ErrNoRows || value != "true" {
-		c.JSON(http.StatusOK, gin.H{"setup_required": true, "version": "1.0.0"})
-		return
+	db.QueryRow(`SELECT value FROM system_settings WHERE key = 'setup_complete'`).Scan(&value)
+	if value == "true" {
+		return false
 	}
-	c.JSON(http.StatusOK, gin.H{"setup_required": false, "version": "1.0.0"})
+	var admins int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM app_users`).Scan(&admins); err != nil {
+		return false
+	}
+	return admins == 0
 }
 
-// SetupComplete processes the wizard form submission.
-// Whoever reaches this endpoint first on a fresh install becomes super_admin, so complete
-// the wizard before exposing the server. It runs `DELETE FROM app_users` first, i.e. it
-// replaces ALL existing admin accounts; it is guarded only by setup_complete in
-// system_settings. If that row is missing or reset to 'false' on a live system the endpoint
-// reopens (after a restart, since main.go caches "done" in memory) and wipes the admins.
-// The wizard's password rule here is just 8 characters, weaker
-// than the 12 + complexity enforced everywhere else. The values it stores (session timeout,
-// MFA required, lockout...) are informational: the code reads env vars, not these rows, and
-// "default_secret" only saves a 3-character hint; it does not configure FreeRADIUS.
+// SetupStatus reports whether the first-run wizard has been completed.
+func (h *Handler) SetupStatus(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"setup_required": SetupRequired(h.db.DB),
+		"token_required": os.Getenv("SETUP_TOKEN") != "",
+		"password_min":   auth.MinPasswordLength(),
+		"version":        AppVersion,
+	})
+}
+
+// SetupComplete processes the wizard form submission and creates the first super_admin.
+// It only runs while SetupRequired is true (no staff account exists yet). If SETUP_TOKEN is
+// set (setup.sh generates one and prints it), the request must carry it, so a stranger who
+// reaches a fresh server first cannot claim it. The security values it stores take effect
+// (they are read from system_settings, see internal/settings). The RADIUS shared secret is
+// configured in .env (RADIUS_SECRET), not here.
 func (h *Handler) SetupComplete(c *gin.Context) {
-	// Idempotency guard — cannot re-run setup once complete
-	var existing string
-	h.db.QueryRow(`SELECT value FROM system_settings WHERE key = 'setup_complete'`).Scan(&existing)
-	if existing == "true" {
+	if !SetupRequired(h.db.DB) {
 		respondError(c, http.StatusForbidden, "setup has already been completed")
 		return
 	}
 
 	var req struct {
+		SetupToken   string `json:"setup_token"`
 		Organization struct {
 			Name     string `json:"name"      binding:"required,min=2,max=100"`
 			Timezone string `json:"timezone"`
@@ -49,7 +61,7 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 			Username string `json:"username"  binding:"required,min=3,max=50"`
 			Email    string `json:"email"     binding:"required,email"`
 			FullName string `json:"full_name" binding:"required"`
-			Password string `json:"password"  binding:"required,min=8"`
+			Password string `json:"password"  binding:"required,min=8,max=128"`
 		} `json:"admin" binding:"required"`
 		RADIUS struct {
 			DefaultSecret string `json:"default_secret"`
@@ -68,9 +80,14 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if want := os.Getenv("SETUP_TOKEN"); want != "" &&
+		subtle.ConstantTimeCompare([]byte(want), []byte(req.SetupToken)) != 1 {
+		respondError(c, http.StatusForbidden, "invalid setup token (printed by setup.sh, SETUP_TOKEN in .env)")
+		return
+	}
 
 	// Apply safe defaults for optional numeric fields
-	if req.Security.PasswordMinLength == 0 {
+	if req.Security.PasswordMinLength < 8 {
 		req.Security.PasswordMinLength = 12
 	}
 	if req.Security.PasswordExpiryDays == 0 {
@@ -89,6 +106,12 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 		req.Organization.Timezone = "UTC"
 	}
 
+	// Same rules as every other staff password, with the length the wizard is saving.
+	if err := auth.ValidatePasswordWithMin(req.Admin.Password, req.Security.PasswordMinLength); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Hash the admin password
 	hash, err := auth.HashPassword(req.Admin.Password)
 	if err != nil {
@@ -103,9 +126,15 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Remove the seed superadmin and create the real admin account
-	if _, err = tx.Exec(`DELETE FROM app_users`); err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to reset users")
+	// Serialise concurrent submissions; the second one finds an admin and stops.
+	if _, err = tx.Exec(`LOCK TABLE app_users IN EXCLUSIVE MODE`); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to lock users")
+		return
+	}
+	var admins int
+	tx.QueryRow(`SELECT COUNT(*) FROM app_users`).Scan(&admins)
+	if admins > 0 {
+		respondError(c, http.StatusForbidden, "setup has already been completed")
 		return
 	}
 	if _, err = tx.Exec(`
@@ -142,15 +171,13 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 	upsert("mfa_required", strconv.FormatBool(req.Security.MFARequired), "Require MFA for admin users")
 	upsert("brute_force_attempts", strconv.Itoa(req.Security.BruteForceAttempts), "Failed attempts before lockout")
 	upsert("max_device_limit", strconv.Itoa(req.RADIUS.MaxDevices), "Max devices per RADIUS user")
-	if req.RADIUS.DefaultSecret != "" {
-		upsert("radius_default_secret_hint", req.RADIUS.DefaultSecret[:min(3, len(req.RADIUS.DefaultSecret))]+"***", "RADIUS secret hint (partial)")
-	}
 
 	if err = tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to save setup")
 		return
 	}
 
+	settings.Invalidate()
 	h.log.Infof("Setup completed — admin account '%s' created", req.Admin.Username)
 	c.JSON(http.StatusOK, gin.H{
 		"message":  "Setup completed successfully",
@@ -158,9 +185,3 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 	})
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

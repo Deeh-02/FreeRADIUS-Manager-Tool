@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -14,9 +15,8 @@ import (
 //
 // NOTE: this is bookkeeping, not multi-tenancy. org_id is a label on radius_users, nas and
 // app_users; no query elsewhere filters by it, so every admin/operator sees every
-// organisation's users, NAS devices, invoices and payments. user_limit is never checked
-// when users are created, and the org_id columns themselves are not in init-db.sql or any
-// migration (like the organizations table).
+// organisation's users, NAS devices, invoices and payments. Do not sell it as isolated
+// reseller accounts. user_limit is enforced when users are assigned to the organisation.
 
 type Organization struct {
 	ID        int        `json:"id"`
@@ -206,6 +206,26 @@ func (h *Handler) AssignUserToOrg(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.db.Exec(`UPDATE radius_users SET org_id=$1 WHERE username=$2`, req.OrgID, req.Username)
+	if req.OrgID != nil {
+		var limit, count int
+		if err := h.db.QueryRow(`SELECT user_limit, (SELECT COUNT(*) FROM radius_users WHERE org_id=$1 AND username<>$2)
+			FROM organizations WHERE id=$1`, *req.OrgID, req.Username).Scan(&limit, &count); err != nil {
+			respondError(c, http.StatusNotFound, "organization not found")
+			return
+		}
+		if limit > 0 && count >= limit {
+			respondError(c, http.StatusConflict, fmt.Sprintf("organization user limit (%d) reached", limit))
+			return
+		}
+	}
+	res, err := h.db.Exec(`UPDATE radius_users SET org_id=$1 WHERE username=$2`, req.OrgID, req.Username)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update user")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		respondError(c, http.StatusNotFound, "user not found")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "user organization updated"})
 }

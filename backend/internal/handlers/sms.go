@@ -2,13 +2,15 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
-	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -24,8 +26,10 @@ func (h *Handler) SendSMS(c *gin.Context) {
 		return
 	}
 
-	claims, _ := middleware.GetClaims(c)
-	_ = claims
+	if !phoneRe.MatchString(req.To) {
+		respondError(c, http.StatusBadRequest, "phone number must be digits, optionally starting with +")
+		return
+	}
 
 	ref, err := sendSMSGateway(req.To, req.Message)
 	status := "sent"
@@ -33,8 +37,7 @@ func (h *Handler) SendSMS(c *gin.Context) {
 		status = "failed"
 	}
 
-	h.db.Exec(`INSERT INTO sms_logs (recipient,message,status,gateway_ref,username)
-		VALUES ($1,$2,$3,$4,$5)`, req.To, req.Message, status, ref, nullableString(req.Username))
+	logSMS(h.db, req.To, req.Message, status, ref, req.Username)
 
 	if err != nil {
 		respondError(c, http.StatusBadRequest, "SMS gateway error: "+err.Error())
@@ -52,7 +55,7 @@ func (h *Handler) SendSMS(c *gin.Context) {
 func (h *Handler) ListSMSLogs(c *gin.Context) {
 	offset, limit := paginationParams(c)
 	rows, err := h.db.Query(`
-		SELECT id, recipient, LEFT(message,80), status, gateway_ref, username, created_at
+		SELECT id, recipient, LEFT(message,160), status, gateway_ref, username, created_at
 		FROM sms_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to fetch SMS logs")
@@ -80,9 +83,9 @@ func (h *Handler) ListSMSLogs(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": logs, "total": total})
 }
 
-// NotifyUserExpiry sends SMS to users expiring within `days` days (if phone set).
-// Manual only: no scheduled task calls it, so expiry reminders go out when an admin
-// presses the button. Running it twice texts the same customers twice.
+// NotifyUserExpiry sends SMS to users expiring within `days` days (if phone set), on demand.
+// The expiry_reminders scheduled task does this automatically, once per paid period;
+// pressing this button texts the same customers again.
 func (h *Handler) NotifyUserExpiry(c *gin.Context) {
 	var req struct {
 		Days    int    `json:"days"`
@@ -99,34 +102,40 @@ func (h *Handler) NotifyUserExpiry(c *gin.Context) {
 		req.Message = "Dear {username}, your account expires on {expiry}. Please renew to continue service."
 	}
 
-	rows, _ := h.db.Query(`
+	rows, err := h.db.Query(`
 		SELECT username, COALESCE(phone,''), COALESCE(account_expiry::text,'')
 		FROM radius_users
 		WHERE status='active'
 		  AND phone IS NOT NULL AND phone != ''
-		  AND account_expiry BETWEEN CURRENT_DATE AND CURRENT_DATE+$1`, req.Days)
+		  AND account_expiry BETWEEN CURRENT_DATE AND CURRENT_DATE + $1::int`, req.Days)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to find expiring users")
+		return
+	}
+	type target struct{ username, phone, expiry string }
+	var targets []target
+	for rows.Next() {
+		var t target
+		if rows.Scan(&t.username, &t.phone, &t.expiry) == nil {
+			targets = append(targets, t)
+		}
+	}
+	rows.Close()
 
 	sent, failed := 0, 0
-	if rows != nil {
-		defer rows.Close()
-		for rows.Next() {
-			var username, phone, expiry string
-			rows.Scan(&username, &phone, &expiry)
+	for _, t := range targets {
+		msg := strings.ReplaceAll(req.Message, "{username}", t.username)
+		msg = strings.ReplaceAll(msg, "{expiry}", t.expiry)
 
-			msg := strings.ReplaceAll(req.Message, "{username}", username)
-			msg = strings.ReplaceAll(msg, "{expiry}", expiry)
-
-			ref, err := sendSMSGateway(phone, msg)
-			status := "sent"
-			if err != nil {
-				status = "failed"
-				failed++
-			} else {
-				sent++
-			}
-			h.db.Exec(`INSERT INTO sms_logs (recipient,message,status,gateway_ref,username)
-				VALUES ($1,$2,$3,$4,$5)`, phone, msg, status, ref, username)
+		ref, err := sendSMSGateway(t.phone, msg)
+		status := "sent"
+		if err != nil {
+			status = "failed"
+			failed++
+		} else {
+			sent++
 		}
+		logSMS(h.db, t.phone, msg, status, ref, t.username)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -145,14 +154,22 @@ func (h *Handler) SMSConfig(c *gin.Context) {
 	})
 }
 
-// sendSMSGateway sends a message via HTTP SMS gateway.
-// Configured only through SMS_GATEWAY / SMS_API_KEY / SMS_SENDER_ID / SMS_BODY_TEMPLATE /
-// SMS_CONTENT_TYPE. docker-compose.yml does not pass any SMS_* variable to the backend
-// container, so under compose SMS reports "not configured" until they are added there.
-// The message is substituted into the body template as raw text with no JSON escaping, so
-// a message containing a double quote breaks the default JSON body. Gateway responses
-// are not parsed: any status below 400 counts as "sent".
-// Supports generic HTTP POST (Bulksms, Africa's Talking, custom gateways).
+var phoneRe = regexp.MustCompile(`^\+?[0-9]{6,15}$`)
+
+func logSMS(db dbtx, to, message, status, ref, username string) {
+	db.Exec(`INSERT INTO sms_logs (recipient,message,status,gateway_ref,username)
+		VALUES ($1,$2,$3,$4,$5)`, to, message, status, nullableString(ref), nullableString(username))
+}
+
+func smsConfigured() bool { return os.Getenv("SMS_GATEWAY") != "" }
+
+// sendSMSGateway sends a message via an HTTP SMS gateway (Africa's Talking, Bulksms, a
+// custom gateway...). Configured only through environment variables: SMS_GATEWAY (URL),
+// SMS_API_KEY, SMS_SENDER_ID, SMS_BODY_TEMPLATE (with {to} {message} {api_key} {sender}),
+// SMS_CONTENT_TYPE (default application/json), SMS_AUTH_HEADER (optional "Name: value",
+// e.g. "apiKey: {api_key}" for Africa's Talking). Placeholder values are escaped for the
+// body's content type (JSON string escaping, or URL encoding for form bodies). Any HTTP status
+// below 400 counts as sent; gateway-specific error bodies are not parsed.
 func sendSMSGateway(to, message string) (string, error) {
 	gatewayURL := os.Getenv("SMS_GATEWAY")
 	if gatewayURL == "" {
@@ -164,26 +181,43 @@ func sendSMSGateway(to, message string) (string, error) {
 	if senderID == "" {
 		senderID = "RADIUS"
 	}
-
-	// Build request body — supports {to}, {message}, {api_key}, {sender} placeholders
-	bodyTemplate := os.Getenv("SMS_BODY_TEMPLATE")
-	if bodyTemplate == "" {
-		// Default: Africa's Talking / generic JSON
-		bodyTemplate = `{"to":"{to}","message":"{message}","from":"{sender}"}`
-	}
-
-	body := strings.ReplaceAll(bodyTemplate, "{to}", to)
-	body = strings.ReplaceAll(body, "{message}", message)
-	body = strings.ReplaceAll(body, "{api_key}", apiKey)
-	body = strings.ReplaceAll(body, "{sender}", senderID)
-
 	contentType := os.Getenv("SMS_CONTENT_TYPE")
 	if contentType == "" {
 		contentType = "application/json"
 	}
 
+	bodyTemplate := os.Getenv("SMS_BODY_TEMPLATE")
+	if bodyTemplate == "" {
+		bodyTemplate = `{"to":"{to}","message":"{message}","from":"{sender}"}`
+	}
+
+	esc := func(v string) string {
+		switch {
+		case strings.Contains(contentType, "json"):
+			b, _ := json.Marshal(v)
+			return string(b[1 : len(b)-1])
+		case strings.Contains(contentType, "x-www-form-urlencoded"):
+			return url.QueryEscape(v)
+		}
+		return v
+	}
+	body := strings.NewReplacer("{to}", esc(to), "{message}", esc(message),
+		"{api_key}", esc(apiKey), "{sender}", esc(senderID)).Replace(bodyTemplate)
+
+	req, err := http.NewRequest("POST", gatewayURL, bytes.NewBufferString(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Accept", "application/json")
+	if hdr := os.Getenv("SMS_AUTH_HEADER"); hdr != "" {
+		if i := strings.Index(hdr, ":"); i > 0 {
+			req.Header.Set(strings.TrimSpace(hdr[:i]), strings.TrimSpace(strings.ReplaceAll(hdr[i+1:], "{api_key}", apiKey)))
+		}
+	}
+
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(gatewayURL, contentType, bytes.NewBufferString(body))
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}

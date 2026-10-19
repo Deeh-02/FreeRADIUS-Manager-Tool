@@ -11,19 +11,21 @@ import (
 )
 
 type visitor struct {
-	count    int
-	lastSeen time.Time
-	blocked  bool
+	count        int
+	windowStart  time.Time
+	lastSeen     time.Time
+	blocked      bool
 	blockedUntil time.Time
 }
 
-// RateLimiter is a simple in-memory rate limiter per IP.
+// RateLimiter is a simple in-memory, fixed-window rate limiter per IP (RATE_LIMIT requests
+// per minute, default 300; the admin UI makes several calls per page, and one office behind
+// NAT shares an IP). Logins have their own, much stricter, brute-force limits.
 // State lives in this process only (lost on restart, not shared between replicas).
-// NOTE: the key is c.ClientIP(). main.go never calls SetTrustedProxies, so Gin trusts
-// every proxy and takes the left-most X-Forwarded-For entry. Behind the bundled nginx
-// (which appends to a client-supplied header) a client can send its own
-// X-Forwarded-For to pick the IP it is counted under, which defeats this limiter, the
-// setup limiter and the IP shown in logs/audit. Checked with a small Gin 1.9.1 program.
+// The key is c.ClientIP(). main.go limits trusted proxies to TRUSTED_PROXIES (default:
+// loopback and the Docker ranges), so Gin walks X-Forwarded-For from the right and stops at
+// the first address that is not a trusted proxy: a client-supplied X-Forwarded-For entry
+// cannot choose the IP it is counted under.
 type RateLimiter struct {
 	mu       sync.Mutex
 	visitors map[string]*visitor
@@ -33,7 +35,7 @@ type RateLimiter struct {
 
 // NewRateLimiter creates a new rate limiter.
 func NewRateLimiter() *RateLimiter {
-	limit := 100
+	limit := 300
 	if raw := os.Getenv("RATE_LIMIT"); raw != "" {
 		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
 			limit = v
@@ -84,25 +86,25 @@ func (rl *RateLimiter) isLimited(ip string) bool {
 	now := time.Now()
 
 	if !ok {
-		rl.visitors[ip] = &visitor{count: 1, lastSeen: now}
+		rl.visitors[ip] = &visitor{count: 1, windowStart: now, lastSeen: now}
 		return false
 	}
 
-	// Once over the limit an IP is blocked for a full window (not just until the
-	// current minute rolls over), which is why lastSeen is refreshed on every hit.
-	// Check if blocked
+	// Once over the limit an IP is blocked for a full window.
 	if v.blocked && now.Before(v.blockedUntil) {
 		return true
 	}
-	if v.blocked && now.After(v.blockedUntil) {
+	if v.blocked {
 		v.blocked = false
 		v.count = 0
+		v.windowStart = now
 	}
 
-	// Reset window
-	if now.Sub(v.lastSeen) > rl.window {
+	// The count restarts every window. (It used to restart only after a quiet minute, so a
+	// UI that polled kept counting up until it was blocked.)
+	if now.Sub(v.windowStart) >= rl.window {
 		v.count = 0
-		v.lastSeen = now
+		v.windowStart = now
 	}
 
 	v.count++

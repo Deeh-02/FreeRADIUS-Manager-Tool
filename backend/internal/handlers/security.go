@@ -4,12 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/freeradius-manager/backend/internal/database"
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
@@ -18,11 +22,16 @@ import (
 // GeoIP Enforcement
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Where these protections apply: the staff login (/auth/login) and the customer portal
+// login (/portal/login), the two endpoints exposed to the internet (loginGuard). They do NOT
+// apply to RADIUS: FreeRADIUS sees your own routers' addresses, not the customers', so
+// blocking by IP or country there would only lock out your routers.
+
 // GeoIPLookup looks up an IP address country via ip-api.com (cached in DB).
 func (h *Handler) GeoIPLookup(c *gin.Context) {
 	ip := c.Query("ip")
-	if ip == "" {
-		respondError(c, http.StatusBadRequest, "ip query parameter required")
+	if net.ParseIP(ip) == nil {
+		respondError(c, http.StatusBadRequest, "a valid ip query parameter is required")
 		return
 	}
 	info, err := lookupIP(h, ip)
@@ -57,12 +66,14 @@ func lookupIP(h *Handler, ip string) (*GeoIPInfo, error) {
 		return &info, nil
 	}
 
-	// Call ip-api.com (free, no key required). Plain HTTP (the free tier has no HTTPS),
-	// so lookups are unencrypted, and ip-api's free plan is limited to non-commercial use
-	// and ~45 requests/minute: a paid key or another provider is needed for a business.
-	// The ip is also placed in the URL unescaped.
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(
-		fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode,country,city,isp,proxy", ip))
+	// ip-api.com: the free endpoint is plain HTTP, limited to ~45 requests/minute and to
+	// NON-COMMERCIAL use. For a business set GEOIP_API_URL to a paid endpoint with the same
+	// JSON fields, e.g. https://pro.ip-api.com/json/%s?key=YOURKEY&fields=... (%s = the IP).
+	tmpl := os.Getenv("GEOIP_API_URL")
+	if tmpl == "" {
+		tmpl = "http://ip-api.com/json/%s?fields=status,countryCode,country,city,isp,proxy"
+	}
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(fmt.Sprintf(tmpl, url.PathEscape(ip)))
 	if err != nil {
 		return nil, fmt.Errorf("GeoIP lookup failed: %v", err)
 	}
@@ -76,7 +87,9 @@ func lookupIP(h *Handler, ip string) (*GeoIPInfo, error) {
 		ISP         string `json:"isp"`
 		Proxy       bool   `json:"proxy"`
 	}
-	json.Unmarshal(body, &data)
+	if err := json.Unmarshal(body, &data); err != nil || data.CountryCode == "" {
+		return nil, fmt.Errorf("GeoIP lookup returned no country for %s", ip)
+	}
 
 	info.CountryCode = data.CountryCode
 	info.CountryName = data.Country
@@ -129,9 +142,17 @@ func (h *Handler) CreateGeoIPRule(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.CountryCode = strings.ToUpper(req.CountryCode)
+	req.CountryCode = strings.ToUpper(strings.TrimSpace(req.CountryCode))
+	if len(req.CountryCode) != 2 {
+		respondError(c, http.StatusBadRequest, "country_code must be a 2-letter ISO code")
+		return
+	}
 	if req.Action == "" {
 		req.Action = "block"
+	}
+	if req.Action != "block" && req.Action != "allow" && req.Action != "flag" {
+		respondError(c, http.StatusBadRequest, "action must be block, allow or flag")
+		return
 	}
 	isActive := true
 	if req.IsActive != nil {
@@ -179,33 +200,77 @@ func StartCredStuffingDetector(db *database.DB, log *logrus.Logger) {
 	})
 }
 
-// CheckCredStuffing is called on every failed auth to update the sliding window.
-// Returns true if the IP should be blocked.
-// NOTE: nothing calls this function (grep for callers finds none), and FreeRADIUS does not
-// consult cred_stuffing_blocks, so these blocks and the "critical" alerts it would raise
-// currently never happen. Only manual BlockIP entries and the 5-minute radpostauth
-// pattern scan (credStuffingAnalysisWorker) produce data, and neither blocks traffic.
+// ipBlocked reports whether an IP is on the block list (manual or automatic).
+func ipBlocked(db dbtx, ip string) bool {
+	var blocked bool
+	db.QueryRow(`SELECT EXISTS(SELECT 1 FROM cred_stuffing_blocks
+		WHERE ip_address=$1 AND (blocked_until IS NULL OR blocked_until > NOW()))`, ip).Scan(&blocked)
+	return blocked
+}
+
+// geoBlocked applies the GeoIP rules to a login from ip. With any active "allow" rule only
+// the allowed countries may log in; "block" rules refuse their country; "flag" rules only
+// raise a security alert. Private/loopback addresses and failed lookups are allowed (fail
+// open), so an outage at the GeoIP provider never locks staff out.
+func geoBlocked(h *Handler, ip, username string) (bool, string) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || isInternalIP(parsed) {
+		return false, ""
+	}
+	var rules int
+	h.db.QueryRow(`SELECT COUNT(*) FROM geoip_rules WHERE is_active`).Scan(&rules)
+	if rules == 0 {
+		return false, ""
+	}
+	info, err := lookupIP(h, ip)
+	if err != nil {
+		return false, ""
+	}
+	var allowRules int
+	var action string
+	h.db.QueryRow(`SELECT COUNT(*) FROM geoip_rules WHERE is_active AND action='allow'`).Scan(&allowRules)
+	h.db.QueryRow(`SELECT action FROM geoip_rules WHERE is_active AND country_code=$1`, info.CountryCode).Scan(&action)
+	alert := func(kind, sev string) {
+		details, _ := json.Marshal(map[string]string{"country": info.CountryName, "isp": info.ISP})
+		h.db.Exec(`INSERT INTO security_alerts (alert_type,severity,ip_address,username,country_code,details)
+			VALUES ($1,$2,$3,$4,$5,$6::jsonb)`, kind, sev, ip, nullableString(username), info.CountryCode, string(details))
+	}
+	switch {
+	case action == "block" || (allowRules > 0 && action != "allow" && action != "flag"):
+		alert("geoip_blocked", "medium")
+		return true, info.CountryCode
+	case action == "flag":
+		alert("geoip_flagged", "low")
+	}
+	return false, info.CountryCode
+}
+
+// loginGuard runs before a password is checked. It refuses blocked IPs and countries.
+func (h *Handler) loginGuard(c *gin.Context, username string) bool {
+	ip := c.ClientIP()
+	if ipBlocked(h.db, ip) {
+		respondError(c, http.StatusForbidden, "access from your network is temporarily blocked")
+		return false
+	}
+	if blocked, cc := geoBlocked(h, ip, username); blocked {
+		respondError(c, http.StatusForbidden, "logins from your country ("+cc+") are not allowed")
+		return false
+	}
+	return true
+}
+
+// CheckCredStuffing is called on every failed staff or portal login to update the sliding
+// window per IP. When an IP reaches cs_max_fails failures within cs_window_secs it is blocked
+// for cs_block_mins (loginGuard then refuses it) and a critical alert is raised.
+// Returns true if the IP is now blocked.
 func CheckCredStuffing(h *Handler, ip, username string) bool {
 	if ip == "" || ip == "127.0.0.1" || ip == "::1" {
 		return false
 	}
 
-	maxFails := 10
-	windowSecs := 300
-	blockMins := 60
-	var mfStr, wsStr, bmStr string
-	h.db.QueryRow(`SELECT value FROM system_settings WHERE key='cs_max_fails'`).Scan(&mfStr)
-	h.db.QueryRow(`SELECT value FROM system_settings WHERE key='cs_window_secs'`).Scan(&wsStr)
-	h.db.QueryRow(`SELECT value FROM system_settings WHERE key='cs_block_mins'`).Scan(&bmStr)
-	if mfStr != "" {
-		fmt.Sscanf(mfStr, "%d", &maxFails)
-	}
-	if wsStr != "" {
-		fmt.Sscanf(wsStr, "%d", &windowSecs)
-	}
-	if bmStr != "" {
-		fmt.Sscanf(bmStr, "%d", &blockMins)
-	}
+	maxFails := settings.Int("cs_max_fails", "", 10)
+	windowSecs := settings.Int("cs_window_secs", "", 300)
+	blockMins := settings.Int("cs_block_mins", "", 60)
 
 	// Check if already DB-blocked
 	var blockedUntil *time.Time
@@ -238,11 +303,12 @@ func CheckCredStuffing(h *Handler, ip, username string) bool {
 			ON CONFLICT (ip_address) DO UPDATE SET
 			fail_count=cred_stuffing_blocks.fail_count+1, blocked_until=$3, updated_at=NOW()`,
 			ip, len(valid), blockedUntilTime)
+		details, _ := json.Marshal(map[string]interface{}{"fail_count": len(valid), "window_secs": windowSecs,
+			"blocked_until": blockedUntilTime.Format(time.RFC3339)})
 		h.db.Exec(`INSERT INTO security_alerts (alert_type,severity,ip_address,username,details)
 			VALUES ('credential_stuffing','critical',$1,$2,$3::jsonb)`,
-			ip, nullableString(username),
-			fmt.Sprintf(`{"fail_count":%d,"window_secs":%d,"blocked_until":"%s"}`,
-				len(valid), windowSecs, blockedUntilTime.Format(time.RFC3339)))
+			ip, nullableString(username), string(details))
+		entry.timestamps = nil
 		return true
 	}
 	return false
@@ -288,6 +354,11 @@ func (h *Handler) BlockIP(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	if net.ParseIP(strings.TrimSpace(req.IP)) == nil {
+		respondError(c, http.StatusBadRequest, "ip must be a single IP address")
+		return
+	}
+	req.IP = strings.TrimSpace(req.IP)
 	if req.Duration == 0 {
 		req.Duration = 24
 	}
@@ -310,7 +381,9 @@ func (h *Handler) UnblockIP(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "IP unblocked"})
 }
 
-// credStuffingAnalysisWorker scans radpostauth every 5 minutes for patterns.
+// credStuffingAnalysisWorker scans radpostauth every 5 minutes for patterns: one NAS
+// relaying failed logins for many different usernames (someone guessing accounts through a
+// hotspot). It only raises alerts; it does not block the NAS.
 func credStuffingAnalysisWorker(db *database.DB, log *logrus.Logger) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -336,9 +409,9 @@ func credStuffingAnalysisWorker(db *database.DB, log *logrus.Logger) {
 			db.QueryRow(`SELECT EXISTS(SELECT 1 FROM security_alerts WHERE ip_address=$1
 				AND alert_type='credential_stuffing_pattern' AND created_at > NOW()-INTERVAL '1 hour')`, ip).Scan(&exists)
 			if !exists {
+				details, _ := json.Marshal(map[string]interface{}{"unique_usernames": uniqueUsers, "fail_count": fails, "window": "10min"})
 				db.Exec(`INSERT INTO security_alerts (alert_type,severity,ip_address,details)
-					VALUES ('credential_stuffing_pattern','high',$1,$2::jsonb)`,
-					ip, fmt.Sprintf(`{"unique_usernames":%d,"fail_count":%d,"window":"10min"}`, uniqueUsers, fails))
+					VALUES ('credential_stuffing_pattern','high',$1,$2::jsonb)`, ip, string(details))
 				log.WithField("ip", ip).WithField("unique_users", uniqueUsers).
 					Warn("Credential stuffing pattern detected")
 			}

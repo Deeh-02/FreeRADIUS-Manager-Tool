@@ -2,16 +2,19 @@ package auth
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"unicode"
+	"unicode/utf8"
 
+	"github.com/freeradius-manager/backend/internal/settings"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var (
-	ErrPasswordTooShort    = errors.New("password must be at least 12 characters")
+	errPasswordTooShort    = "password must be at least %d characters"
 	ErrPasswordNoUpper     = errors.New("password must contain at least one uppercase letter")
 	ErrPasswordNoLower     = errors.New("password must contain at least one lowercase letter")
 	ErrPasswordNoDigit     = errors.New("password must contain at least one digit")
@@ -39,12 +42,19 @@ func CheckPassword(hash, password string) bool {
 
 // ValidatePasswordComplexity checks that a password meets all complexity rules.
 // Applies to admin/operator accounts only; RADIUS (customer) passwords only need
-// 6 characters (models.CreateRadiusUserRequest). The length check counts bytes, not
-// characters, so a short non-ASCII password can pass.
+// 6 characters (models.CreateRadiusUserRequest).
 func ValidatePasswordComplexity(password string) error {
-	minLen := getMinPasswordLength()
-	if len(password) < minLen {
-		return ErrPasswordTooShort
+	return ValidatePasswordWithMin(password, MinPasswordLength())
+}
+
+// ValidatePasswordWithMin is ValidatePasswordComplexity with an explicit minimum length
+// (used by the setup wizard, which chooses the policy it is about to save).
+func ValidatePasswordWithMin(password string, minLen int) error {
+	if minLen < 8 {
+		minLen = 8
+	}
+	if utf8.RuneCountInString(password) < minLen {
+		return fmt.Errorf(errPasswordTooShort, minLen)
 	}
 
 	var hasUpper, hasLower, hasDigit, hasSpecial bool
@@ -102,14 +112,12 @@ func getBcryptCost() int {
 	return cost
 }
 
-func getMinPasswordLength() int {
-	raw := os.Getenv("PASSWORD_MIN_LENGTH")
-	if raw == "" {
-		return 12
-	}
-	l, err := strconv.Atoi(raw)
-	if err != nil || l < 8 {
-		return 12
+// MinPasswordLength is the staff password minimum: Settings page "password_min_length",
+// else PASSWORD_MIN_LENGTH, else 12. Never below 8.
+func MinPasswordLength() int {
+	l := settings.Int("password_min_length", "PASSWORD_MIN_LENGTH", 12)
+	if l < 8 {
+		return 8
 	}
 	return l
 }

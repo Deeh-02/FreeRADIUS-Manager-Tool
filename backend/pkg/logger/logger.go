@@ -1,7 +1,9 @@
 package logger
 
 import (
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -44,8 +46,18 @@ func GinLogger(log *logrus.Logger) gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
-		// The query string is logged verbatim, which includes ?token=<JWT> on SSE requests.
+		// Query strings are logged with credential-looking parameters masked. The API no
+		// longer accepts ?token=, but an old client or a typo should not leak one into logs.
 		if raw != "" {
+			if q, err := url.ParseQuery(raw); err == nil {
+				for k := range q {
+					switch strings.ToLower(k) {
+					case "token", "access_token", "refresh_token", "key", "api_key", "password", "secret":
+						q.Set(k, "REDACTED")
+					}
+				}
+				raw = q.Encode()
+			}
 			path = path + "?" + raw
 		}
 

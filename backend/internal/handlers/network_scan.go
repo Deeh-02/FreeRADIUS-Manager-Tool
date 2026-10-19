@@ -2,7 +2,9 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -90,9 +92,6 @@ func (h *Handler) executeNetworkScan(scanID int, subnet, scanType string) {
 	}
 
 	secret := os.Getenv("RADIUS_SECRET")
-	if secret == "" {
-		secret = "testing123"
-	}
 	port := getRadiusPort()
 
 	for _, host := range hosts {
@@ -267,8 +266,8 @@ func (h *Handler) NetworkScannerStatus(c *gin.Context) {
 }
 
 // ImportScanHostAsNAS creates a NAS entry from a discovered host.
-// Every imported device is given the global RADIUS_SECRET (or "testing123" if unset), so
-// the secret is shared across devices and must be changed per device to be meaningful.
+// Every imported device gets its own random secret, returned once in the response; enter it
+// on the device. FreeRADIUS loads NAS rows at start-up, so restart it afterwards.
 func (h *Handler) ImportScanHostAsNAS(c *gin.Context) {
 	hostID, err := mustInt(c, "hostId")
 	if err != nil {
@@ -306,28 +305,39 @@ func (h *Handler) ImportScanHostAsNAS(c *gin.Context) {
 		nasType = "mikrotik"
 	}
 
-	secret := os.Getenv("RADIUS_SECRET")
-	if secret == "" {
-		secret = "testing123"
+	// Each imported device gets its own random secret (shown once here; it can be changed on
+	// the NAS Devices page). A device already registered keeps its existing secret.
+	secretBytes := make([]byte, 24)
+	if _, err := rand.Read(secretBytes); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to generate secret")
+		return
 	}
+	secret := base64.RawURLEncoding.EncodeToString(secretBytes)
 
 	var nasID int
+	var inserted bool
 	err = h.db.QueryRow(`
 		INSERT INTO nas (nasname, shortname, type, secret, description, status)
 		VALUES ($1, $2, $3, $4, $5, 'active')
 		ON CONFLICT (nasname) DO UPDATE SET shortname = EXCLUDED.shortname, updated_at = NOW()
-		RETURNING id`,
+		RETURNING id, (xmax = 0)`,
 		ip, shortName, nasType, secret,
 		"Imported from network scan — RADIUS "+strconv.FormatBool(isRadius),
-	).Scan(&nasID)
+	).Scan(&nasID, &inserted)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to create NAS device")
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
-		"message": "NAS device created",
+	resp := gin.H{
+		"message": "NAS device created. Configure this shared secret on the device, then restart FreeRADIUS (docker compose restart freeradius).",
 		"nas_id":  nasID,
 		"nasname": ip,
-	})
+		"secret":  secret,
+	}
+	if !inserted {
+		resp["message"] = "NAS device already registered; its existing secret was kept"
+		delete(resp, "secret")
+	}
+	c.JSON(http.StatusCreated, resp)
 }

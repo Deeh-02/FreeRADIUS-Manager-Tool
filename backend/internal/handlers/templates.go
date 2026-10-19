@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -71,6 +73,10 @@ func (h *Handler) CreateTemplate(c *gin.Context) {
 	if req.Attributes == nil {
 		req.Attributes = []AttributeEntry{}
 	}
+	if err := validateTemplateAttrs(req.Attributes); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	attrsJSON, _ := json.Marshal(req.Attributes)
 
 	var id int
@@ -101,20 +107,30 @@ func (h *Handler) UpdateTemplate(c *gin.Context) {
 		Attributes  []AttributeEntry `json:"attributes"`
 		IsActive    *bool            `json:"is_active"`
 	}
-	c.ShouldBindJSON(&req)
-	isActive := true
-	if req.IsActive != nil {
-		isActive = *req.IsActive
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validateTemplateAttrs(req.Attributes); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
 	}
 	attrsJSON, _ := json.Marshal(req.Attributes)
 
-	h.db.Exec(`UPDATE radius_templates SET
+	if _, err := h.db.Exec(`UPDATE radius_templates SET
 		name=COALESCE(NULLIF($1,''),name),
 		description=COALESCE(NULLIF($2,''),description),
-		attributes=CASE WHEN $3='null' OR $3='[]' THEN attributes ELSE $3::jsonb END,
-		is_active=$4
+		attributes=CASE WHEN $3='null' THEN attributes ELSE $3::jsonb END,
+		is_active=COALESCE($4,is_active)
 		WHERE id=$5`,
-		req.Name, req.Description, string(attrsJSON), isActive, id)
+		req.Name, req.Description, string(attrsJSON), req.IsActive, id); err != nil {
+		if isUniqueViolation(err) {
+			respondError(c, http.StatusConflict, "template name already exists")
+			return
+		}
+		respondError(c, http.StatusInternalServerError, "failed to update template")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "template updated"})
 }
 
@@ -129,12 +145,64 @@ func (h *Handler) DeleteTemplate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "template deleted"})
 }
 
+// allowedTemplateOps are the FreeRADIUS operators a template may use.
+var allowedTemplateOps = map[string]bool{":=": true, "=": true, "==": true, "+=": true, "!=": true,
+	">": true, ">=": true, "<": true, "<=": true}
+
+// protectedCheckAttrs may not be set by a template: they would change the password or the
+// billing/suspension state that syncAccess manages.
+var protectedCheckAttrs = map[string]bool{"Cleartext-Password": true, "Auth-Type": true,
+	"Expiration": true, "Simultaneous-Use": true, "Crypt-Password": true, "MD5-Password": true,
+	"NT-Password": true, "SHA-Password": true}
+
+func validateTemplateAttrs(attrs []AttributeEntry) error {
+	for _, a := range attrs {
+		if a.Attribute == "" || len(a.Attribute) > 64 || len(a.Value) > 253 {
+			return fmt.Errorf("attribute names must be 1-64 characters and values at most 253")
+		}
+		if a.Op == "" {
+			continue
+		}
+		if !allowedTemplateOps[a.Op] {
+			return fmt.Errorf("operator %q is not allowed", a.Op)
+		}
+		if a.Table == "check" && protectedCheckAttrs[a.Attribute] {
+			return fmt.Errorf("%s is managed by the system and cannot be set by a template", a.Attribute)
+		}
+	}
+	return nil
+}
+
+// applyTemplateTx writes a template's attributes for one user: reply attributes (the
+// default) replace any existing value of the same name; check attributes are upserted.
+func applyTemplateTx(q dbtx, username string, attrs []AttributeEntry) error {
+	if err := validateTemplateAttrs(attrs); err != nil {
+		return err
+	}
+	for _, attr := range attrs {
+		op := attr.Op
+		if attr.Table == "check" {
+			if op == "" {
+				op = ":="
+			}
+			if err := setCheck(q, username, attr.Attribute, op, attr.Value); err != nil {
+				return err
+			}
+		} else {
+			if op == "" {
+				op = "="
+			}
+			if err := setReply(q, username, attr.Attribute, op, attr.Value); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // ApplyTemplate applies a template's attributes to one or more RADIUS users.
-// Attribute names and values are written straight into radcheck/radreply without
-// validation, so a template can set any check item (including Auth-Type or
-// Cleartext-Password); template routes are admin/super_admin only in main.go. As in
-// AssignIP, the radreply branch's ON CONFLICT has no unique index to match (only radcheck
-// has one), so reply attributes are expected to fail silently.
+// System-managed check items (password, Auth-Type, Expiration, Simultaneous-Use) are
+// refused; template routes are admin/super_admin only in main.go.
 func (h *Handler) ApplyTemplate(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -149,7 +217,6 @@ func (h *Handler) ApplyTemplate(c *gin.Context) {
 		return
 	}
 
-	// Load template
 	var attrsRaw []byte
 	err = h.db.QueryRow(`SELECT attributes FROM radius_templates WHERE id=$1 AND is_active=true`, id).Scan(&attrsRaw)
 	if err != nil {
@@ -160,26 +227,19 @@ func (h *Handler) ApplyTemplate(c *gin.Context) {
 	json.Unmarshal(attrsRaw, &attrs)
 
 	applied, failed := 0, 0
+	errors := []string{}
 	for _, username := range req.Usernames {
-		// Verify user exists
 		var exists bool
 		h.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM radius_users WHERE username=$1)`, username).Scan(&exists)
 		if !exists {
 			failed++
+			errors = append(errors, username+": user not found")
 			continue
 		}
-
-		// Apply each attribute
-		for _, attr := range attrs {
-			if attr.Table == "reply" || attr.Table == "" {
-				h.db.Exec(`INSERT INTO radreply (username,attribute,op,value) VALUES ($1,$2,$3,$4)
-					ON CONFLICT (username,attribute) DO UPDATE SET value=$4, op=$3`,
-					username, attr.Attribute, attr.Op, attr.Value)
-			} else {
-				h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,$2,$3,$4)
-					ON CONFLICT (username,attribute) DO UPDATE SET value=$4, op=$3`,
-					username, attr.Attribute, attr.Op, attr.Value)
-			}
+		if err := h.inTx(func(tx *sql.Tx) error { return applyTemplateTx(tx, username, attrs) }); err != nil {
+			failed++
+			errors = append(errors, username+": "+err.Error())
+			continue
 		}
 		applied++
 	}
@@ -188,6 +248,7 @@ func (h *Handler) ApplyTemplate(c *gin.Context) {
 		"message": "template applied",
 		"applied": applied,
 		"failed":  failed,
+		"errors":  errors,
 	})
 }
 

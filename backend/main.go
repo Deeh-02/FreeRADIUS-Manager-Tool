@@ -1,63 +1,143 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/auth"
 	"github.com/freeradius-manager/backend/internal/database"
 	"github.com/freeradius-manager/backend/internal/handlers"
 	"github.com/freeradius-manager/backend/internal/middleware"
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/freeradius-manager/backend/pkg/logger"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 )
 
-// setupState caches whether setup has been completed so we only hit the DB once.
+// setupIPRateLimit caps calls to /setup per client IP for the life of the process (a brake
+// on guessing SETUP_TOKEN, not a per-minute limit).
 var (
-	setupDone   bool
-	setupDoneMu sync.RWMutex
+	setupIPHits  = map[string]int{}
+	setupIPMu    sync.Mutex
+	maxSetupHits = 30
 )
 
-// markSetupDone caches the completed state in memory (irreversible).
-func markSetupDone() {
-	setupDoneMu.Lock()
-	setupDone = true
-	setupDoneMu.Unlock()
+// weakSecrets are values that have shipped as examples or defaults in this repository.
+var weakSecrets = map[string]bool{
+	"testing123": true, "ChangeMe_Secure_Pass123!": true, "CHANGE_ME_STRONG_DB_PASSWORD": true,
+	"CHANGE_ME_STRONG_RADIUS_SECRET": true, "changeme": true, "password": true,
+	"testing123-please-change-to-32-char-minimum-in-production": true,
 }
 
-// isSetupDone checks in-memory cache first, then DB.
-func isSetupDone(db *database.DB) bool {
-	setupDoneMu.RLock()
-	cached := setupDone
-	setupDoneMu.RUnlock()
-	if cached {
-		return true
-	}
-	var val string
-	db.QueryRow(`SELECT value FROM system_settings WHERE key = 'setup_complete'`).Scan(&val)
-	if val == "true" {
-		markSetupDone()
-		return true
-	}
-	return false
+func weakSecret(s string) bool {
+	return s == "" || weakSecrets[s] || strings.HasPrefix(strings.ToUpper(s), "CHANGE_ME")
 }
 
-// setupIPRateLimit is a very simple per-IP request counter for the setup endpoint.
-// NOTE: counts are never reset, so this is a cap per IP for the life of the process
-// (cleared only on restart), not a per-minute limit. The IP itself comes from
-// c.ClientIP(), which a client can spoof via X-Forwarded-For (see middleware/ratelimit.go).
-var (
-	setupIPHits   = map[string]int{}
-	setupIPMu     sync.Mutex
-	maxSetupHits  = 10
-)
+// checkSecrets returns the problems with the configured secrets.
+func checkSecrets() []string {
+	var problems []string
+	if err := auth.CheckJWTSecret(); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if weakSecret(os.Getenv("DB_PASSWORD")) {
+		problems = append(problems, "DB_PASSWORD is empty or a published example value")
+	}
+	if r := os.Getenv("RADIUS_SECRET"); weakSecret(r) || len(r) < 12 {
+		problems = append(problems, "RADIUS_SECRET is empty, a published example value, or shorter than 12 characters")
+	}
+	return problems
+}
+
+// runCommand runs a maintenance command and returns the process exit code.
+func runCommand(db *database.DB, name string) int {
+	switch name {
+	case "reset-password", "reset-mfa":
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "usage: radius-manager %s <staff username>\n", name)
+			return 64
+		}
+		return resetStaffAccount(db, name, os.Args[2])
+	case "access-report":
+		if _, err := handlers.AccessReport(db.DB, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "access-report:", err)
+			return 1
+		}
+		return 0
+	case "resync-access":
+		_, failed, err := handlers.ResyncAllAccess(db.DB, os.Stdout)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "resync-access:", err)
+			return 1
+		}
+		if failed > 0 {
+			return 2
+		}
+		return 0
+	}
+	fmt.Fprintf(os.Stderr, "unknown command %q\ncommands:\n"+
+		"  access-report             list customers who will be refused once access rows are synced\n"+
+		"  resync-access             write RADIUS enforcement rows (expiry, status, device limit) for every customer\n"+
+		"  reset-password <username> set a staff password (read from stdin), unlock and re-enable the account\n"+
+		"  reset-mfa <username>      turn off two-factor authentication for a staff account\n", name)
+	return 64
+}
+
+// resetStaffAccount is the way back in when the only super admin is locked out or has lost
+// their MFA device: run it on the server, e.g.
+//
+//	docker exec -it radius_backend ./radius-manager reset-password admin
+//
+// Either way the account is signed out everywhere.
+func resetStaffAccount(db *database.DB, cmd, username string) int {
+	var id int
+	if err := db.QueryRow(`SELECT id FROM app_users WHERE username = $1`, username).Scan(&id); err != nil {
+		fmt.Fprintf(os.Stderr, "no staff account named %q\n", username)
+		return 1
+	}
+	if cmd == "reset-mfa" {
+		if _, err := db.Exec(`UPDATE app_users SET mfa_enabled = FALSE, mfa_secret = NULL, updated_at = NOW() WHERE id = $1`, id); err != nil {
+			fmt.Fprintln(os.Stderr, "reset-mfa:", err)
+			return 1
+		}
+		auth.RevokeAllUserSessions(db.DB, id)
+		fmt.Printf("Two-factor authentication turned off for %s; they can set it up again on their Profile page.\n", username)
+		return 0
+	}
+
+	fmt.Fprint(os.Stderr, "New password: ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		fmt.Fprintln(os.Stderr, "\nno password given (pass it on stdin)")
+		return 1
+	}
+	password := strings.TrimRight(line, "\r\n")
+	if err := auth.ValidatePasswordWithMin(password, auth.MinPasswordLength()); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "hash:", err)
+		return 1
+	}
+	if _, err := db.Exec(`UPDATE app_users SET password_hash = $1, is_active = TRUE, failed_attempts = 0,
+		locked_until = NULL, updated_at = NOW() WHERE id = $2`, hash, id); err != nil {
+		fmt.Fprintln(os.Stderr, "reset-password:", err)
+		return 1
+	}
+	auth.RevokeAllUserSessions(db.DB, id)
+	fmt.Printf("Password set for %s; the account is unlocked and active.\n", username)
+	return 0
+}
 
 func main() {
 	// Load .env file if present (development mode)
@@ -65,36 +145,71 @@ func main() {
 
 	log := logger.New()
 
+	// Refuse to start with missing or published secrets: anyone who knows the JWT key can
+	// sign in as any admin. APP_ENV=development downgrades this to a warning.
+	appEnv := os.Getenv("APP_ENV")
+	if problems := checkSecrets(); len(problems) > 0 {
+		for _, p := range problems {
+			log.Error("insecure configuration: " + p)
+		}
+		if appEnv != "development" {
+			log.Fatal("refusing to start; set real secrets in .env (setup.sh generates them) or APP_ENV=development for local testing")
+		}
+	}
+
 	// Initialize database
 	db, err := database.New()
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 	defer db.Close()
+	settings.Init(db.DB)
+
+	// Maintenance commands (run once and exit), e.g.
+	//   docker exec radius_backend ./radius-manager access-report
+	if len(os.Args) > 1 {
+		os.Exit(runCommand(db, os.Args[1]))
+	}
 	log.Info("Database connection established")
 
-	// Set Gin mode
-	appEnv := os.Getenv("APP_ENV")
 	if appEnv == "production" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
 	router := gin.New()
+	// Only these proxies may set X-Forwarded-For. Gin walks the header from the right and
+	// stops at the first address that is not a trusted proxy, so a client cannot spoof the
+	// IP used for rate limiting, lockouts, IP blocks and the audit log. The default covers
+	// loopback and Docker's private ranges (the bundled nginx); list your own load balancer
+	// in TRUSTED_PROXIES if there is one in front of nginx.
+	trusted := []string{"127.0.0.1/32", "::1/128", "172.16.0.0/12"}
+	if v := strings.TrimSpace(os.Getenv("TRUSTED_PROXIES")); v != "" {
+		trusted = strings.Split(strings.ReplaceAll(v, " ", ""), ",")
+	}
+	if err := router.SetTrustedProxies(trusted); err != nil {
+		log.Fatalf("TRUSTED_PROXIES: %v", err)
+	}
 	router.Use(gin.Recovery())
 	router.Use(logger.GinLogger(log))
+	// Bodies over 20 MB are refused (the CSV import is the largest legitimate upload).
+	router.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 20<<20)
+		c.Next()
+	})
 
-	// CORS configuration. A wildcard origin is tolerable only because auth is a Bearer
-	// header (no cookies, AllowCredentials=false). Normal traffic goes through the
-	// frontend's nginx proxy on the same origin, so CORS rarely applies.
-	corsConfig := cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Requested-With"},
-		ExposeHeaders:    []string{"Content-Length", "X-Request-ID"},
-		AllowCredentials: false,
-		MaxAge:           12 * time.Hour,
+	// CORS is off by default: the UI is served by nginx on the same origin as /api. Set
+	// CORS_ORIGINS (comma-separated, e.g. https://admin.example.com) only if a different
+	// site must call the API from a browser.
+	if origins := strings.TrimSpace(os.Getenv("CORS_ORIGINS")); origins != "" {
+		router.Use(cors.New(cors.Config{
+			AllowOrigins:     strings.Split(strings.ReplaceAll(origins, " ", ""), ","),
+			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Requested-With", "X-Portal-Token"},
+			ExposeHeaders:    []string{"Content-Length", "X-Request-ID"},
+			AllowCredentials: false,
+			MaxAge:           12 * time.Hour,
+		}))
 	}
-	router.Use(cors.New(corsConfig))
 
 	// Rate limiter middleware
 	rateLimiter := middleware.NewRateLimiter()
@@ -110,48 +225,44 @@ func main() {
 	// Initialize handlers
 	h := handlers.New(db, log)
 
-	// ── Start Tier 2-7 background workers ───────────────────────────────────
-	// These run inside the API process. Running more than one backend replica would
-	// run every worker (scheduler, alerts, NAS pings, honeypot port) once per replica.
-	handlers.StartNASMonitor(db, log)
-	handlers.StartAlertWorker(db, log)
-	handlers.StartScheduler(db, log)
-	handlers.StartHoneypot(db, log)
-	handlers.StartCredStuffingDetector(db, log)
+	// ── Background workers ─────────────────────────────────────────────────
+	// They run inside the API process. With more than one backend copy, set RUN_WORKERS=false
+	// on all but one (scheduled tasks are also protected by a database lock). Note the
+	// login rate limiter and lockout windows are per process.
+	if os.Getenv("RUN_WORKERS") != "false" {
+		handlers.StartNASMonitor(db, log)
+		handlers.StartAlertWorker(db, log)
+		handlers.StartScheduler(db, log)
+		handlers.StartHoneypot(db, log)
+		handlers.StartCredStuffingDetector(db, log)
+	} else {
+		log.Info("RUN_WORKERS=false: background workers not started in this process")
+	}
 
 	// API v1 routes
 	v1 := router.Group("/api/v1")
 	{
-		// First-run setup wizard endpoints — permanently locked once setup_complete = true
+		// First-run setup wizard. /status always answers (the UI uses it to decide whether
+		// to show the wizard); /complete works only while no staff account exists
+		// (handlers.SetupRequired) and, if SETUP_TOKEN is set, with that token.
 		setup := v1.Group("/setup")
 		setup.Use(func(c *gin.Context) {
-			// Rate-limit per IP
-			ip := c.ClientIP()
-			setupIPMu.Lock()
-			setupIPHits[ip]++
-			hits := setupIPHits[ip]
-			setupIPMu.Unlock()
-			if hits > maxSetupHits {
-				c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
-				return
-			}
-
-			// Once setup is done the endpoint vanishes (404 — no information leak)
-			if isSetupDone(db) {
-				c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "not found"})
-				return
+			if c.Request.Method == http.MethodPost {
+				ip := c.ClientIP()
+				setupIPMu.Lock()
+				setupIPHits[ip]++
+				hits := setupIPHits[ip]
+				setupIPMu.Unlock()
+				if hits > maxSetupHits {
+					c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": "too many requests"})
+					return
+				}
 			}
 			c.Next()
 		})
 		{
 			setup.GET("/status", h.SetupStatus)
-			setup.POST("/complete", func(c *gin.Context) {
-				h.SetupComplete(c)
-				// If the handler succeeded, warm the in-memory cache immediately
-				if c.Writer.Status() == http.StatusOK {
-					markSetupDone()
-				}
-			})
+			setup.POST("/complete", h.SetupComplete)
 		}
 
 		// Auth endpoints (public)
@@ -177,9 +288,9 @@ func main() {
 			portal.GET("/dashboard", h.PortalAuthMiddleware(), h.PortalDashboard)
 		}
 
-		// ── Tier 5 Pro: Captive Portal serve (public HTML, no JWT) ───────────
-		// NOTE: the served page's form posts to /api/v1/captive/authenticate, which is not
-		// registered anywhere, so the portal can be displayed but cannot log anyone in.
+		// ── Captive Portal page (public HTML, no JWT) ────────────────────────
+		// The page's form posts to the router's hotspot login (captive_portals.login_url or
+		// ?link-login-only=), and the router authenticates against FreeRADIUS.
 		v1.GET("/captive/serve/:id", h.ServeCaptivePortal)
 
 		// Protected routes: every route below needs a valid session (RequireAuth), and
@@ -260,12 +371,13 @@ func main() {
 			system.PUT("", middleware.RequireRole("super_admin"), h.UpdateSettings)
 		}
 
-		// Backup/Restore (super_admin only)
-		// NOTE: these are stubs (see handlers/dashboard.go) — they return a message but do
-		// not dump or restore anything, and BACKUP_SCHEDULE is not read by any code.
+		// Backups (super_admin only): pg_dump to BACKUP_DIR, also run daily by the scheduler.
+		// Restore is a manual step on the server (POST /restore only returns instructions).
 		protected.POST("backup", middleware.RequireRole("super_admin"), h.CreateBackup)
 		protected.POST("restore", middleware.RequireRole("super_admin"), h.RestoreBackup)
 		protected.GET("backups", middleware.RequireRole("super_admin"), h.ListBackups)
+		protected.GET("backups/:name", middleware.RequireRole("super_admin"), h.DownloadBackup)
+		protected.DELETE("backups/:name", middleware.RequireRole("super_admin"), h.DeleteBackup)
 
 		// ── Tier 1 Pro: Vouchers ─────────────────────────────────────────────
 		vouchers := protected.Group("vouchers")
@@ -314,6 +426,7 @@ func main() {
 		billing := protected.Group("invoices")
 		{
 			billing.GET("", middleware.RequireRole("operator", "admin", "super_admin"), h.ListInvoices)
+			billing.GET("/:id", middleware.RequireRole("operator", "admin", "super_admin"), h.GetInvoice)
 			billing.POST("", middleware.RequireRole("admin", "super_admin"), h.CreateInvoice)
 			billing.PUT("/:id", middleware.RequireRole("admin", "super_admin"), h.UpdateInvoice)
 			billing.DELETE("/:id", middleware.RequireRole("admin", "super_admin"), h.DeleteInvoice)
@@ -344,9 +457,9 @@ func main() {
 		protected.POST("ip-pools/assign", middleware.RequireRole("admin", "super_admin"), h.AssignIP)
 		protected.POST("ip-pools/release", middleware.RequireRole("admin", "super_admin"), h.ReleaseIP)
 
-		// ── Tier 3 Pro: API Keys ──────────────────────────────────────────────
-		// NOTE: keys can be created and revoked here, but no route accepts them yet:
-		// Handler.ValidateAPIKey is not mounted on any group.
+		// ── API Keys ──────────────────────────────────────────────────────────
+		// Keys authenticate as "Authorization: ApiKey <key>" (middleware.RequireAuth):
+		// read keys = operator, GET only; write keys = admin.
 		apikeys := protected.Group("api-keys")
 		{
 			apikeys.GET("", middleware.RequireRole("super_admin"), h.ListAPIKeys)
@@ -447,7 +560,8 @@ func main() {
 		{
 			payments.GET("", middleware.RequireRole("operator", "admin", "super_admin"), h.ListPayments)
 			payments.POST("", middleware.RequireRole("admin", "super_admin"), h.CreatePayment)
-			payments.DELETE("/:id", middleware.RequireRole("super_admin"), h.DeletePayment)
+			payments.POST("/:id/reverse", middleware.RequireRole("super_admin"), h.ReversePayment)
+			payments.DELETE("/:id", middleware.RequireRole("super_admin"), h.ReversePayment)
 			payments.GET("/:id/receipt", middleware.RequireRole("operator", "admin", "super_admin"), h.GetPaymentReceipt)
 			payments.GET("/summary", middleware.RequireRole("admin", "super_admin"), h.PaymentSummary)
 		}
@@ -489,9 +603,8 @@ func main() {
 			sim.POST("/batch", middleware.RequireRole("admin", "super_admin"), h.SimulateBatch)
 		}
 
-		// GeoIP Enforcement
-		// NOTE: only lookups and rule storage exist; nothing consults the rules when a
-		// user authenticates, and CheckCredStuffing (security.go) is never called.
+		// GeoIP rules and IP blocks apply to the staff and customer-portal logins
+		// (handlers.loginGuard), not to RADIUS.
 		geoip := protected.Group("security/geoip")
 		{
 			geoip.GET("/lookup", middleware.RequireRole("operator", "admin", "super_admin"), h.GeoIPLookup)
@@ -527,14 +640,16 @@ func main() {
 		port = "8080"
 	}
 
-	// WriteTimeout bounds the whole response, so it also ends the long-lived SSE stream
-	// at /live/stats after ~30s; the browser's EventSource reconnects automatically.
+	// WriteTimeout bounds normal responses; the live-stats stream and backup downloads lift
+	// it for themselves (http.ResponseController).
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%s", port),
-		Handler:      router,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	go func() {
@@ -544,7 +659,7 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown 
+	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

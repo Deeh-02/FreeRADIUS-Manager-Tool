@@ -14,6 +14,7 @@ type NAS struct {
 	Community   string    `json:"community"`
 	Description string    `json:"description"`
 	Status      string    `json:"status"`
+	CoAPort     int       `json:"coa_port"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }
@@ -28,6 +29,7 @@ type CreateNASRequest struct {
 	Server      string `json:"server"`
 	Community   string `json:"community"`
 	Description string `json:"description"`
+	CoAPort     int    `json:"coa_port" binding:"omitempty,min=1,max=65535"`
 }
 
 // UpdateNASRequest is the request body for updating a NAS client.
@@ -40,6 +42,7 @@ type UpdateNASRequest struct {
 	Community   string `json:"community"`
 	Description string `json:"description"`
 	Status      string `json:"status" binding:"omitempty,oneof=active inactive"`
+	CoAPort     *int   `json:"coa_port" binding:"omitempty,min=1,max=65535"`
 }
 
 // NASTestResult is returned after testing a NAS connection.

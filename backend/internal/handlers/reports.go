@@ -9,24 +9,20 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// UsageReport returns per-user data usage over a time period.
-// NOTE: the interval is bound as a parameter (`INTERVAL $1`), which PostgreSQL does not
-// accept (a typed literal cannot take a placeholder), so this query is expected to fail
-// and the endpoint to return 500; the other reports in this file avoid it by inserting an
-// interval chosen from a fixed list with Sprintf (safe: user input never reaches the SQL).
-// (Read, not run.)
+// UsageReport returns per-user data usage over a time period. The period is a fixed list
+// turned into a number of days and bound as a parameter.
 func (h *Handler) UsageReport(c *gin.Context) {
 	period := c.DefaultQuery("period", "7d")
 	username := c.Query("username")
 
-	interval := "7 days"
+	days := 7
 	switch period {
 	case "1d":
-		interval = "1 day"
+		days = 1
 	case "30d":
-		interval = "30 days"
+		days = 30
 	case "90d":
-		interval = "90 days"
+		days = 90
 	}
 
 	type UserUsage struct {
@@ -40,10 +36,9 @@ func (h *Handler) UsageReport(c *gin.Context) {
 	}
 
 	where := ""
-	args := []interface{}{fmt.Sprintf("%s", interval)}
-	argN := 2
+	args := []interface{}{days}
 	if username != "" {
-		where = fmt.Sprintf(" AND username ILIKE $%d", argN)
+		where = " AND username ILIKE $2"
 		args = append(args, "%"+username+"%")
 	}
 
@@ -55,11 +50,12 @@ func (h *Handler) UsageReport(c *gin.Context) {
 		       COALESCE(SUM(acctinputoctets + acctoutputoctets), 0) as total_bytes,
 		       COALESCE(AVG(acctsessiontime), 0) as avg_duration
 		FROM radacct
-		WHERE acctstarttime >= NOW() - INTERVAL $1 %s
+		WHERE acctstarttime >= NOW() - make_interval(days => $1) %s
 		GROUP BY username
 		ORDER BY total_bytes DESC
 		LIMIT 100`, where), args...)
 	if err != nil {
+		h.log.WithError(err).Error("usage report")
 		respondError(c, http.StatusInternalServerError, "failed to fetch usage report")
 		return
 	}
@@ -189,7 +185,7 @@ func (h *Handler) NASUsageReport(c *gin.Context) {
 	}
 
 	rows, err := h.db.Query(fmt.Sprintf(`
-		SELECT nasipaddress::text,
+		SELECT host(nasipaddress),
 		       COUNT(*) as sessions,
 		       COALESCE(SUM(acctinputoctets + acctoutputoctets), 0) as total_bytes,
 		       COUNT(DISTINCT username) as unique_users
@@ -256,7 +252,7 @@ func (h *Handler) ExportUsageReport(c *gin.Context) {
 		rows.Scan(&username, &sessions, &inputBytes, &outputBytes, &totalBytes, &avgDuration)
 		totalGB := float64(totalBytes) / (1024 * 1024 * 1024)
 		w.Write([]string{
-			username,
+			csvSafe(username),
 			fmt.Sprintf("%d", sessions),
 			fmt.Sprintf("%d", inputBytes),
 			fmt.Sprintf("%d", outputBytes),

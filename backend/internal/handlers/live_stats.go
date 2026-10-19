@@ -10,11 +10,12 @@ import (
 )
 
 // LiveStats streams real-time system statistics using Server-Sent Events.
-// Pushes a fresh snapshot every 5s (about 6 queries each). Browsers' EventSource cannot
-// set an Authorization header, which is why RequireAuth accepts ?token=. Each open
-// dashboard holds a connection and a DB-polling loop; the server's 30s WriteTimeout ends the
-// stream periodically and the client reconnects. X-Accel-Buffering stops nginx buffering events.
+// Pushes a fresh snapshot every 5s (about 6 queries each). The UI reads the stream with
+// fetch() so the token travels in the Authorization header, not the URL. The server-wide
+// 30s write timeout is lifted for this response; the stream ends when the browser
+// disconnects. X-Accel-Buffering stops nginx buffering events.
 func (h *Handler) LiveStats(c *gin.Context) {
+	http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{})
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")

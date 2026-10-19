@@ -21,40 +21,48 @@ func New(db *database.DB, log *logrus.Logger) *Handler {
 	return &Handler{db: db, log: log}
 }
 
-// HealthCheck returns service health status.
-// Checks only the database. The body always says "status":"ok"; failure is signalled by
-// the 503 status code and services.database. FreeRADIUS is not checked.
+// AppVersion is the single version string (API, setup wizard, webhooks, UI footer).
+const AppVersion = "1.1.0"
+
+// HealthCheck returns service health status. The database decides the HTTP status (503 when
+// it is down, which is what the container healthcheck acts on); FreeRADIUS is probed with
+// Status-Server and reported, but a RADIUS outage does not fail the API's health. Pass
+// ?full=1 to include the RADIUS probe (it adds up to 2s).
 func HealthCheck(db *database.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		dbStatus := "ok"
+		services := gin.H{}
+		overall := "ok"
+		code := http.StatusOK
 		if err := db.Ping(); err != nil {
-			dbStatus = "error: " + err.Error()
+			services["database"] = "error: " + err.Error()
+			overall, code = "degraded", http.StatusServiceUnavailable
+		} else {
+			services["database"] = "ok"
+		}
+		if c.Query("full") != "" {
+			if err := radiusAlive(); err != nil {
+				services["radius"] = "error: " + err.Error()
+				overall = "degraded"
+			} else {
+				services["radius"] = "ok"
+			}
 		}
 
-		status := http.StatusOK
-		if dbStatus != "ok" {
-			status = http.StatusServiceUnavailable
-		}
-
-		c.JSON(status, gin.H{
-			"status":    "ok",
+		c.JSON(code, gin.H{
+			"status":    overall,
+			"version":   AppVersion,
 			"timestamp": time.Now().UTC(),
-			"services": gin.H{
-				"database": dbStatus,
-			},
+			"services":  services,
 		})
 	}
 }
 
 // Version returns the application version.
-// "build" is the current date at request time, not a real build date, and the setup status
-// endpoint reports a different hard-coded version ("1.0.0").
 func Version() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"version": "2.0.0-pro",
-			"name":    "FreeRADIUS Manager Pro",
-			"build":   time.Now().Format("2006-01-02"),
+			"version": AppVersion,
+			"name":    "FreeRADIUS Manager",
 		})
 	}
 }

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"math/big"
@@ -35,11 +36,15 @@ func generateVoucherCode() (string, error) {
 
 // GenerateVouchersRequest is the payload for batch voucher generation.
 type GenerateVouchersRequest struct {
-	Count        int    `json:"count" binding:"required,min=1,max=500"`
-	BatchName    string `json:"batch_name"`
-	DataLimitMB  *int64 `json:"data_limit_mb"`
-	TimeLimitMin *int   `json:"time_limit_minutes"`
-	ValidDays    int    `json:"valid_days"`
+	Count        int     `json:"count" binding:"required,min=1,max=500"`
+	BatchName    string  `json:"batch_name"`
+	DataLimitMB  *int64  `json:"data_limit_mb" binding:"omitempty,min=1"`
+	TimeLimitMin *int    `json:"time_limit_minutes" binding:"omitempty,min=1"`
+	ValidDays    int     `json:"valid_days" binding:"omitempty,min=1,max=3650"`
+	PlanID       *int    `json:"plan_id"`
+	Price        float64 `json:"price" binding:"omitempty,min=0"`
+	Currency     string  `json:"currency"`
+	Devices      int     `json:"devices" binding:"omitempty,min=1,max=50"`
 }
 
 // ListVouchers returns paginated vouchers with optional filters.
@@ -69,10 +74,11 @@ func (h *Handler) ListVouchers(c *gin.Context) {
 	dataArgs := append(args, limit, offset)
 	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT v.id, v.code, v.batch_name, v.status, v.data_limit_mb, v.time_limit_minutes,
-		       v.valid_days, v.expires_at, v.redeemed_by, v.redeemed_at,
-		       au.username, v.created_at
+		       COALESCE(v.valid_days, 30), v.expires_at, v.redeemed_by, v.redeemed_at,
+		       au.username, v.created_at, v.plan_id, up.name, v.price, v.currency
 		FROM vouchers v
 		LEFT JOIN app_users au ON au.id = v.created_by
+		LEFT JOIN user_plans up ON up.id = v.plan_id
 		%s
 		ORDER BY v.created_at DESC
 		LIMIT $%d OFFSET $%d`, where, argN, argN+1), dataArgs...)
@@ -96,13 +102,21 @@ func (h *Handler) ListVouchers(c *gin.Context) {
 		RedeemedAt   *time.Time `json:"redeemed_at"`
 		CreatedBy    *string    `json:"created_by"`
 		CreatedAt    time.Time  `json:"created_at"`
+		PlanID       *int       `json:"plan_id"`
+		PlanName     *string    `json:"plan_name"`
+		Price        float64    `json:"price"`
+		Currency     string     `json:"currency"`
 	}
 
 	vouchers := []VoucherRow{}
 	for rows.Next() {
 		var v VoucherRow
-		rows.Scan(&v.ID, &v.Code, &v.BatchName, &v.Status, &v.DataLimitMB, &v.TimeLimitMin,
-			&v.ValidDays, &v.ExpiresAt, &v.RedeemedBy, &v.RedeemedAt, &v.CreatedBy, &v.CreatedAt)
+		if err := rows.Scan(&v.ID, &v.Code, &v.BatchName, &v.Status, &v.DataLimitMB, &v.TimeLimitMin,
+			&v.ValidDays, &v.ExpiresAt, &v.RedeemedBy, &v.RedeemedAt, &v.CreatedBy, &v.CreatedAt,
+			&v.PlanID, &v.PlanName, &v.Price, &v.Currency); err != nil {
+			h.log.WithError(err).Warn("scan voucher")
+			continue
+		}
 		vouchers = append(vouchers, v)
 	}
 
@@ -112,11 +126,13 @@ func (h *Handler) ListVouchers(c *gin.Context) {
 // GenerateVouchers creates a batch of voucher codes.
 // A voucher is a RADIUS login in its own right: the code is both the username and the
 // password (radcheck Cleartext-Password = code), so anyone holding the code can connect.
-// Limits: expires_at/valid_days are stored but never turned into an Expiration radcheck
-// row, so an unused voucher stays usable after its "expiry"; nothing marks a voucher
-// 'used' or fills redeemed_by (there is no redeem endpoint); Max-Octets is not enforced
-// (see AssignPlan); and one failed insert per attempt is retried up to 10 times, so a batch
-// can silently come back smaller than requested (check "count" in the response).
+// What FreeRADIUS enforces for each code:
+//   - Expiration at expires_at (generation time + valid_days), whether used or not
+//   - Simultaneous-Use (devices, default 1; or the plan's device limit)
+//   - Max-Octets (data limit) and Max-All-Session (total online time), via mods-available/quota
+//   - the plan's speed profile, if a plan is given
+// The scheduler's voucher_housekeeping task marks codes 'used' after their first session and
+// 'expired' after expires_at. price is recorded for reporting; vouchers are sold offline.
 func (h *Handler) GenerateVouchers(c *gin.Context) {
 	var req GenerateVouchersRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -125,6 +141,32 @@ func (h *Handler) GenerateVouchers(c *gin.Context) {
 	}
 	if req.ValidDays == 0 {
 		req.ValidDays = 30
+	}
+	if req.Currency == "" {
+		req.Currency = defaultCurrency()
+	}
+	devices := req.Devices
+	var plan *planRow
+	if req.PlanID != nil {
+		p, err := loadPlan(h.db, *req.PlanID)
+		if err != nil {
+			respondError(c, http.StatusBadRequest, "plan not found")
+			return
+		}
+		plan = p
+		if devices == 0 {
+			devices = p.MaxDevices
+		}
+		if req.DataLimitMB == nil && p.DataLimitMB != nil && *p.DataLimitMB > 0 {
+			req.DataLimitMB = p.DataLimitMB
+		}
+		if req.Price == 0 {
+			req.Price = p.Price
+			req.Currency = p.Currency
+		}
+	}
+	if devices == 0 {
+		devices = 1
 	}
 
 	claims, _ := middleware.GetClaims(c)
@@ -136,47 +178,88 @@ func (h *Handler) GenerateVouchers(c *gin.Context) {
 	}
 
 	created := 0
+	var lastErr error
 	for i := 0; i < req.Count; i++ {
-		for attempt := 0; attempt < 10; attempt++ {
+		for attempt := 0; attempt < 5; attempt++ {
 			code, err := generateVoucherCode()
 			if err != nil {
+				lastErr = err
 				break
 			}
-			_, dbErr := h.db.Exec(`
-				INSERT INTO vouchers (code, batch_name, data_limit_mb, time_limit_minutes, valid_days, expires_at, created_by)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-				code, batchName, req.DataLimitMB, req.TimeLimitMin, req.ValidDays, expiresAt, claims.UserID)
-			if dbErr != nil {
-				continue // collision, retry
+			err = h.inTx(func(tx *sql.Tx) error {
+				if _, err := tx.Exec(`
+					INSERT INTO vouchers (code, batch_name, data_limit_mb, time_limit_minutes, valid_days,
+					                      expires_at, created_by, plan_id, price, currency)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+					code, batchName, req.DataLimitMB, req.TimeLimitMin, req.ValidDays, expiresAt,
+					claims.UserID, req.PlanID, round2(req.Price), strings.ToUpper(req.Currency)); err != nil {
+					return err
+				}
+				// A code must not collide with a customer's username either.
+				var taken bool
+				tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM radcheck WHERE username=$1)`, code).Scan(&taken)
+				if taken {
+					return fmt.Errorf("code in use")
+				}
+				for _, a := range [][2]string{
+					{"Cleartext-Password", code},
+					{"Expiration", expiresAt.Format(radiusDateLayout)},
+					{"Simultaneous-Use", fmt.Sprintf("%d", devices)},
+				} {
+					if err := setCheck(tx, code, a[0], ":=", a[1]); err != nil {
+						return err
+					}
+				}
+				if req.DataLimitMB != nil {
+					if err := setCheck(tx, code, "Max-Octets", ":=", fmt.Sprintf("%d", *req.DataLimitMB*1024*1024)); err != nil {
+						return err
+					}
+				}
+				if req.TimeLimitMin != nil {
+					if err := setCheck(tx, code, "Max-All-Session", ":=", fmt.Sprintf("%d", *req.TimeLimitMin*60)); err != nil {
+						return err
+					}
+				}
+				if plan != nil && plan.BandwidthProfileID != nil {
+					var up, down int
+					var rl sql.NullString
+					if err := tx.QueryRow(`SELECT upload_kbps, download_kbps, mikrotik_rate_limit FROM bandwidth_profiles WHERE id=$1`,
+						*plan.BandwidthProfileID).Scan(&up, &down, &rl); err == nil {
+						rate := kbpsToMikrotik(up, down)
+						if rl.Valid && rl.String != "" {
+							rate = rl.String
+						}
+						if err := setReply(tx, code, "Mikrotik-Rate-Limit", "=", rate); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			})
+			if err == nil {
+				created++
+				break
 			}
-			// Register code in radcheck so FreeRADIUS accepts it
-			h.db.Exec(`
-				INSERT INTO radcheck (username, attribute, op, value)
-				VALUES ($1, 'Cleartext-Password', ':=', $1)
-				ON CONFLICT (username, attribute) DO NOTHING`, code)
-			if req.DataLimitMB != nil {
-				bytes := *req.DataLimitMB * 1024 * 1024
-				h.db.Exec(`INSERT INTO radcheck (username, attribute, op, value)
-					VALUES ($1, 'Max-Octets', ':=', $2)
-					ON CONFLICT (username, attribute) DO UPDATE SET value = $2`,
-					code, fmt.Sprintf("%d", bytes))
-			}
-			if req.TimeLimitMin != nil {
-				h.db.Exec(`INSERT INTO radcheck (username, attribute, op, value)
-					VALUES ($1, 'Session-Timeout', ':=', $2)
-					ON CONFLICT (username, attribute) DO UPDATE SET value = $2`,
-					code, fmt.Sprintf("%d", *req.TimeLimitMin*60))
-			}
-			created++
-			break
+			lastErr = err
 		}
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+	resp := gin.H{
 		"message": fmt.Sprintf("Generated %d vouchers in batch '%s'", created, batchName),
 		"count":   created,
 		"batch":   batchName,
-	})
+	}
+	status := http.StatusCreated
+	if created < req.Count {
+		resp["message"] = fmt.Sprintf("Generated only %d of %d vouchers in batch '%s'", created, req.Count, batchName)
+		if lastErr != nil {
+			resp["error"] = lastErr.Error()
+		}
+		if created == 0 {
+			status = http.StatusInternalServerError
+		}
+	}
+	c.JSON(status, resp)
 }
 
 // GetVoucherBatches lists all voucher batches with summary counts.
@@ -228,10 +311,16 @@ func (h *Handler) DisableVoucher(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "voucher not found")
 		return
 	}
-	h.db.Exec(`UPDATE vouchers SET status = 'disabled', updated_at = NOW() WHERE id = $1`, id)
-	h.db.Exec(`INSERT INTO radcheck (username, attribute, op, value)
-		VALUES ($1, 'Auth-Type', ':=', 'Reject')
-		ON CONFLICT (username, attribute) DO UPDATE SET value = 'Reject'`, code)
+	if err := h.inTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE vouchers SET status = 'disabled', updated_at = NOW() WHERE id = $1`, id); err != nil {
+			return err
+		}
+		return setCheck(tx, code, "Auth-Type", ":=", "Reject")
+	}); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to disable voucher")
+		return
+	}
+	disconnectUserSessions(h.db, code, false)
 	c.JSON(http.StatusOK, gin.H{"message": "voucher disabled"})
 }
 
@@ -247,8 +336,19 @@ func (h *Handler) DeleteVoucher(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "voucher not found")
 		return
 	}
-	h.db.Exec(`DELETE FROM radcheck WHERE username = $1`, code)
-	h.db.Exec(`DELETE FROM vouchers WHERE id = $1`, id)
+	disconnectUserSessions(h.db, code, true)
+	if err := h.inTx(func(tx *sql.Tx) error {
+		for _, q := range []string{`DELETE FROM radcheck WHERE username = $1`, `DELETE FROM radreply WHERE username = $1`} {
+			if _, err := tx.Exec(q, code); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(`DELETE FROM vouchers WHERE id = $1`, id)
+		return err
+	}); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete voucher")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "voucher deleted"})
 }
 
@@ -264,7 +364,7 @@ func (h *Handler) ExportVouchers(c *gin.Context) {
 
 	rows, err := h.db.Query(fmt.Sprintf(`
 		SELECT code, batch_name, status, data_limit_mb, time_limit_minutes,
-		       valid_days, expires_at, redeemed_by, created_at
+		       valid_days, expires_at, redeemed_by, created_at, price, currency
 		FROM vouchers %s ORDER BY batch_name, created_at`, where), args...)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "export failed")
@@ -276,7 +376,7 @@ func (h *Handler) ExportVouchers(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="vouchers_export.csv"`)
 
 	w := csv.NewWriter(c.Writer)
-	w.Write([]string{"code", "batch", "status", "data_limit_mb", "time_limit_min", "valid_days", "expires_at", "redeemed_by", "created_at"})
+	w.Write([]string{"code", "batch", "status", "data_limit_mb", "time_limit_min", "valid_days", "expires_at", "redeemed_by", "created_at", "price", "currency"})
 
 	ns := func(s *string) string {
 		if s == nil {
@@ -310,8 +410,12 @@ func (h *Handler) ExportVouchers(c *gin.Context) {
 		var timeLimitMins, validDays *int
 		var expiresAt *time.Time
 		var createdAt time.Time
+		var price float64
+		var currency string
 
-		rows.Scan(&code, &batch, &status, &dataLimitMB, &timeLimitMins, &validDays, &expiresAt, &redeemedBy, &createdAt)
+		if rows.Scan(&code, &batch, &status, &dataLimitMB, &timeLimitMins, &validDays, &expiresAt, &redeemedBy, &createdAt, &price, &currency) != nil {
+			continue
+		}
 		vd := 30
 		if validDays != nil {
 			vd = *validDays
@@ -319,6 +423,7 @@ func (h *Handler) ExportVouchers(c *gin.Context) {
 		w.Write([]string{
 			code, ns(batch), status, ni64(dataLimitMB), ni(timeLimitMins),
 			fmt.Sprintf("%d", vd), nt(expiresAt), ns(redeemedBy), createdAt.Format("2006-01-02 15:04"),
+			fmt.Sprintf("%.2f", price), currency,
 		})
 	}
 	w.Flush()

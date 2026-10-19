@@ -13,11 +13,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// NASPingResult holds the result of a ping check.
-// NOTE: the ping_status, ping_latency_ms and last_ping columns it reads/writes on `nas`
-// are not in init-db.sql or any migration (only the base nas table is), so on a database
-// built from this repo the monitor, dashboard NAS health and the nas_down alert depend on
-// columns that must have been added by hand.
+// NASPingResult holds the result of a ping check (columns added by migrations/010).
 type NASPingResult struct {
 	NASID     int       `json:"id"`
 	NASName   string    `json:"nasname"`
@@ -125,22 +121,23 @@ func StartNASMonitor(db *database.DB, log *logrus.Logger) {
 }
 
 func pingAllNAS(db *database.DB, log *logrus.Logger) {
-	rows, err := db.Query(`SELECT id, nasname FROM nas WHERE status='active'`)
+	rows, err := db.Query(`SELECT id, nasname, COALESCE(shortname,''), COALESCE(ping_status,'unknown') FROM nas WHERE status='active'`)
 	if err != nil {
 		return
 	}
-	defer rows.Close()
 
 	type nasEntry struct {
-		id      int
-		nasname string
+		id                   int
+		nasname, short, prev string
 	}
 	devices := []nasEntry{}
 	for rows.Next() {
 		var e nasEntry
-		rows.Scan(&e.id, &e.nasname)
-		devices = append(devices, e)
+		if rows.Scan(&e.id, &e.nasname, &e.short, &e.prev) == nil {
+			devices = append(devices, e)
+		}
 	}
+	rows.Close()
 
 	// Ping concurrently (max 20 at once)
 	sem := make(chan struct{}, 20)
@@ -160,6 +157,10 @@ func pingAllNAS(db *database.DB, log *logrus.Logger) {
 			}
 			db.Exec(`UPDATE nas SET ping_status=$1, ping_latency_ms=$2, last_ping=NOW() WHERE id=$3`,
 				status, latency, dev.id)
+			// Notify on a change of state (not on every check, and not on first sight).
+			if dev.prev != "unknown" && dev.prev != status {
+				dispatchWebhookDB(db, "nas."+status, gin.H{"id": dev.id, "nasname": dev.nasname, "shortname": dev.short})
+			}
 		}(d)
 	}
 	wg.Wait()

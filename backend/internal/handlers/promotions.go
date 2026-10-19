@@ -13,11 +13,10 @@ import (
 // Promotions / Discount Codes
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// How promotions currently work: Validate only calculates a discounted price for display;
-// Apply only increments uses_count. Neither is called from AssignPlan or CreateInvoice, no
-// invoice records which code was used, and the frontend never calls Apply. A code therefore
-// changes what a customer is charged only if someone types the discounted amount into an
-// invoice by hand. Fixed discounts carry no currency.
+// A code is used by passing promo_code when assigning a plan or creating an invoice: the
+// discount is taken off the invoice, the invoice records the code, and one use is counted
+// atomically (billing_core.go redeemPromotion). Validate only previews the discount.
+// Fixed-amount discounts are in the invoice's currency.
 
 type Promotion struct {
 	ID            int        `json:"id"`
@@ -82,6 +81,10 @@ func (h *Handler) CreatePromotion(c *gin.Context) {
 	if req.DiscountType == "" {
 		req.DiscountType = "percent"
 	}
+	if req.DiscountType != "percent" && req.DiscountType != "fixed" {
+		respondError(c, http.StatusBadRequest, "discount_type must be percent or fixed")
+		return
+	}
 	if req.DiscountType == "percent" && req.DiscountValue > 100 {
 		respondError(c, http.StatusBadRequest, "percent discount cannot exceed 100")
 		return
@@ -108,10 +111,8 @@ func (h *Handler) CreatePromotion(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"id": id, "message": "promotion created"})
 }
 
-// UpdatePromotion updates a promotion's settings.
-// Omitted fields are not all "unchanged": a missing is_active becomes true (re-enabling a
-// disabled code) and a missing max_uses becomes 0 (unlimited), because `$4>=0` below is
-// always true for an int. The UI always sends both, so this bites API callers.
+// UpdatePromotion updates a promotion's settings. Only the fields present in the request
+// change; send "clear_plan": true / "clear_dates": true to remove a restriction.
 func (h *Handler) UpdatePromotion(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -119,30 +120,49 @@ func (h *Handler) UpdatePromotion(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Description   string     `json:"description"`
-		DiscountType  string     `json:"discount_type"`
-		DiscountValue float64    `json:"discount_value"`
-		MaxUses       int        `json:"max_uses"`
+		Description   *string    `json:"description"`
+		DiscountType  *string    `json:"discount_type" binding:"omitempty,oneof=percent fixed"`
+		DiscountValue *float64   `json:"discount_value" binding:"omitempty,gt=0"`
+		PlanID        *int       `json:"plan_id"`
+		ClearPlan     bool       `json:"clear_plan"`
+		MaxUses       *int       `json:"max_uses" binding:"omitempty,min=0"`
 		ValidFrom     *time.Time `json:"valid_from"`
 		ValidUntil    *time.Time `json:"valid_until"`
+		ClearDates    bool       `json:"clear_dates"`
 		IsActive      *bool      `json:"is_active"`
 	}
-	c.ShouldBindJSON(&req)
-	isActive := true
-	if req.IsActive != nil {
-		isActive = *req.IsActive
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
 	}
-	h.db.Exec(`UPDATE promotions SET
-		description=COALESCE(NULLIF($1,''),description),
-		discount_type=COALESCE(NULLIF($2,''),discount_type),
-		discount_value=CASE WHEN $3>0 THEN $3 ELSE discount_value END,
-		max_uses=CASE WHEN $4>=0 THEN $4 ELSE max_uses END,
-		valid_from=COALESCE($5,valid_from),
-		valid_until=COALESCE($6,valid_until),
-		is_active=$7
-		WHERE id=$8`,
-		req.Description, req.DiscountType, req.DiscountValue, req.MaxUses,
-		req.ValidFrom, req.ValidUntil, isActive, id)
+	if req.DiscountValue != nil && *req.DiscountValue > 100 {
+		dt := ""
+		h.db.QueryRow(`SELECT discount_type FROM promotions WHERE id=$1`, id).Scan(&dt)
+		if (req.DiscountType != nil && *req.DiscountType == "percent") || (req.DiscountType == nil && dt == "percent") {
+			respondError(c, http.StatusBadRequest, "percent discount cannot exceed 100")
+			return
+		}
+	}
+	res, err := h.db.Exec(`UPDATE promotions SET
+		description    = COALESCE($1, description),
+		discount_type  = COALESCE($2, discount_type),
+		discount_value = COALESCE($3, discount_value),
+		plan_id        = CASE WHEN $4 THEN NULL ELSE COALESCE($5, plan_id) END,
+		max_uses       = COALESCE($6, max_uses),
+		valid_from     = CASE WHEN $7 THEN NULL ELSE COALESCE($8, valid_from) END,
+		valid_until    = CASE WHEN $7 THEN NULL ELSE COALESCE($9, valid_until) END,
+		is_active      = COALESCE($10, is_active)
+		WHERE id = $11`,
+		req.Description, req.DiscountType, req.DiscountValue, req.ClearPlan, req.PlanID, req.MaxUses,
+		req.ClearDates, req.ValidFrom, req.ValidUntil, req.IsActive, id)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update promotion")
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		respondError(c, http.StatusNotFound, "promotion not found")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "promotion updated"})
 }
 
@@ -157,12 +177,13 @@ func (h *Handler) DeletePromotion(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "promotion deleted"})
 }
 
-// ValidatePromoCode checks if a code is valid and returns discount details.
-// plan_id on the promotion is stored and shown but never checked here.
+// ValidatePromoCode checks if a code is valid (for plan_id, if given) and previews the
+// discount. It does not consume a use.
 func (h *Handler) ValidatePromoCode(c *gin.Context) {
 	var req struct {
 		Code          string  `json:"code" binding:"required"`
 		OriginalPrice float64 `json:"original_price"`
+		PlanID        *int    `json:"plan_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
@@ -201,18 +222,15 @@ func (h *Handler) ValidatePromoCode(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "promotion has expired")
 		return
 	}
+	if p.PlanID != nil && (req.PlanID == nil || *req.PlanID != *p.PlanID) {
+		respondError(c, http.StatusBadRequest, "promotion does not apply to this plan")
+		return
+	}
 
 	var discountAmount, finalPrice float64
 	if req.OriginalPrice > 0 {
-		if p.DiscountType == "percent" {
-			discountAmount = req.OriginalPrice * (p.DiscountValue / 100)
-		} else {
-			discountAmount = p.DiscountValue
-		}
-		finalPrice = req.OriginalPrice - discountAmount
-		if finalPrice < 0 {
-			finalPrice = 0
-		}
+		discountAmount = promoDiscount(p.DiscountType, p.DiscountValue, req.OriginalPrice)
+		finalPrice = round2(req.OriginalPrice - discountAmount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -223,22 +241,19 @@ func (h *Handler) ValidatePromoCode(c *gin.Context) {
 	})
 }
 
-// ApplyPromoCode increments usage count after a promotion is used.
-// It does not re-run the validity checks (active, dates, max_uses, plan) and the
-// increment is not guarded, so concurrent or repeated calls can exceed max_uses.
+// ApplyPromoCode consumes one use of a code outside the invoice flow (for example a
+// discount given at the counter). It runs the same checks as Validate, atomically.
 func (h *Handler) ApplyPromoCode(c *gin.Context) {
 	var req struct {
-		Code string `json:"code" binding:"required"`
+		Code   string `json:"code" binding:"required"`
+		PlanID *int   `json:"plan_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	req.Code = strings.ToUpper(strings.TrimSpace(req.Code))
-	result, _ := h.db.Exec(`UPDATE promotions SET uses_count=uses_count+1 WHERE code=$1`, req.Code)
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		respondError(c, http.StatusNotFound, "promo code not found")
+	if _, err := redeemPromotion(h.db, req.Code, req.PlanID, 0); err != nil {
+		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "promo code applied"})

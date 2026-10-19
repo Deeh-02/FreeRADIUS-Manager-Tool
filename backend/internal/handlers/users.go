@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"database/sql"
+	"errors"
 	"net/http"
 
 	"github.com/freeradius-manager/backend/internal/auth"
 	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/freeradius-manager/backend/internal/models"
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
 )
 
 // ListAdminUsers returns all admin/operator users.
@@ -131,6 +133,11 @@ func (h *Handler) UpdateAdminUser(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The new role must also be one the actor may manage (no promoting to your own level).
+	if req.Role != "" && !auth.CanManageRole(actorClaims.Role, req.Role) {
+		respondError(c, http.StatusForbidden, "you cannot give a user a role equal to or above your own")
+		return
+	}
 
 	_, err = h.db.Exec(`
 		UPDATE app_users
@@ -138,14 +145,26 @@ func (h *Handler) UpdateAdminUser(c *gin.Context) {
 		    full_name = COALESCE(NULLIF($2, ''), full_name),
 		    role = COALESCE(NULLIF($3, ''), role),
 		    is_active = COALESCE($4, is_active),
+		    mfa_enabled = CASE WHEN $6 THEN FALSE ELSE mfa_enabled END,
+		    mfa_secret  = CASE WHEN $6 THEN NULL ELSE mfa_secret END,
+		    failed_attempts = CASE WHEN $7 THEN 0 ELSE failed_attempts END,
+		    locked_until    = CASE WHEN $7 THEN NULL ELSE locked_until END,
 		    updated_at = NOW()
 		WHERE id = $5`,
-		req.Email, req.FullName, req.Role, req.IsActive, targetID,
+		req.Email, req.FullName, req.Role, req.IsActive, targetID, req.ResetMFA, req.Unlock,
 	)
 	if err != nil {
+		if isUniqueViolation(err) {
+			respondError(c, http.StatusConflict, "email is already in use")
+			return
+		}
 		h.log.WithError(err).Error("failed to update admin user")
 		respondError(c, http.StatusInternalServerError, "failed to update user")
 		return
+	}
+	// Disabling an account or resetting its MFA signs it out everywhere.
+	if (req.IsActive != nil && !*req.IsActive) || req.ResetMFA {
+		auth.RevokeAllUserSessions(h.db.DB, targetID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "user updated successfully"})
@@ -188,23 +207,8 @@ func (h *Handler) DeleteAdminUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "user deleted successfully"})
 }
 
-// isUniqueViolation checks for PostgreSQL unique constraint violation.
-// It matches on the error text ("23505" or the word "unique"), not on the driver's error
-// code, so any error message that merely contains "unique" is also reported as a duplicate.
-// contains/containsStr below re-implement strings.Contains.
+// isUniqueViolation reports a PostgreSQL unique_violation (SQLSTATE 23505).
 func isUniqueViolation(err error) bool {
-	return err != nil && (contains(err.Error(), "23505") || contains(err.Error(), "unique"))
-}
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsStr(s, substr))
-}
-
-func containsStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && pqErr.Code == "23505"
 }

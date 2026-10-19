@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/freeradius-manager/backend/internal/database"
 	"github.com/gin-gonic/gin"
@@ -60,9 +61,7 @@ func AuditLogger(db *database.DB, log *logrus.Logger) gin.HandlerFunc {
 			return
 		}
 
-		// Sanitize body - remove password fields. Only top-level JSON keys named in
-		// sensitiveFields are redacted; nested secrets and any other sensitive field (for
-		// example a NAS's SNMP "community") are stored in audit_log as-is.
+		// Sanitize body: keys in sensitiveFields are redacted at any depth.
 		sanitized := sanitizeBody(bodyBytes)
 
 		action := method + " " + c.FullPath()
@@ -90,21 +89,43 @@ func AuditLogger(db *database.DB, log *logrus.Logger) gin.HandlerFunc {
 	}
 }
 
+// sensitiveFields are JSON keys whose values never reach audit_log, at any nesting depth.
+var sensitiveFields = map[string]bool{
+	"password": true, "new_password": true, "current_password": true, "secret": true,
+	"mfa_secret": true, "mfa_code": true, "token": true, "refresh_token": true,
+	"community": true, "key": true, "api_key": true, "setup_token": true,
+	"default_secret": true, "smtp_pass": true,
+}
+
 // sanitizeBody removes sensitive fields from the JSON body for audit storage.
 func sanitizeBody(body []byte) []byte {
 	if len(body) == 0 {
 		return body
 	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(body, &m); err != nil {
+	var v interface{}
+	if err := json.Unmarshal(body, &v); err != nil {
 		return []byte("[non-JSON body]")
 	}
-	sensitiveFields := []string{"password", "new_password", "current_password", "secret", "mfa_secret", "token"}
-	for _, f := range sensitiveFields {
-		if _, ok := m[f]; ok {
-			m[f] = "***REDACTED***"
-		}
-	}
-	out, _ := json.Marshal(m)
+	out, _ := json.Marshal(redact(v))
 	return out
+}
+
+func redact(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, val := range t {
+			if sensitiveFields[strings.ToLower(k)] {
+				t[k] = "***REDACTED***"
+			} else {
+				t[k] = redact(val)
+			}
+		}
+		return t
+	case []interface{}:
+		for i := range t {
+			t[i] = redact(t[i])
+		}
+		return t
+	}
+	return v
 }
