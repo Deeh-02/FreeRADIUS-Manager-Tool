@@ -34,6 +34,8 @@ sql {
 
     # Disable reading NAS clients from DB on startup to prevent module
     # init failure if the connection is briefly unavailable.
+    # NOTE: the comment above says "disable", but the value is yes: clients ARE read from
+    # the `nas` table (see client_query), once at startup.
     read_clients = yes
 
     group_attribute = "SQL-Group"

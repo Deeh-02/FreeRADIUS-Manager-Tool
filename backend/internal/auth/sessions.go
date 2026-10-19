@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// A "session" is a login on one device. Its id is copied into the JWT and into every
+// refresh_tokens row created for it (refresh rotates the row but keeps the id), so one
+// session_id ties the short-lived access token to a revocable server-side record.
+
 // GenerateSessionID creates a unique session identifier stored in JWT and refresh_tokens.
 func GenerateSessionID() (string, error) {
 	b := make([]byte, 16)
@@ -31,6 +35,10 @@ func SessionTimeout() time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+// NOTE: SessionConcurrentBlock / HasActiveSession implement the older "single active
+// session" rule. Login (handlers/auth.go) no longer calls HasActiveSession since
+// multi-device login was enabled, so this pair is currently unused.
+//
 // SessionConcurrentBlock returns how recently the account must have been used to
 // reject a second login. After this idle period the previous session is treated
 // as closed (browser tab closed without sign-out).
@@ -48,7 +56,8 @@ func SessionConcurrentBlock() time.Duration {
 	return 5 * time.Minute
 }
 
-// RevokeAllUserSessions invalidates every active session for a user.
+// RevokeAllUserSessions invalidates every active session for a user (currently unused;
+// ChangePassword does the same revoke with its own inline UPDATE).
 func RevokeAllUserSessions(db *sql.DB, userID int) {
 	db.Exec(`UPDATE refresh_tokens SET revoked = TRUE WHERE user_id = $1 AND revoked = FALSE`, userID)
 }

@@ -50,6 +50,9 @@ func isSetupDone(db *database.DB) bool {
 }
 
 // setupIPRateLimit is a very simple per-IP request counter for the setup endpoint.
+// NOTE: counts are never reset, so this is a cap per IP for the life of the process
+// (cleared only on restart), not a per-minute limit. The IP itself comes from
+// c.ClientIP(), which a client can spoof via X-Forwarded-For (see middleware/ratelimit.go).
 var (
 	setupIPHits   = map[string]int{}
 	setupIPMu     sync.Mutex
@@ -80,7 +83,9 @@ func main() {
 	router.Use(gin.Recovery())
 	router.Use(logger.GinLogger(log))
 
-	// CORS configuration
+	// CORS configuration. A wildcard origin is tolerable only because auth is a Bearer
+	// header (no cookies, AllowCredentials=false). Normal traffic goes through the
+	// frontend's nginx proxy on the same origin, so CORS rarely applies.
 	corsConfig := cors.Config{
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
@@ -106,6 +111,8 @@ func main() {
 	h := handlers.New(db, log)
 
 	// ── Start Tier 2-7 background workers ───────────────────────────────────
+	// These run inside the API process. Running more than one backend replica would
+	// run every worker (scheduler, alerts, NAS pings, honeypot port) once per replica.
 	handlers.StartNASMonitor(db, log)
 	handlers.StartAlertWorker(db, log)
 	handlers.StartScheduler(db, log)
@@ -161,6 +168,8 @@ func main() {
 		}
 
 		// ── Tier 4 Pro: User Self-Service Portal (public, no JWT) ────────────
+		// Customers (radius_users), not admins. Auth is a separate opaque token sent as
+		// X-Portal-Token and kept in portal_sessions; only the global per-IP rate limit applies.
 		portal := v1.Group("/portal")
 		{
 			portal.POST("/login", h.PortalLogin)
@@ -169,9 +178,15 @@ func main() {
 		}
 
 		// ── Tier 5 Pro: Captive Portal serve (public HTML, no JWT) ───────────
+		// NOTE: the served page's form posts to /api/v1/captive/authenticate, which is not
+		// registered anywhere, so the portal can be displayed but cannot log anyone in.
 		v1.GET("/captive/serve/:id", h.ServeCaptivePortal)
 
-		// Protected routes
+		// Protected routes: every route below needs a valid session (RequireAuth), and
+		// AuditLogger records each POST/PUT/PATCH/DELETE (reads are not audited). The
+		// setup, auth, portal and captive routes above sit outside this group, so they
+		// are not audited. Per-route RequireRole is the real authorisation check; the
+		// frontend's role metadata only hides menu items.
 		protected := v1.Group("/")
 		protected.Use(middleware.RequireAuth(db))
 		protected.Use(middleware.AuditLogger(db, log))
@@ -246,6 +261,8 @@ func main() {
 		}
 
 		// Backup/Restore (super_admin only)
+		// NOTE: these are stubs (see handlers/dashboard.go) — they return a message but do
+		// not dump or restore anything, and BACKUP_SCHEDULE is not read by any code.
 		protected.POST("backup", middleware.RequireRole("super_admin"), h.CreateBackup)
 		protected.POST("restore", middleware.RequireRole("super_admin"), h.RestoreBackup)
 		protected.GET("backups", middleware.RequireRole("super_admin"), h.ListBackups)
@@ -328,6 +345,8 @@ func main() {
 		protected.POST("ip-pools/release", middleware.RequireRole("admin", "super_admin"), h.ReleaseIP)
 
 		// ── Tier 3 Pro: API Keys ──────────────────────────────────────────────
+		// NOTE: keys can be created and revoked here, but no route accepts them yet:
+		// Handler.ValidateAPIKey is not mounted on any group.
 		apikeys := protected.Group("api-keys")
 		{
 			apikeys.GET("", middleware.RequireRole("super_admin"), h.ListAPIKeys)
@@ -471,6 +490,8 @@ func main() {
 		}
 
 		// GeoIP Enforcement
+		// NOTE: only lookups and rule storage exist; nothing consults the rules when a
+		// user authenticates, and CheckCredStuffing (security.go) is never called.
 		geoip := protected.Group("security/geoip")
 		{
 			geoip.GET("/lookup", middleware.RequireRole("operator", "admin", "super_admin"), h.GeoIPLookup)
@@ -506,6 +527,8 @@ func main() {
 		port = "8080"
 	}
 
+	// WriteTimeout bounds the whole response, so it also ends the long-lived SSE stream
+	// at /live/stats after ~30s; the browser's EventSource reconnects automatically.
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),
 		Handler:      router,

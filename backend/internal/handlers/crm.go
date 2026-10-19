@@ -11,6 +11,12 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // Customers CRM
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// A customer record is separate contact data (including a national ID number and address)
+// that is linked to a RADIUS login only by the free-text `username`; creating one does not
+// create a RADIUS user, and deleting either side does not touch the other. The country
+// default is hard-coded to "Zimbabwe". The customers/tickets tables are not defined in this
+// repo's SQL files.
 
 type Customer struct {
 	ID            int        `json:"id"`

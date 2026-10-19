@@ -18,6 +18,12 @@ type visitor struct {
 }
 
 // RateLimiter is a simple in-memory rate limiter per IP.
+// State lives in this process only (lost on restart, not shared between replicas).
+// NOTE: the key is c.ClientIP(). main.go never calls SetTrustedProxies, so Gin trusts
+// every proxy and takes the left-most X-Forwarded-For entry. Behind the bundled nginx
+// (which appends to a client-supplied header) a client can send its own
+// X-Forwarded-For to pick the IP it is counted under, which defeats this limiter, the
+// setup limiter and the IP shown in logs/audit. Checked with a small Gin 1.9.1 program.
 type RateLimiter struct {
 	mu       sync.Mutex
 	visitors map[string]*visitor
@@ -82,6 +88,8 @@ func (rl *RateLimiter) isLimited(ip string) bool {
 		return false
 	}
 
+	// Once over the limit an IP is blocked for a full window (not just until the
+	// current minute rolls over), which is why lastSeen is refreshed on every hit.
 	// Check if blocked
 	if v.blocked && now.Before(v.blockedUntil) {
 		return true

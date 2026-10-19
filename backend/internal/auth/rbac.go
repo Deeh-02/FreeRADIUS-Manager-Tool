@@ -32,6 +32,9 @@ func HasMinRole(userRole, minRole string) bool {
 }
 
 // CanManageRole returns true if the actor can manage (create/edit/delete) the target role.
+// Strictly greater, so even a super_admin cannot edit or delete another super_admin.
+// Route access itself is decided by middleware.RequireRole with explicit role lists;
+// roleHierarchy is only used here and by HasMinRole, which nothing currently calls.
 // A user cannot manage peers or higher roles.
 func CanManageRole(actorRole, targetRole string) bool {
 	return roleHierarchy[actorRole] > roleHierarchy[targetRole]

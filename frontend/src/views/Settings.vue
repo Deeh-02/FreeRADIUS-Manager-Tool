@@ -227,6 +227,10 @@ async function loadSettings() {
   finally { loading.value = false }
 }
 
+// Saves every field to the system_settings table. Most of these keys are informational: the
+// backend reads session timeout, rate limit, lockout, password rules and SMTP from environment
+// variables, so changing them here does not change behaviour (see handlers/dashboard.go
+// UpdateSettings). The same goes for the "require MFA" box, which nothing enforces.
 async function saveSettings() {
   saving.value = true
   try {
@@ -238,6 +242,7 @@ async function saveSettings() {
   finally { saving.value = false }
 }
 
+// The endpoint is a stub: the toast says "backup initiated" but no backup file is created.
 async function createBackup() {
   try {
     const { data } = await settingsAPI.createBackup()
@@ -245,6 +250,8 @@ async function createBackup() {
   } catch { toast.error('Backup failed') }
 }
 
+// Does not send anything or call the API (the backend has POST /alerts/test-email); it only
+// shows this message.
 async function testEmail() {
   toast.info('Email test functionality requires SMTP configuration')
 }

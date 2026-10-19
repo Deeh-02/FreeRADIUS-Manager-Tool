@@ -107,6 +107,8 @@
             <td class="text-xs text-gray-400">{{ formatDate(p.created_at) }}</td>
             <td>
               <div class="flex gap-1">
+                <!-- A plain link cannot send the Authorization header, and the API requires it for
+                     receipts, so from here the new tab gets a 401 JSON error (see GetPaymentReceipt). -->
                 <a :href="`/api/v1/payments/${p.id}/receipt`" target="_blank"
                   class="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600" title="View Receipt">
                   <ReceiptPercentIcon class="w-4 h-4" />
@@ -203,6 +205,9 @@ const lastReceipt = ref('')
 const lastPaymentId = ref(null)
 let debounceTimer
 
+// This form has no invoice field, so a payment recorded here is never linked to an invoice
+// (the API supports invoice_id, which would also mark that invoice paid). Totals in the
+// summary cards are shown with a fixed "$" regardless of each payment's currency.
 const form = reactive({ username: '', amount: '', currency: 'USD', payment_method: 'cash', gateway_ref: '', notes: '' })
 
 function formatDate(d) { try { return format(parseISO(d), 'MMM d, yyyy HH:mm') } catch { return d } }

@@ -147,6 +147,8 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 }
 
 // DeletePlan removes a plan (unlinking users first).
+// Users keep whatever radcheck/radreply attributes the plan already gave them (device
+// limit, Max-Octets, rate limit); only the plan_id link is cleared.
 func (h *Handler) DeletePlan(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -160,6 +162,19 @@ func (h *Handler) DeletePlan(c *gin.Context) {
 }
 
 // AssignPlan assigns a plan to a RADIUS user and applies plan attributes.
+//
+// Billing behaviour worth knowing before relying on it:
+//   - Not transactional: each step below is a separate statement and errors are ignored,
+//     so a failure part-way leaves the user half-configured with a 200 response.
+//   - Expiry is reset to today + validity_days; it does not extend from the current
+//     expiry, so renewing early forfeits the remaining days.
+//   - An invoice is created on EVERY assignment of a paid plan, including re-assigning the
+//     same plan. Nothing links a promotion to it (see promotions.go).
+//   - The invoice number uses the clock's nanoseconds mod 1e6; a collision violates
+//     invoices.invoice_number UNIQUE and the INSERT's error is ignored, so no invoice.
+//   - Max-Octets is only a radcheck row; FreeRADIUS has no counter module configured here
+//     to enforce it (see freeradius/sites-available/default).
+//   - No UI calls this endpoint (plansAPI.assignToUser is unused in the frontend).
 func (h *Handler) AssignPlan(c *gin.Context) {
 	userID, err := mustInt(c, "id")
 	if err != nil {

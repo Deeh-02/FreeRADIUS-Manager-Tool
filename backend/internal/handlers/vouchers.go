@@ -13,6 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// 32 symbols x 12 positions (~60 bits) from crypto/rand; the alphabet drops look-alike
+// characters so codes survive being read out or printed on scratch cards.
 const voucherChars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // no 0/O or 1/I
 
 func generateVoucherCode() (string, error) {
@@ -108,6 +110,13 @@ func (h *Handler) ListVouchers(c *gin.Context) {
 }
 
 // GenerateVouchers creates a batch of voucher codes.
+// A voucher is a RADIUS login in its own right: the code is both the username and the
+// password (radcheck Cleartext-Password = code), so anyone holding the code can connect.
+// Limits: expires_at/valid_days are stored but never turned into an Expiration radcheck
+// row, so an unused voucher stays usable after its "expiry"; nothing marks a voucher
+// 'used' or fills redeemed_by (there is no redeem endpoint); Max-Octets is not enforced
+// (see AssignPlan); and one failed insert per attempt is retried up to 10 times, so a batch
+// can silently come back smaller than requested (check "count" in the response).
 func (h *Handler) GenerateVouchers(c *gin.Context) {
 	var req GenerateVouchersRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

@@ -12,6 +12,8 @@ import (
 )
 
 // responseWriter wraps gin.ResponseWriter to capture the status code.
+// The audit row is written after the handler runs, so it can record the outcome
+// (including 4xx/5xx and role-denied attempts), not just the request.
 type responseWriter struct {
 	gin.ResponseWriter
 	body   *bytes.Buffer
@@ -58,7 +60,9 @@ func AuditLogger(db *database.DB, log *logrus.Logger) gin.HandlerFunc {
 			return
 		}
 
-		// Sanitize body - remove password fields
+		// Sanitize body - remove password fields. Only top-level JSON keys named in
+		// sensitiveFields are redacted; nested secrets and any other sensitive field (for
+		// example a NAS's SNMP "community") are stored in audit_log as-is.
 		sanitized := sanitizeBody(bodyBytes)
 
 		action := method + " " + c.FullPath()

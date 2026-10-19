@@ -163,7 +163,9 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 		accountExpiry = *req.AccountExpiry
 	}
 
-	// Default password expiry (from settings, fallback 90 days)
+	// Default password expiry (from settings, fallback 90 days).
+	// NOTE: always 90 days — the password_expiry_days setting is never read. Nothing in this
+	// repo enforces password_expiry or force_password_change when a RADIUS user connects.
 	passwordExpiry := time.Now().AddDate(0, 0, 90).Format("2006-01-02")
 
 	tx, err := h.db.Begin()
@@ -193,7 +195,10 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 		return
 	}
 
-	// Insert into radcheck for FreeRADIUS (Cleartext-Password for PAP/CHAP/EAP)
+	// Insert into radcheck for FreeRADIUS (Cleartext-Password for PAP/CHAP/EAP).
+	// The bcrypt hash in radius_users.password only serves the self-service portal and
+	// password history; this plaintext copy is what FreeRADIUS authenticates against, so
+	// anyone who can read radcheck can read every customer's network password.
 	_, err = tx.Exec(`
 		INSERT INTO radcheck (username, attribute, op, value)
 		VALUES ($1, 'Cleartext-Password', ':=', $2)
@@ -206,7 +211,9 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 		return
 	}
 
-	// Simultaneous-Use for device limiting
+	// Simultaneous-Use for device limiting. Enforced by FreeRADIUS, not this API:
+	// sites-available/default runs `session { sql }`, which compares the open radacct
+	// rows for the user (simul_count_query) against this value.
 	_, err = tx.Exec(`
 		INSERT INTO radcheck (username, attribute, op, value)
 		VALUES ($1, 'Simultaneous-Use', ':=', $2)
@@ -384,7 +391,8 @@ func (h *Handler) ResetRadiusUserPassword(c *gin.Context) {
 		newHash, id)
 	tx.Exec(`UPDATE radcheck SET value = $1 WHERE username = $2 AND attribute = 'Cleartext-Password'`,
 		req.NewPassword, username)
-	// Save old password to history
+	// Save old password to history. The check above compares only against past hashes,
+	// never the current password, so resetting to the same password is accepted.
 	tx.Exec(`INSERT INTO radius_user_password_history (user_id, password_hash) VALUES ($1, $2)`,
 		id, oldHash)
 
@@ -421,7 +429,10 @@ func (h *Handler) setRadiusUserStatus(c *gin.Context, status string) {
 
 	h.db.Exec(`UPDATE radius_users SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 
-	// Add/remove Auth-Type := Reject in radcheck to block login
+	// Add/remove Auth-Type := Reject in radcheck to block login.
+	// This row is the only thing that blocks a suspended user at the RADIUS server —
+	// FreeRADIUS never reads radius_users.status. The scheduler's 'expired' status does
+	// NOT write this row, so an expired account can still authenticate (see scheduler.go).
 	if status == "suspended" {
 		h.db.Exec(`
 			INSERT INTO radcheck (username, attribute, op, value)
@@ -464,7 +475,9 @@ func (h *Handler) DisconnectRadiusUser(c *gin.Context) {
 		var sessionID, nasIP, callingStation string
 		rows.Scan(&sessionID, &nasIP, &callingStation)
 		// In production: send CoA/Disconnect-Request to NAS
-		// For now, mark session as stopped in DB
+		// For now, mark session as stopped in DB.
+		// NOTE: no packet is sent, so the user stays connected until the NAS drops
+		// them; only the accounting row is closed (the "disconnected N" count is DB rows).
 		h.db.Exec(`
 			UPDATE radacct SET acctstoptime = NOW(), acctterminatecause = 'Admin-Reset'
 			WHERE acctsessionid = $1`, sessionID)
@@ -648,6 +661,10 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 		}
 
 		var newID int
+		// NOTE: this INSERT names a `description` column, but radius_users has none in
+		// init-db.sql or any migration, so it is expected to fail for every row (reported as
+		// "error" per row). The import also skips Simultaneous-Use, password_expiry and the
+		// plan's own radcheck/radreply attributes (it only sets plan_id).
 		insertErr := h.db.QueryRow(`
 			INSERT INTO radius_users (username, email, password, description, status, account_expiry, plan_id, created_by)
 			VALUES ($1,$2,$3,$4,'active',$5,$6,$7) RETURNING id`,

@@ -11,6 +11,12 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // Organizations / Resellers
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// NOTE: this is bookkeeping, not multi-tenancy. org_id is a label on radius_users, nas and
+// app_users; no query elsewhere filters by it, so every admin/operator sees every
+// organisation's users, NAS devices, invoices and payments. user_limit is never checked
+// when users are created, and the org_id columns themselves are not in init-db.sql or any
+// migration (like the organizations table).
 
 type Organization struct {
 	ID        int        `json:"id"`

@@ -130,6 +130,11 @@ func (h *Handler) DeleteTemplate(c *gin.Context) {
 }
 
 // ApplyTemplate applies a template's attributes to one or more RADIUS users.
+// Attribute names and values are written straight into radcheck/radreply without
+// validation, so a template can set any check item (including Auth-Type or
+// Cleartext-Password); template routes are admin/super_admin only in main.go. As in
+// AssignIP, the radreply branch's ON CONFLICT has no unique index to match (only radcheck
+// has one), so reply attributes are expected to fail silently.
 func (h *Handler) ApplyTemplate(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {

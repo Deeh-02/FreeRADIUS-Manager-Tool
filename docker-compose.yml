@@ -1,3 +1,11 @@
+# Four containers on one private network:
+#   frontend (nginx + built Vue app, :8081) --/api--> backend (Go API, :8088) --> postgres
+#   freeradius (UDP 1812/1813) reads and writes the SAME postgres database.
+# Only the host ports published below are reachable from outside; postgres is not published.
+#
+# Every ${VAR:-default} falls back to a well-known value (DB password, JWT secret, RADIUS
+# secret) when .env does not set it, so run setup.sh or copy .env.example and change
+# them before going live: the stack starts happily with the insecure defaults.
 version: '3.8'
 
 services:
@@ -10,6 +18,9 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD:-ChangeMe_Secure_Pass123!}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Files in docker-entrypoint-initdb.d run only when the data volume is EMPTY (first
+      # start). Changing them later does nothing; apply new migrations by hand or with
+      # deploy-update.sh. 008_network_scanner.sql is not mounted: init-db.sql already has it.
       - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
       - ./migrations/009_billing.sql:/docker-entrypoint-initdb.d/02-billing.sql
     networks:
@@ -27,6 +38,8 @@ services:
     ports:
       - "1812:1812/udp"
       - "1813:1813/udp"
+      # 18120 is the inner-tunnel listener, bound to 127.0.0.1 inside the container, so this
+      # published port reaches nothing.
       - "18120:18120/udp"
     environment:
       DB_HOST: postgres
@@ -63,11 +76,15 @@ services:
       RADIUS_SECRET: ${RADIUS_SECRET:-testing123}
       RADIUS_TIMEOUT: ${RADIUS_TIMEOUT:-5s}
       RADIUS_RETRIES: ${RADIUS_RETRIES:-3}
+      # Hard-coded: the backend always listens on 8088 in compose, whatever WEB_PORT says in
+      # .env (the Dockerfile healthcheck and nginx proxy_pass also assume 8088).
       WEB_PORT: 8088
       BCRYPT_COST: ${BCRYPT_COST:-12}
       RATE_LIMIT: ${RATE_LIMIT:-100}
       BRUTE_FORCE_ATTEMPTS: ${BRUTE_FORCE_ATTEMPTS:-5}
       BRUTE_FORCE_LOCKOUT: ${BRUTE_FORCE_LOCKOUT:-15}
+      # Not read by any backend code (grep finds no use), so this does not restrict admin
+      # access. Restrict by firewall or proxy instead.
       ADMIN_IP_WHITELIST: ${ADMIN_IP_WHITELIST:-0.0.0.0/0}
       SESSION_TIMEOUT: ${SESSION_TIMEOUT:-3600}
       SESSION_CONCURRENT_BLOCK: ${SESSION_CONCURRENT_BLOCK:-5m}
@@ -78,6 +95,8 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-noreply@radius-manager.local}
+      # No SMS_* variables are passed (see handlers/sms.go) and BACKUP_* are not read by any
+      # code: add SMS_GATEWAY etc. here to use SMS, and schedule pg_dump outside the app.
       BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
       BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
       APP_ENV: ${APP_ENV:-production}
@@ -90,6 +109,7 @@ services:
         condition: service_started
     networks:
       - radius-network
+    # Lets nmap (network scanner) use raw sockets for ARP/ICMP discovery.
     cap_add:
       - NET_RAW
       - NET_ADMIN
@@ -104,6 +124,8 @@ services:
     ports:
       - "8081:80"
     environment:
+      # No effect at runtime: Vite bakes VITE_API_URL into the JS bundle at build time, from
+      # the build arg above (/api/v1). nginx then proxies /api/ to the backend.
       - VITE_API_URL=${VITE_API_URL:-http://localhost:8080}
     depends_on:
       - backend
@@ -115,6 +137,9 @@ networks:
   radius-network:
     driver: bridge
 
+# postgres_data holds ALL business data (users, invoices, payments, accounting). Removing it
+# (`docker compose down -v`) deletes everything and re-runs the init scripts. Nothing here
+# backs it up; see docs/ARCHITECTURE.md for the pg_dump command.
 volumes:
   postgres_data:
     driver: local

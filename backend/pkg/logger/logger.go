@@ -44,6 +44,7 @@ func GinLogger(log *logrus.Logger) gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 
+		// The query string is logged verbatim, which includes ?token=<JWT> on SSE requests.
 		if raw != "" {
 			path = path + "?" + raw
 		}

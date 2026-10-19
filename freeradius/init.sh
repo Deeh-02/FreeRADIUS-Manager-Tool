@@ -8,6 +8,8 @@ until pg_isready -h "${DB_HOST:-postgres}" -p "${DB_PORT:-5432}" -U "${DB_USER:-
 done
 echo "[FreeRADIUS] PostgreSQL is ready."
 
+# Placeholders are filled in at container start (not image build) so one image works with any
+# .env. The sed delimiter is "|", hence the escaping of \ & | in values below.
 # Safe replacement: escapes \ & | so any password/secret can be used
 sed_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/&/\\&/g; s/|/\\|/g'; }
 
@@ -27,4 +29,7 @@ sed -i "s|DB_PASS_PLACEHOLDER|$(sed_escape "${DB_PASS:-}")|g"            "$SQL"
 echo "[FreeRADIUS] SQL module credentials set (host: ${DB_HOST:-postgres})."
 
 echo "[FreeRADIUS] Starting FreeRADIUS..."
+# exec: FreeRADIUS becomes PID 1 so `docker stop` signals reach it. The placeholders are
+# replaced in place, so on a plain `docker restart` the already-substituted files are reused;
+# changing RADIUS_SECRET or DB_PASS needs the container recreated, not just restarted.
 exec freeradius -f -l stdout "$@"

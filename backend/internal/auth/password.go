@@ -20,6 +20,9 @@ var (
 )
 
 // HashPassword creates a bcrypt hash of the password.
+// Used for admin logins and the customer self-service portal. It does NOT protect
+// RADIUS network passwords: FreeRADIUS needs the cleartext (PAP/CHAP/MS-CHAP), so
+// handlers also write the plain password to radcheck (Cleartext-Password).
 func HashPassword(password string) (string, error) {
 	cost := getBcryptCost()
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
@@ -35,6 +38,9 @@ func CheckPassword(hash, password string) bool {
 }
 
 // ValidatePasswordComplexity checks that a password meets all complexity rules.
+// Applies to admin/operator accounts only; RADIUS (customer) passwords only need
+// 6 characters (models.CreateRadiusUserRequest). The length check counts bytes, not
+// characters, so a short non-ASCII password can pass.
 func ValidatePasswordComplexity(password string) error {
 	minLen := getMinPasswordLength()
 	if len(password) < minLen {

@@ -15,6 +15,11 @@ import (
 )
 
 // Login authenticates an app user and issues JWT tokens.
+// Lockout is per account (failed_attempts/locked_until), not per IP. failed_attempts is
+// not reset when a lock expires, so the first wrong password after a lockout re-locks the
+// account immediately. Disabled and locked accounts are reported before the password is
+// checked, which reveals that a username exists. Each login opens a new session; there is
+// no limit on concurrent sessions per user.
 func (h *Handler) Login(c *gin.Context) {
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -170,7 +175,9 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	// Rotate refresh token (same session)
+	// Rotate refresh token (same session). The old token is revoked here but if the client
+	// loses the response the retry fails with 401; a stolen-and-replayed old token is simply
+	// rejected (it is not treated as a theft signal that revokes the whole session).
 	h.db.Exec(`UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1`, hash)
 
 	newAccessToken, err := auth.GenerateAccessToken(userID, username, role, sessionID)
@@ -315,6 +322,9 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 }
 
 // MFASetup generates and returns a TOTP secret and QR code URI.
+// The new secret overwrites the stored one immediately, even when MFA is already enabled,
+// and it is kept unencrypted in app_users.mfa_secret. The "MFA required" setting is
+// stored by the wizard/settings page but nothing enforces it at login.
 func (h *Handler) MFASetup(c *gin.Context) {
 	claims, _ := middleware.GetClaims(c)
 

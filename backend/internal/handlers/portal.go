@@ -11,6 +11,11 @@ import (
 )
 
 // PortalLogin authenticates a RADIUS user and returns a short-lived portal token.
+// Checks the bcrypt copy in radius_users.password (not radcheck). Customer passwords can be
+// as short as 6 characters and the only brake on guessing is the global per-IP rate limit
+// (which is spoofable, see middleware/ratelimit.go): there is no per-account lockout here.
+// Only 'suspended' is refused; an 'expired' customer can still sign in and see their data.
+// Tokens live 24h in portal_sessions, a table that is not created by init-db.sql.
 func (h *Handler) PortalLogin(c *gin.Context) {
 	var req struct {
 		Username string `json:"username" binding:"required"`

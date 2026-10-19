@@ -76,7 +76,8 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 	keyHash := hex.EncodeToString(hash[:])
 	keyPrefix := fullKey[:12] // "rmk_" + first 8 hex chars
 
-	// Build permissions array literal for PostgreSQL
+	// Build permissions array literal for PostgreSQL. Hand-built and unquoted: a
+	// permission containing a comma, brace or quote produces a different array than intended.
 	permsLiteral := "{" + joinStrings(req.Permissions, ",") + "}"
 
 	var expiresAt interface{}
@@ -129,6 +130,10 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 
 // ValidateAPIKey middleware authenticates requests using an API key.
 // Checks Authorization: ApiKey <key> header.
+// NOTE: not mounted on any route in main.go, so issued keys currently grant nothing. If
+// it is wired in, note that it calls c.Next() when the header is absent (it is an
+// "optional" check, not a gate), never compares perms against the route, and scans a
+// text[] column into []string, which lib/pq cannot do without pq.Array.
 func (h *Handler) ValidateAPIKey(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if len(authHeader) < 8 || authHeader[:7] != "ApiKey " {

@@ -189,6 +189,9 @@ func (h *Handler) DeleteAdminUser(c *gin.Context) {
 }
 
 // isUniqueViolation checks for PostgreSQL unique constraint violation.
+// It matches on the error text ("23505" or the word "unique"), not on the driver's error
+// code, so any error message that merely contains "unique" is also reported as a duplicate.
+// contains/containsStr below re-implement strings.Contains.
 func isUniqueViolation(err error) bool {
 	return err != nil && (contains(err.Error(), "23505") || contains(err.Error(), "unique"))
 }

@@ -2,7 +2,9 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/store/auth'
 import { setupAPI } from '@/api/index'
 
-// Cache setup status so we only check once per page load
+// Cache setup status so we only check once per page load.
+// If the status call fails (backend down) we assume setup is NOT required, so the login
+// page shows instead of the wizard.
 let setupRequired = null
 
 async function checkSetupStatus() {
@@ -258,6 +260,9 @@ const router = createRouter({
   routes,
 })
 
+// Route guard. The `roles` lists in meta only decide which pages the UI lets you open;
+// they are a convenience, not security. The API enforces roles per endpoint
+// (middleware.RequireRole), so a hidden page's data is still protected server-side.
 router.beforeEach(async (to, from, next) => {
   const authStore = useAuthStore()
 

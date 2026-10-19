@@ -22,6 +22,8 @@ func New(db *database.DB, log *logrus.Logger) *Handler {
 }
 
 // HealthCheck returns service health status.
+// Checks only the database. The body always says "status":"ok"; failure is signalled by
+// the 503 status code and services.database. FreeRADIUS is not checked.
 func HealthCheck(db *database.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		dbStatus := "ok"
@@ -45,6 +47,8 @@ func HealthCheck(db *database.DB) gin.HandlerFunc {
 }
 
 // Version returns the application version.
+// "build" is the current date at request time, not a real build date, and the setup status
+// endpoint reports a different hard-coded version ("1.0.0").
 func Version() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
@@ -61,6 +65,9 @@ func respondError(c *gin.Context, status int, message string) {
 }
 
 // paginationParams extracts page and limit from query string.
+// Defaults to page 1 / 20 rows; limit is capped at 100 and silently falls back to 20 if
+// larger. Many list endpoints also run a separate COUNT(*) and ignore scan errors, so a
+// failing query shows up as an empty page, not an error.
 func paginationParams(c *gin.Context) (offset, limit int) {
 	page := 1
 	limit = 20

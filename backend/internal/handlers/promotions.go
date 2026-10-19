@@ -12,6 +12,12 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // Promotions / Discount Codes
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// How promotions currently work: Validate only calculates a discounted price for display;
+// Apply only increments uses_count. Neither is called from AssignPlan or CreateInvoice, no
+// invoice records which code was used, and the frontend never calls Apply. A code therefore
+// changes what a customer is charged only if someone types the discounted amount into an
+// invoice by hand. Fixed discounts carry no currency.
 
 type Promotion struct {
 	ID            int        `json:"id"`
@@ -103,6 +109,9 @@ func (h *Handler) CreatePromotion(c *gin.Context) {
 }
 
 // UpdatePromotion updates a promotion's settings.
+// Omitted fields are not all "unchanged": a missing is_active becomes true (re-enabling a
+// disabled code) and a missing max_uses becomes 0 (unlimited), because `$4>=0` below is
+// always true for an int. The UI always sends both, so this bites API callers.
 func (h *Handler) UpdatePromotion(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -149,6 +158,7 @@ func (h *Handler) DeletePromotion(c *gin.Context) {
 }
 
 // ValidatePromoCode checks if a code is valid and returns discount details.
+// plan_id on the promotion is stored and shown but never checked here.
 func (h *Handler) ValidatePromoCode(c *gin.Context) {
 	var req struct {
 		Code          string  `json:"code" binding:"required"`
@@ -214,6 +224,8 @@ func (h *Handler) ValidatePromoCode(c *gin.Context) {
 }
 
 // ApplyPromoCode increments usage count after a promotion is used.
+// It does not re-run the validity checks (active, dates, max_uses, plan) and the
+// increment is not guarded, so concurrent or repeated calls can exceed max_uses.
 func (h *Handler) ApplyPromoCode(c *gin.Context) {
 	var req struct {
 		Code string `json:"code" binding:"required"`

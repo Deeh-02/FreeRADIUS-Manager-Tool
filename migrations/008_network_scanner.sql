@@ -1,4 +1,6 @@
 -- Network scanner tables (run on existing installations)
+-- These same statements are already inside init-db.sql; docker-compose does not mount this
+-- file (fresh installs get the tables from init-db.sql), deploy-update.sh applies it.
 CREATE TABLE IF NOT EXISTS network_scans (
     id            SERIAL PRIMARY KEY,
     subnet        VARCHAR(64)  NOT NULL,

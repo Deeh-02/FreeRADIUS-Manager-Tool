@@ -2,6 +2,11 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { authAPI } from '@/api'
 
+// Holds the signed-in admin/operator. Mirrors tokens and the user into localStorage so a page
+// reload keeps you signed in. isAuthenticated only means "a token is stored": whether it is
+// still valid is decided by the API (401 -> refresh or sign-out, see api/index.js). The role
+// here is only used to show or hide UI; it is not authoritative.
+// The customer self-service portal (UserPortal.vue) does not use this store.
 export const useAuthStore = defineStore('auth', () => {
   const user = ref(JSON.parse(localStorage.getItem('user') || 'null'))
   const accessToken = ref(localStorage.getItem('access_token') || null)

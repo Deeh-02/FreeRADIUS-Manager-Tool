@@ -81,6 +81,18 @@ func (h *Handler) ListPayments(c *gin.Context) {
 }
 
 // CreatePayment records a new payment and marks the linked invoice as paid.
+//
+// This is a manual ledger for money received by hand (cash, transfer, mobile money); no
+// payment-gateway integration or callback exists. Known limits:
+//   - Not transactional: the payment can be saved while the invoice update fails silently.
+//   - invoice_id is not validated: any id is accepted, a cancelled invoice can be marked
+//     paid, a partial payment still marks the invoice fully paid, and the same invoice can
+//     be paid again and again.
+//   - gateway_ref is not unique, so a retried gateway reference creates a duplicate row.
+//   - Recording a payment does not renew the plan, extend account_expiry or re-activate
+//     the customer; those are separate manual steps.
+//   - The Payments page form has no invoice field, so payments entered there never touch
+//     an invoice; the operator must also press "Mark Paid" on the Billing page.
 func (h *Handler) CreatePayment(c *gin.Context) {
 	var req struct {
 		InvoiceID     *int    `json:"invoice_id"`
@@ -137,6 +149,9 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 }
 
 // GetPaymentReceipt returns HTML receipt for a payment.
+// Requires a Bearer token (or ?token=). The Payments page opens it with a plain
+// <a href target=_blank>, which cannot send an Authorization header, so from the UI the
+// browser lands on a 401 JSON error rather than the receipt.
 func (h *Handler) GetPaymentReceipt(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -175,6 +190,8 @@ func (h *Handler) GetPaymentReceipt(c *gin.Context) {
 }
 
 // DeletePayment removes a payment record.
+// Hard delete: the linked invoice stays "paid" and no reversal entry is kept (the audit
+// log is the only trace), so deleting a payment makes revenue and invoices disagree.
 func (h *Handler) DeletePayment(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -245,12 +262,18 @@ func (h *Handler) PaymentSummary(c *gin.Context) {
 	})
 }
 
+// generateReceiptNumber returns RCP-<date>-<6 random digits>. It is random, not a
+// sequence, and relies on payments.receipt_number UNIQUE; a collision (about 1 in 900k
+// per day, more as volume grows) makes CreatePayment return a 500.
 func generateReceiptNumber() string {
 	t := time.Now()
 	r := rand.Intn(900000) + 100000
 	return fmt.Sprintf("RCP-%d%02d%02d-%06d", t.Year(), t.Month(), t.Day(), r)
 }
 
+// buildReceiptHTML renders the receipt with fmt.Sprintf. Notes, username and the
+// organisation name are interpolated WITHOUT HTML escaping, so markup in any of them is
+// rendered in the page that serves the receipt.
 func buildReceiptHTML(p Payment, orgName, orgEmail string) string {
 	username := "—"
 	if p.Username != nil {

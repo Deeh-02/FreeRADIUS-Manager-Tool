@@ -208,6 +208,10 @@ async function create() {
 
 function openCreate() { showModal.value = true }
 
+// Only flips the invoice status (and stamps paid_at). It does NOT create a payment record,
+// so the Payments page, receipts and "this month" revenue will not include it. Record the
+// money on the Payments page as well. The summary cards count invoices of all currencies
+// together; the "USD" label is fixed text, not read from the data.
 async function markPaid(inv) {
   try {
     await billingAPI.update(inv.id, { status: 'paid' })

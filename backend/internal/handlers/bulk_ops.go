@@ -15,6 +15,11 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 
 // BulkOperation performs an action on multiple RADIUS users.
+// Each username is processed independently (no transaction, errors are reported per user
+// but statement errors inside an action are often ignored). Actions are not equivalent to
+// their single-user counterparts: "change_plan" only sets plan_id — it does not apply the
+// plan's attributes, expiry or invoice like AssignPlan does — and "apply_template" uses
+// ON CONFLICT on radreply, which has no unique index (see AssignIP).
 func (h *Handler) BulkOperation(c *gin.Context) {
 	var req struct {
 		Usernames []string               `json:"usernames" binding:"required,min=1"`
@@ -97,6 +102,9 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 			} else {
 				_, opErr = h.db.Exec(`UPDATE radius_users SET account_expiry=$1 WHERE username=$2`, expiry, username)
 				if opErr == nil {
+					// The only code path that writes the radcheck Expiration attribute the FreeRADIUS
+					// `expiration` module enforces. The value is an ISO date (YYYY-MM-DD); I could not
+					// confirm that FreeRADIUS parses that format (it documents e.g. "Dec 31 2026").
 					h.db.Exec(`INSERT INTO radcheck (username,attribute,op,value) VALUES ($1,'Expiration',':=',$2)
 						ON CONFLICT (username,attribute) DO UPDATE SET value=$2`, username, expiry)
 					msg = "expiry updated to " + expiry

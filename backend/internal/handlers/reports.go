@@ -10,6 +10,11 @@ import (
 )
 
 // UsageReport returns per-user data usage over a time period.
+// NOTE: the interval is bound as a parameter (`INTERVAL $1`), which PostgreSQL does not
+// accept (a typed literal cannot take a placeholder), so this query is expected to fail
+// and the endpoint to return 500; the other reports in this file avoid it by inserting an
+// interval chosen from a fixed list with Sprintf (safe: user input never reaches the SQL).
+// (Read, not run.)
 func (h *Handler) UsageReport(c *gin.Context) {
 	period := c.DefaultQuery("period", "7d")
 	username := c.Query("username")

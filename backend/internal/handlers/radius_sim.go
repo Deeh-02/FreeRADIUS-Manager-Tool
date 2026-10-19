@@ -30,6 +30,9 @@ type SimResult struct {
 }
 
 // SimulateAuth sends an Access-Request and returns a detailed breakdown.
+// Any admin can aim this at any host:port with a caller-supplied secret, so it doubles as a
+// UDP probe from the backend's network position. A real RADIUS user's password is sent
+// (encrypted with the shared secret) exactly as a NAS would, so test accounts are safer to use.
 func (h *Handler) SimulateAuth(c *gin.Context) {
 	var req struct {
 		Username    string `json:"username" binding:"required"`

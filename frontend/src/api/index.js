@@ -10,7 +10,9 @@ const api = axios.create({
   },
 })
 
-// Request interceptor: attach access token
+// Request interceptor: attach access token.
+// Tokens live in localStorage (not an httpOnly cookie), so any script injected into the
+// page could read them; the backend's Bearer-header design also makes CSRF a non-issue.
 api.interceptors.request.use(
   (config) => {
     const token = localStorage.getItem('access_token')
@@ -33,7 +35,12 @@ const processQueue = (error, token = null) => {
   failedQueue = []
 }
 
-// Response interceptor: handle 401 and token refresh
+// Response interceptor: handle 401 and token refresh.
+// The backend distinguishes two 401s by `code`: SESSION_REVOKED (logged out / idle timeout
+// -> drop credentials, go to /login) and TOKEN_EXPIRED (access JWT lapsed -> use the refresh
+// token once). While one refresh is in flight, other failed requests wait in failedQueue
+// and are replayed with the new token, so a burst of calls triggers a single refresh.
+// The refresh token rotates: each refresh invalidates the previous one.
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
@@ -220,6 +227,9 @@ export const reportsAPI = {
 }
 
 // ── Tier 2 Pro: User Plans ────────────────────────────────────────────────
+// NOTE: assignToUser (POST /radius/users/:id/plan) is the only call that applies a plan's
+// limits and raises its invoice, but no view calls it yet, so plans cannot be assigned from
+// the UI. The user form sets account expiry and device limit by hand instead.
 export const plansAPI = {
   list: () => api.get('/plans'),
   create: (data) => api.post('/plans', data),
@@ -308,6 +318,9 @@ export const smsAPI = {
 // ── Tier 4 Pro: Live Stats (SSE helper) ───────────────────────────────────
 export const liveStatsAPI = {
   current: () => api.get('/live/stats/current'),
+  // EventSource cannot set an Authorization header, so the JWT goes in the URL (the backend
+  // accepts ?token=). It therefore appears in server logs. The path is hard-coded to
+  // /api/v1 and ignores VITE_API_URL, so it works only when the API is on the same origin.
   createEventSource: () => {
     const token = localStorage.getItem('access_token') || ''
     return new EventSource(`/api/v1/live/stats?token=${encodeURIComponent(token)}`)
@@ -378,6 +391,8 @@ export const templatesAPI = {
 }
 
 // ── Tier 6 Pro: Promotions ────────────────────────────────────────────────
+// NOTE: `apply` is never called from a view, and neither validate nor apply touches an
+// invoice, so promotions are currently a calculator, not a discount on what is billed.
 export const promotionsAPI = {
   list: () => api.get('/promotions'),
   create: (data) => api.post('/promotions', data),

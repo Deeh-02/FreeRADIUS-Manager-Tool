@@ -32,12 +32,17 @@ fi
 DB_USER="${DB_USER:-radius_user}"
 DB_NAME="${DB_NAME:-radius}"
 
+# NOTE: this updates whichever checkout it runs in by pulling origin/main (step 2 does
+# `git checkout main`), so run it only on the deployment server, never on a working branch
+# with uncommitted work. It is the only place a database backup is taken.
 # --- 1. Backup database ---
 BACKUP_DIR="./backups"
 mkdir -p "$BACKUP_DIR"
 BACKUP_FILE="$BACKUP_DIR/radius_pre_update_$(date +%Y%m%d_%H%M%S).sql"
 if docker ps --format '{{.Names}}' | grep -q '^radius_postgres$'; then
   info "Backing up database to $BACKUP_FILE ..."
+  # Plain-SQL dump on the host, inside ./backups (git-ignored). It is not copied
+  # off-machine and old dumps are never pruned.
   docker exec radius_postgres pg_dump -U "${DB_USER:-radius_user}" "${DB_NAME:-radius}" > "$BACKUP_FILE"
   success "Database backup saved"
 else
@@ -58,6 +63,9 @@ else
 fi
 
 # --- 3. Run SQL migrations ---
+# Re-applies EVERY file in migrations/ on each update (they are written to be idempotent),
+# and `|| true` below means a failing migration does not stop the update or fail the script.
+# Read the output for ERROR lines. init-db.sql itself is not re-run here.
 if [ -d migrations ] && docker ps --format '{{.Names}}' | grep -q '^radius_postgres$'; then
   info "Applying database migrations ..."
   for f in $(ls migrations/*.sql 2>/dev/null | sort); do
@@ -91,7 +99,9 @@ else
   warn "Frontend not responding yet — check: docker logs radius_frontend"
 fi
 
-# Verify new backend code is running
+# Verify new backend code is running. The marker string is a function name from the
+# session code; the check also needs `strings` inside the (alpine) backend image, which may
+# be missing, in which case this warns even though the update succeeded.
 if docker exec radius_backend strings /app/radius-manager 2>/dev/null | grep -q 'RevokeSession'; then
   success "Backend running updated session code"
 else

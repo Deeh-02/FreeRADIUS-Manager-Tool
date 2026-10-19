@@ -55,6 +55,11 @@ func (h *Handler) ListWebhooks(c *gin.Context) {
 }
 
 // CreateWebhook registers a new webhook.
+// NOTE: `events` is written as a JSON string (["a","b"]), read back with json.Unmarshal,
+// and queried in dispatchWebhook with ANY(events) / events='{}' — which assume a Postgres
+// array. These cannot all be right for one column type and the table is not defined in
+// this repo, so event filtering (and possibly create/update) may be broken. Only
+// "invoice.paid" and "ticket.created" are ever dispatched.
 func (h *Handler) CreateWebhook(c *gin.Context) {
 	var req struct {
 		Name     string   `json:"name" binding:"required,min=2"`
@@ -228,6 +233,10 @@ func (h *Handler) dispatchWebhook(event string, payload gin.H) {
 }
 
 // deliverWebhook sends a signed JSON POST to the given URL.
+// The body is signed with HMAC-SHA256 of the raw JSON using the webhook's secret and sent
+// as X-RADIUS-Signature: sha256=<hex>; receivers should recompute it and also reject old
+// "timestamp" values (it is inside the signed body). There is no retry and no allow-list
+// for the URL, so a super_admin can point it at internal addresses (SSRF).
 func deliverWebhook(url string, secret *string, event string, payload interface{}) (int, error) {
 	body, _ := json.Marshal(map[string]interface{}{
 		"event":     event,

@@ -1,3 +1,13 @@
+# Request flow for a normal login: listen -> authorize (`sql` loads the user's
+# radcheck/radreply rows; `expiration`/`logintime` act on any Expiration/Login-Time rows;
+# `pap`/`chap`/`mschap` pick how the password will be checked) -> authenticate (compares
+# against radcheck's Cleartext-Password) -> post-auth (`sql` logs to radpostauth).
+# Accounting packets go to `accounting { sql }` -> radacct.
+#
+# What this config does NOT do: it never looks at radius_users (status, account_expiry,
+# plan) or at invoices. A user is blocked only if a radcheck row says so (Auth-Type :=
+# Reject, or an Expiration date). No counter module (e.g. sqlcounter) is called from this
+# site, so data caps (Max-Octets) and time caps written to radcheck are not enforced here.
 server default {
     listen {
         type   = auth
@@ -52,6 +62,9 @@ server default {
         attr_filter.accounting_response
     }
 
+    # Enforces Simultaneous-Use (the per-user device limit): counts open radacct rows via
+    # simul_count_query in queries.conf. It trusts accounting, so sessions whose Stop packet
+    # never arrived keep counting until the scheduler's cleanup_sessions closes them.
     session {
         sql
     }

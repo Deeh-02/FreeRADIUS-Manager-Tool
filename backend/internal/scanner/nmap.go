@@ -73,6 +73,13 @@ func ValidateSubnet(cidr string) (*net.IPNet, error) {
 	return ipNet, nil
 }
 
+// Why two phases for big subnets: running a port scan across up to 16k addresses would take
+// hours, so large ranges are first swept for live hosts only, and ports are then scanned on
+// the survivors (capped at NMAP_MAX_PORTSCAN_HOSTS, default 512; live hosts beyond the cap
+// are dropped from the results entirely, not reported without ports). Flags are chosen for
+// speed over completeness (-T4, one retry, short host timeouts), so slow or rate-limited
+// devices can be missed.
+//
 // RunScan executes nmap and returns discovered hosts.
 // For subnets larger than /24, port-scan profiles use two phases: discovery then port scan on live hosts.
 func RunScan(ctx context.Context, subnet, scanType string) ([]HostResult, error) {

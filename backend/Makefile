@@ -12,6 +12,7 @@ deps:
 tidy:
 	go mod tidy
 
+# There are currently no *_test.go files, so this runs nothing.
 test:
 	go test ./... -v
 

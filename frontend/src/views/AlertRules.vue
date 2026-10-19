@@ -86,6 +86,9 @@
           </div>
           <div v-if="!editing">
             <label class="form-label">Event Type <span class="text-red-500">*</span></label>
+            <!-- The backend (handlers/alerts.go checkAlerts) only evaluates data_limit_100pct,
+                 account_expiry_3d, account_expiry_7d and nas_down. The other options below
+                 (data_limit_80pct, login_failure, new_user) can be saved but never fire. -->
             <select v-model="form.event_type" class="form-input" required>
               <option value="">Select event…</option>
               <option value="data_limit_80pct">Data at 80% of limit</option>

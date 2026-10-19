@@ -96,6 +96,8 @@ const toast = useToast()
 const loading = ref(false)
 const running = ref(null)
 const tasks = ref([])
+// "Recent Task Runs" is only this browser tab's memory of "Run Now" clicks; it is lost on
+// reload. The server's own record of the last result per task is task.last_result above.
 const runLog = ref([])
 
 function formatDate(d) {

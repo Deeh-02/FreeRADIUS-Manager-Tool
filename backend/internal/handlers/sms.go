@@ -81,6 +81,8 @@ func (h *Handler) ListSMSLogs(c *gin.Context) {
 }
 
 // NotifyUserExpiry sends SMS to users expiring within `days` days (if phone set).
+// Manual only: no scheduled task calls it, so expiry reminders go out when an admin
+// presses the button. Running it twice texts the same customers twice.
 func (h *Handler) NotifyUserExpiry(c *gin.Context) {
 	var req struct {
 		Days    int    `json:"days"`
@@ -144,6 +146,12 @@ func (h *Handler) SMSConfig(c *gin.Context) {
 }
 
 // sendSMSGateway sends a message via HTTP SMS gateway.
+// Configured only through SMS_GATEWAY / SMS_API_KEY / SMS_SENDER_ID / SMS_BODY_TEMPLATE /
+// SMS_CONTENT_TYPE. docker-compose.yml does not pass any SMS_* variable to the backend
+// container, so under compose SMS reports "not configured" until they are added there.
+// The message is substituted into the body template as raw text with no JSON escaping, so
+// a message containing a double quote breaks the default JSON body. Gateway responses
+// are not parsed: any status below 400 counts as "sent".
 // Supports generic HTTP POST (Bulksms, Africa's Talking, custom gateways).
 func sendSMSGateway(to, message string) (string, error) {
 	gatewayURL := os.Getenv("SMS_GATEWAY")

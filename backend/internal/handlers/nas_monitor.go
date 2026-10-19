@@ -14,6 +14,10 @@ import (
 )
 
 // NASPingResult holds the result of a ping check.
+// NOTE: the ping_status, ping_latency_ms and last_ping columns it reads/writes on `nas`
+// are not in init-db.sql or any migration (only the base nas table is), so on a database
+// built from this repo the monitor, dashboard NAS health and the nas_down alert depend on
+// columns that must have been added by hand.
 type NASPingResult struct {
 	NASID     int       `json:"id"`
 	NASName   string    `json:"nasname"`
@@ -72,6 +76,10 @@ func (h *Handler) PingNASNow(c *gin.Context) {
 }
 
 // pingHost checks if a host is reachable by trying TCP on common management ports.
+// TCP instead of ICMP so the backend does not need raw-socket privileges. A "refused"
+// answer counts as up (something is there to refuse). A NAS that silently drops all of
+// these ports (firewalled, or only speaks RADIUS) is reported "down" even when healthy,
+// and a down NAS can take up to 7 x 1.5s per check.
 // Returns (up, latency_ms).
 func pingHost(host string) (bool, float64) {
 	// Strip CIDR notation if present

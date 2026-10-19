@@ -3,6 +3,14 @@
 -- Idempotent: safe to re-run (deploy-update.sh applies migrations/*.sql)
 -- ============================================================
 
+-- Money is NUMERIC(12,2) here, though the Go handlers read/write it as float64.
+-- Revenue totals add amounts together without regard to currency.
+-- invoices and payments copy username (and plan name) instead of relying only on the
+-- foreign key, so history survives deleting a user or plan (FKs are ON DELETE SET NULL).
+-- Nothing here enforces access on the network: FreeRADIUS reads radcheck/radreply only.
+-- Only the plan's limits are copied there, and only when a plan is assigned via the API.
+-- Statuses are free text except invoices.status, which has a CHECK.
+
 CREATE TABLE IF NOT EXISTS user_plans (
     id                   SERIAL PRIMARY KEY,
     name                 VARCHAR(100)   UNIQUE NOT NULL,
@@ -44,6 +52,9 @@ CREATE INDEX IF NOT EXISTS invoices_status   ON invoices (status);
 CREATE INDEX IF NOT EXISTS invoices_username ON invoices (username);
 CREATE INDEX IF NOT EXISTS invoices_due_date ON invoices (due_date) WHERE status = 'pending';
 
+-- payments.invoice_id is optional: a payment can exist with no invoice (cash on the spot).
+-- There is no link from a payment back to the promotion used, and no refund/reversal status.
+-- receipt_number is UNIQUE; gateway_ref is not, so repeated gateway callbacks can duplicate.
 CREATE TABLE IF NOT EXISTS payments (
     id             SERIAL PRIMARY KEY,
     invoice_id     INTEGER        REFERENCES invoices(id) ON DELETE SET NULL,
@@ -63,6 +74,8 @@ CREATE INDEX IF NOT EXISTS payments_username   ON payments (username);
 CREATE INDEX IF NOT EXISTS payments_invoice_id ON payments (invoice_id);
 CREATE INDEX IF NOT EXISTS payments_created_at ON payments (created_at);
 
+-- discount_type is free text; the code understands 'percent' and treats anything else as a
+-- fixed amount. max_uses = 0 means unlimited. Not referenced by invoices or payments.
 CREATE TABLE IF NOT EXISTS promotions (
     id             SERIAL PRIMARY KEY,
     code           VARCHAR(50)    UNIQUE NOT NULL,
@@ -78,6 +91,8 @@ CREATE TABLE IF NOT EXISTS promotions (
     created_at     TIMESTAMP      DEFAULT CURRENT_TIMESTAMP
 );
 
+-- task_type must match a case in handlers/scheduler.go runTask; unknown types just log
+-- "unknown task". schedule is one of hourly | daily | weekly (anything else acts as daily).
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
     id          SERIAL PRIMARY KEY,
     name        VARCHAR(100) NOT NULL,

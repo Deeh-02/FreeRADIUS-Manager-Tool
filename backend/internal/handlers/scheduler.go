@@ -97,6 +97,10 @@ func (h *Handler) UpdateTaskSchedule(c *gin.Context) {
 }
 
 // StartScheduler launches the background task runner.
+// It is a simple in-process poller, not cron: every 10 minutes it runs the active tasks
+// whose next_run is empty or past. "daily" therefore means "24h after the last run", not a
+// fixed time of day, and a task can start up to 10 minutes late. With several backend
+// replicas each one would run every task (nothing takes a lock).
 func StartScheduler(db *database.DB, log *logrus.Logger) {
 	go func() {
 		log.Info("Scheduler started — checking tasks every 10 minutes")
@@ -144,6 +148,12 @@ func runDueTasks(db *database.DB, log *logrus.Logger) {
 
 // runTask executes the logic for a given task type.
 // Returns a description and number of affected rows.
+//
+// Important for billing: these tasks only change columns in the app's own tables.
+// FreeRADIUS never reads radius_users.status or account_expiry (its SQL queries read only
+// radcheck/radreply), so "expiring" an account here does not by itself stop that
+// customer from connecting. Enforcement requires a radcheck row such as Auth-Type :=
+// Reject or Expiration, which only the suspend actions and the bulk "set_expiry" write.
 func runTask(db *database.DB, taskType string) (string, int) {
 	switch taskType {
 
@@ -172,7 +182,11 @@ func runTask(db *database.DB, taskType string) (string, int) {
 		return "invoices marked overdue", int(n)
 
 	case "cleanup_sessions":
-		// Close radacct sessions that haven't had an update in >24h (stale)
+		// Close radacct sessions that haven't had an update in >24h (stale).
+		// Sessions with acctupdatetime NULL never match (NULL < x is not true). Because the
+		// accounting_update_query in queries.conf appears to name a non-existent column
+		// (see that file), interim updates may not refresh acctupdatetime, in which case
+		// genuinely connected users would be closed here 24h after they connected.
 		res, err := db.Exec(`
 			UPDATE radacct SET acctstoptime=NOW(),
 			       acctterminatecause='Session-Timeout'
@@ -185,7 +199,8 @@ func runTask(db *database.DB, taskType string) (string, int) {
 		return "stale sessions closed", int(n)
 
 	case "daily_report":
-		// Count key stats for the report
+		// Count key stats for the report. The numbers are only written to last_result;
+		// nothing is emailed or stored as a report.
 		var users, sessions, traffic int
 		db.QueryRow(`SELECT COUNT(*) FROM radius_users WHERE status='active'`).Scan(&users)
 		db.QueryRow(`SELECT COUNT(*) FROM radacct WHERE acctstoptime IS NULL`).Scan(&sessions)
@@ -193,7 +208,12 @@ func runTask(db *database.DB, taskType string) (string, int) {
 		return fmt.Sprintf("daily report: %d active users, %d sessions, %d bytes today", users, sessions, traffic), 1
 
 	case "renew_plans":
-		// Find users with expired plans and valid billing — extend for another period
+		// Find users with expired plans and valid billing — extend for another period.
+		// WARNING: despite the comment above, no billing check exists: every active user
+		// whose expiry is within a day of today is extended a full period for free, and no
+		// invoice is raised. It ships disabled (migrations/009_billing.sql); do not enable
+		// it until it is tied to a paid invoice. Also, expire_accounts flips status to
+		// 'expired' for expiry < today, and this query only touches status 'active'.
 		res, err := db.Exec(`
 			UPDATE radius_users ru SET
 			  account_expiry = CURRENT_DATE + up.validity_days,

@@ -31,6 +31,8 @@
                   <EyeSlashIcon v-else class="w-4 h-4" />
                 </button>
               </div>
+              <!-- This hint describes the ADMIN password policy. For RADIUS (customer) users the API
+                   only requires 6 characters (models.CreateRadiusUserRequest). -->
               <p class="text-xs text-gray-500 mt-1">Min 12 chars, uppercase, lowercase, number, special</p>
             </div>
           </div>

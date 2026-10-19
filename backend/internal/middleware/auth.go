@@ -18,7 +18,9 @@ func RequireAuth(db *database.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		header := c.GetHeader("Authorization")
 
-		// Allow token via query parameter for SSE (EventSource can't set headers)
+		// Allow token via query parameter for SSE (EventSource can't set headers).
+		// NOTE: this is accepted on every protected route, not just SSE, and
+		// logger.GinLogger writes the raw query string, so tokens end up in access logs.
 		if header == "" {
 			if t := c.Query("token"); t != "" {
 				header = "Bearer " + t
@@ -47,6 +49,10 @@ func RequireAuth(db *database.DB) gin.HandlerFunc {
 			return
 		}
 
+		// A valid JWT is not enough: the matching refresh_tokens row must still be
+		// unrevoked and recently active. This is what makes logout and idle timeout
+		// take effect immediately instead of waiting for the access token to expire.
+		// It costs one SELECT and one UPDATE (TouchSession) per request.
 		active, err := auth.ValidateSession(db.DB, claims.UserID, claims.SessionID)
 		if err != nil || !active {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{

@@ -10,6 +10,14 @@ import (
 )
 
 // DashboardStats returns aggregated statistics for the dashboard.
+// One request runs about 30 queries, mostly over radpostauth/radacct; nothing is cached, so
+// a busy install should keep those tables trimmed and indexed (init-db.sql indexes
+// username, start/stop time and NAS IP on radacct, but not radpostauth.reply).
+// radpostauth.reply is matched as both 'Access-Accept' and '2' (the code accepts either
+// spelling of the reply). generate_series() zero-fills hours/days with no activity so
+// charts have no gaps.
+// "bandwidth_*_mbps" divides the open sessions' cumulative octets by 300s, assuming a
+// 5-minute window; it is an estimate, not a measured rate.
 func (h *Handler) DashboardStats(c *gin.Context) {
 	type AuthHourStat struct {
 		Hour     string `json:"hour"`
@@ -768,6 +776,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 }
 
 // UpdateSettings updates one or more system settings.
+// Only existing keys are updated (the UPDATE silently matches nothing for an unknown key),
+// and most keys are informational: the code reads session timeout, rate limit, bcrypt
+// cost, password length, lockout and SMTP from environment variables, not from this
+// table. The only keys read back from system_settings are setup_complete, org_name,
+// org_email, honeypot_enabled and the cs_* thresholds.
 func (h *Handler) UpdateSettings(c *gin.Context) {
 	var updates map[string]string
 	if err := c.ShouldBindJSON(&updates); err != nil {
@@ -783,6 +796,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 }
 
 // CreateBackup triggers a database dump.
+// NOTE: stub. It builds a filename and returns "backup initiated" but runs no pg_dump and
+// writes no file; RestoreBackup and ListBackups are equally inert, and BACKUP_SCHEDULE /
+// BACKUP_RETENTION_DAYS are never read. The only real backup is the pg_dump that
+// deploy-update.sh takes before an update, so schedule your own (see docs/ARCHITECTURE.md).
 func (h *Handler) CreateBackup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message":  "backup initiated",

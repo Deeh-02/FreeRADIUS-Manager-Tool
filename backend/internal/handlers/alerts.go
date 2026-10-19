@@ -148,6 +148,10 @@ func sendEmail(to, subject, body string) error {
 		from = "noreply@radius-manager.local"
 	}
 
+	// Minimal plain-text message built by hand: no Date/Message-ID/MIME headers, and
+	// `to`/`subject` go in unsanitised (a newline in either would inject headers). Many
+	// providers accept this; some spam filters score it down. smtp.SendMail upgrades to
+	// STARTTLS when the server offers it but does not require it.
 	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s", from, to, subject, body)
 
 	addr := host + ":" + port
@@ -176,6 +180,12 @@ func StartAlertWorker(db *database.DB, log *logrus.Logger) {
 	}()
 }
 
+// checkAlerts evaluates each active rule and emails the result to the rule's address (or
+// SMTP_FROM if none). Alerts go to the operator, not to customers.
+// There is no de-duplication: last_triggered is written but never read, so while a
+// condition stays true (a NAS stays down, accounts stay near expiry) the same email is
+// re-sent on every 5-minute pass. The rule `event_type` is free text; only the four cases
+// below do anything, and the whole worker is a no-op when SMTP_HOST is empty.
 func checkAlerts(db *database.DB, log *logrus.Logger) {
 	smtpHost := os.Getenv("SMTP_HOST")
 	if smtpHost == "" {

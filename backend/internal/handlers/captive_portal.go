@@ -188,6 +188,12 @@ func (h *Handler) ServeCaptivePortal(c *gin.Context) {
 	c.String(http.StatusOK, html)
 }
 
+// buildCaptivePortalHTML renders the public login page with Sprintf. Title, subtitle,
+// logo URL, terms, footer and redirect URL are inserted without HTML escaping, so an
+// admin-entered value containing markup or script runs for every visitor of this public
+// page. The form posts to /api/v1/captive/authenticate, which no route handles, and the
+// voucher field would need a matching RADIUS login to exist (see GenerateVouchers).
+// The trailing ReplaceAll turns "%%" back into "%" for the CSS written with doubled percents.
 func buildCaptivePortalHTML(p CaptivePortal) string {
 	subtitle := ""
 	if p.Subtitle != nil {

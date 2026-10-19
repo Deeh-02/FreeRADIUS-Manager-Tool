@@ -49,7 +49,10 @@ generate_secret() {
     openssl rand -hex 32
 }
 
-# Check if .env already exists
+# Check if .env already exists. Generated secrets are written once and never rotated by
+# this script. Note docker-compose.yml ignores WEB_PORT from .env (backend is fixed to 8088),
+# and the database password is baked into the postgres volume on first start, so changing
+# DB_PASSWORD in .env later does not change the password inside an existing database.
 if [ -f ".env" ]; then
     warn ".env file already exists. Skipping password generation."
     warn "If you want to regenerate passwords, delete .env and re-run setup."
@@ -171,6 +174,8 @@ else
 fi
 
 # --- Send test RADIUS packet ---
+# "testuser" does not exist, so an Access-Reject is the expected (and passing) answer: it
+# only proves FreeRADIUS is up and reading its config, not that a real login works.
 echo ""
 info "Sending test RADIUS packet..."
 if $COMPOSE_CMD exec -T freeradius radtest testuser testpassword 127.0.0.1 0 testing123 2>&1 | grep -q "Access-Reject\|Access-Accept"; then

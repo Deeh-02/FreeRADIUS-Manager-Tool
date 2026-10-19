@@ -21,6 +21,15 @@ func (h *Handler) SetupStatus(c *gin.Context) {
 }
 
 // SetupComplete processes the wizard form submission.
+// Whoever reaches this endpoint first on a fresh install becomes super_admin, so complete
+// the wizard before exposing the server. It runs `DELETE FROM app_users` first, i.e. it
+// replaces ALL existing admin accounts; it is guarded only by setup_complete in
+// system_settings. If that row is missing or reset to 'false' on a live system the endpoint
+// reopens (after a restart, since main.go caches "done" in memory) and wipes the admins.
+// The wizard's password rule here is just 8 characters, weaker
+// than the 12 + complexity enforced everywhere else. The values it stores (session timeout,
+// MFA required, lockout...) are informational: the code reads env vars, not these rows, and
+// "default_secret" only saves a 3-character hint; it does not configure FreeRADIUS.
 func (h *Handler) SetupComplete(c *gin.Context) {
 	// Idempotency guard — cannot re-run setup once complete
 	var existing string

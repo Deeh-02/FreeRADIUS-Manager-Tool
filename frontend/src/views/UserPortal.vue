@@ -150,6 +150,10 @@ import { ref, reactive, onMounted } from 'vue'
 import axios from 'axios'
 import { ArrowRightOnRectangleIcon } from '@heroicons/vue/24/outline'
 
+// The customer portal is separate from the admin app: it uses its own opaque token (sent as
+// X-Portal-Token, valid 24h on the server), kept under this localStorage key, and bypasses
+// the axios instance/interceptors in api/index.js. It is read-only: customers can see plan,
+// expiry and usage but cannot pay, renew or change anything from here.
 const SESSION_KEY = 'portal_token'
 const API = '/api/v1/portal'
 

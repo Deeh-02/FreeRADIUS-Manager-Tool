@@ -16,6 +16,11 @@ import (
 )
 
 // StartNetworkScan launches an async nmap scan of a subnet.
+// The scan runs in a goroutine and survives the HTTP request; if the backend restarts
+// mid-scan the row stays 'running' forever and counts toward the limit of 2 concurrent
+// scans below. The subnet is validated as a CIDR before it reaches exec (a value starting
+// with "-" cannot parse), and nmap is run without a shell. The scan originates from the
+// backend host, so an admin can use it to probe any network that host can reach.
 func (h *Handler) StartNetworkScan(c *gin.Context) {
 	if !scanner.NmapAvailable() {
 		respondError(c, http.StatusServiceUnavailable, "nmap is not installed on the server")
@@ -262,6 +267,8 @@ func (h *Handler) NetworkScannerStatus(c *gin.Context) {
 }
 
 // ImportScanHostAsNAS creates a NAS entry from a discovered host.
+// Every imported device is given the global RADIUS_SECRET (or "testing123" if unset), so
+// the secret is shared across devices and must be changed per device to be meaningful.
 func (h *Handler) ImportScanHostAsNAS(c *gin.Context) {
 	hostID, err := mustInt(c, "hostId")
 	if err != nil {

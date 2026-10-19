@@ -120,6 +120,8 @@ watch(() => props.device, (d) => {
   if (d) Object.assign(form.value, { ...form.value, ...d, secret: '' })
 }, { immediate: true })
 
+// Math.random is not a cryptographic generator, so secrets made by this button are
+// weaker than ones from `openssl rand`; use a proper generator for production devices.
 function generateSecret() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*'
   form.value.secret = Array.from({ length: 32 }, () => chars[Math.floor(Math.random() * chars.length)]).join('')

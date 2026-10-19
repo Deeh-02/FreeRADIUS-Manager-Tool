@@ -10,6 +10,9 @@ import (
 )
 
 // Invoice holds a billing record.
+// Money is float64 here and in the handlers (the database column is NUMERIC(12,2)), so
+// sums use binary floating point; fine for display, not for strict accounting.
+// username/plan_name are copied onto the invoice so history survives deleting the user or plan.
 type Invoice struct {
 	ID            int        `json:"id"`
 	InvoiceNumber string     `json:"invoice_number"`
@@ -76,7 +79,9 @@ func (h *Handler) ListInvoices(c *gin.Context) {
 		invoices = append(invoices, inv)
 	}
 
-	// Revenue summary
+	// Revenue summary. Counts every invoice (ignores the filters above) and adds amounts
+	// across currencies without conversion. "Paid" is invoice status, not payment records,
+	// so this figure can differ from /payments/summary.
 	type Summary struct {
 		TotalRevenue float64 `json:"total_revenue"`
 		Pending      int     `json:"pending"`
@@ -129,6 +134,8 @@ func (h *Handler) CreateInvoice(c *gin.Context) {
 		}
 	}
 
+	// Number = month + last 6 digits of the clock's nanoseconds. It is not a sequence and
+	// can collide (UNIQUE then rejects it and the caller sees a 500).
 	invoiceNum := fmt.Sprintf("INV-%s-%06d", time.Now().Format("200601"), time.Now().UnixNano()%1000000)
 
 	var dueDate interface{}
@@ -151,6 +158,11 @@ func (h *Handler) CreateInvoice(c *gin.Context) {
 }
 
 // UpdateInvoice updates invoice status / payment.
+// Empty/zero fields mean "leave unchanged" (COALESCE/NULLIF below), so a field cannot be
+// cleared through this endpoint. Setting status=paid here only stamps paid_at: it does
+// not create a payment row, extend the user's expiry or re-activate them. Any status
+// string is accepted by the handler (only the table CHECK rejects unknown ones, and the
+// resulting error is ignored, so the response still says "invoice updated").
 func (h *Handler) UpdateInvoice(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {

@@ -25,6 +25,10 @@ try {
 }
 
 # Generate passwords
+# NOTE: Get-Random is not a cryptographic random generator (setup.sh uses `openssl rand`),
+# so the DB password, JWT secret and RADIUS secret generated here are weaker than on Linux.
+# For production, replace them with values from a proper generator. This script also calls the
+# old `docker-compose` binary, so it needs Compose v1 (or an alias for `docker compose`).
 function New-RandomPassword {
     param([int]$Length = 40)
     $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'

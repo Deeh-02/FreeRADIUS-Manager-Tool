@@ -2,6 +2,21 @@
 -- FreeRADIUS Manager - Database Initialization Script
 -- PostgreSQL 15+
 -- ============================================================
+--
+-- READ THIS FIRST
+--  * Not re-runnable: the CREATE TRIGGER statements have no IF NOT EXISTS, so a second run
+--    errors (and stops, under ON_ERROR_STOP). Docker runs it once, on an empty data volume (docker-compose.yml);
+--    run-local.sh only runs it when app_users does not exist.
+--  * Incomplete for the application: the Go handlers also use these tables, which no SQL file
+--    in this repo creates: alert_rules, api_keys, bulk_operations, captive_portals,
+--    cred_stuffing_blocks, customers, geoip_cache, geoip_rules, honeypot_logs, hotspot_zones,
+--    ip_pool_assignments, ip_pools, organizations, portal_sessions, radius_templates,
+--    security_alerts, sms_logs, tickets, webhook_logs, webhooks.
+--    They also use columns missing here: nas.ping_status / ping_latency_ms / last_ping /
+--    zone_id / org_id, radius_users.org_id and app_users.org_id. Those features need
+--    their schema added before they can work on a fresh database.
+--  * Billing tables (user_plans, invoices, payments, promotions, scheduled_tasks) live in
+--    migrations/009_billing.sql, applied after this file.
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -47,6 +62,9 @@ CREATE TABLE IF NOT EXISTS radius_users (
     updated_at            TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
 );
 
+-- radius_users.password is a bcrypt hash used by the self-service portal and password
+-- history only. status / account_expiry / password_expiry / force_password_change are
+-- application state: FreeRADIUS does not read them (see the FreeRADIUS section below).
 -- Password history to prevent reuse
 CREATE TABLE IF NOT EXISTS radius_user_password_history (
     id           SERIAL PRIMARY KEY,
@@ -58,6 +76,12 @@ CREATE TABLE IF NOT EXISTS radius_user_password_history (
 -- ============================================================
 -- FREERADIUS CORE TABLES (must match FreeRADIUS schema)
 -- ============================================================
+-- FreeRADIUS reads ONLY these tables (plus nas and radacct/radpostauth) when it
+-- authenticates someone: see freeradius/mods-config/sql/main/postgresql/queries.conf.
+-- radius_users / user_plans / invoices are application tables that FreeRADIUS never sees; the
+-- app copies what matters into radcheck/radreply (password, Simultaneous-Use, Auth-Type
+-- Reject, rate limits). Anything not copied there is not enforced on the network.
+-- radcheck.value holds Cleartext-Password in plain text because PAP/CHAP/MS-CHAP need it.
 CREATE TABLE IF NOT EXISTS radcheck (
     id        SERIAL PRIMARY KEY,
     username  VARCHAR(64) NOT NULL DEFAULT '',
@@ -74,6 +98,10 @@ CREATE TABLE IF NOT EXISTS radreply (
     op        CHAR(2)     NOT NULL DEFAULT '=',
     value     VARCHAR(253) NOT NULL DEFAULT ''
 );
+-- NOTE: unlike radcheck above, this index is NOT unique (matches the stock FreeRADIUS
+-- schema, which allows several reply rows per attribute). Application code that does
+-- INSERT INTO radreply ... ON CONFLICT (username, attribute) therefore has no constraint to
+-- match and errors (see AssignIP, ApplyTemplate, bulk apply_template).
 CREATE INDEX IF NOT EXISTS radreply_username ON radreply (username, attribute);
 
 CREATE TABLE IF NOT EXISTS radgroupcheck (
@@ -252,7 +280,10 @@ CREATE TRIGGER update_nas_updated_at
 
 -- No default admin user — credentials are created via the Setup Wizard on first launch.
 
--- Default system settings
+-- Default system settings. Most keys are informational only: the backend reads session
+-- timeout, rate limit, lockout, password length, SMTP and backup settings from environment
+-- variables, not from this table (backup_* is not used at all). Read back from here:
+-- setup_complete, org_name, org_email, honeypot_enabled and the cs_* thresholds.
 INSERT INTO system_settings (key, value, description) VALUES
     ('setup_complete',      'false',     'Whether the initial setup wizard has been completed'),
     ('org_name',            'My Organisation', 'Organisation display name'),
@@ -273,7 +304,9 @@ INSERT INTO system_settings (key, value, description) VALUES
     ('brute_force_lockout', '15',        'Lockout duration in minutes')
 ON CONFLICT (key) DO NOTHING;
 
--- Default NAS entry (localhost — for local/testing connections)
+-- Default NAS entry (localhost — for local/testing connections).
+-- The secret is a well-known test value; change it (or delete this row) in production.
+-- FreeRADIUS loads NAS clients from this table only at startup.
 INSERT INTO nas (nasname, shortname, type, secret, description)
 VALUES ('127.0.0.1', 'localhost', 'other', 'testing123', 'Local test NAS client (update secret to match RADIUS_SECRET)')
 ON CONFLICT (nasname) DO NOTHING;
@@ -340,6 +373,8 @@ CREATE TRIGGER update_vouchers_updated_at
 -- ============================================================
 -- NETWORK SCANNER (nmap discovery)
 -- ============================================================
+-- Duplicated verbatim in migrations/008_network_scanner.sql for installs that predate it;
+-- both use IF NOT EXISTS, so applying either (or both) is harmless.
 CREATE TABLE IF NOT EXISTS network_scans (
     id            SERIAL PRIMARY KEY,
     subnet        VARCHAR(64)  NOT NULL,

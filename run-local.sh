@@ -15,6 +15,9 @@ for tool in psql go node npm openssl; do
   command -v "$tool" >/dev/null 2>&1 || fail "'$tool' is not installed or not on PATH"
 done
 
+# Local mode differs from Docker: API on :8080 (Docker: 8088), UI served by Vite on :3000
+# (Docker: nginx on 8081), no FreeRADIUS and no nmap unless installed on the host. Pages
+# that need tables missing from init-db.sql (see its header) will error here too.
 ENV_FILE=".env.local"
 if [ ! -f "$ENV_FILE" ]; then
   info "Creating $ENV_FILE with generated secrets"
@@ -52,6 +55,8 @@ if ! app_psql -tAc "select to_regclass('public.app_users')" | grep -q app_users;
   info "Creating base schema"
   app_psql -f init-db.sql
 fi
+# Migrations are idempotent, so they are re-applied on every run; NOTICE lines are hidden
+# and `|| true` means a failing migration is not reported unless you read the output.
 for f in migrations/*.sql; do
   info "Applying $f"
   app_psql -f "$f" 2>&1 | grep -v NOTICE || true

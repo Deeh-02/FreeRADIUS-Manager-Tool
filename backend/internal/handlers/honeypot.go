@@ -23,6 +23,11 @@ var honeypotRunning bool
 var honeypotMu sync.Mutex
 
 // StartHoneypot starts a fake RADIUS listener on port 11812 that logs all packets.
+// It is a decoy for scanners, not part of real authentication. docker-compose.yml does not
+// publish UDP 11812, so it only sees traffic from inside the Docker network unless the
+// port is published. Every packet costs a DB insert and count (no rate limit), and the
+// alert `details` JSON is built with Sprintf from attacker-controlled User-Name without
+// escaping, so a username containing a quote makes that insert fail instead of raising the alert.
 func StartHoneypot(db *database.DB, log *logrus.Logger) {
 	honeypotMu.Lock()
 	if honeypotRunning {

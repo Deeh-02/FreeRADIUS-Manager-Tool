@@ -173,6 +173,9 @@ async function load() {
 
 async function loadCurrentStats() {
   try {
+    // NOTE: the app stores the login token under 'access_token' (see store/auth.js), not 'token',
+    // so this lookup finds nothing, no Authorization header is sent, and the request gets a
+    // 401 that the catch below hides: the live-stats panel on this page stays empty.
     const token = localStorage.getItem('token') || sessionStorage.getItem('token') || ''
     const { data } = await axios.get('/api/v1/live/stats/current', {
       headers: token ? { Authorization: 'Bearer ' + token } : {}

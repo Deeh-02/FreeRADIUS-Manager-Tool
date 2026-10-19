@@ -10,7 +10,9 @@ COPY go.mod ./
 RUN go mod download || true
 
 COPY . .
-# go mod tidy resolves and pins all deps, then we build
+# go mod tidy resolves and pins all deps, then we build. Note `tidy` may rewrite go.mod/go.sum
+# inside the image, so the image can end up with dependency versions that differ from the
+# committed files; the build also needs network access to the Go module proxy.
 RUN go mod tidy && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-w -s" -o radius-manager ./main.go
@@ -24,7 +26,9 @@ WORKDIR /app
 
 COPY --from=builder /app/radius-manager .
 
-# nmap needs raw socket access for some scan types
+# nmap needs raw socket access for some scan types. The API therefore runs as root inside
+# the container (plus NET_RAW from docker-compose.yml); consider a non-root user and only
+# the needed capability if the network scanner is not used.
 USER root
 
 EXPOSE 8088

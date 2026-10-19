@@ -35,6 +35,13 @@ type BandwidthProfileRequest struct {
 	IsActive          *bool  `json:"is_active"`
 }
 
+// kbpsToMikrotik builds a Mikrotik-Rate-Limit value ("rx/tx" from the router's point of
+// view, so upload/download as the customer sees them). Only the base rates are used:
+// burst_upload_kbps / burst_download_kbps are stored but never put into the rate string
+// unless an admin types a full mikrotik_rate_limit by hand. Other vendors need their own
+// attributes; the WISPr bandwidth attributes written alongside are in bits per second.
+// Rate-limit writes below are delete-then-insert (no ON CONFLICT), which is why they work
+// even though radreply has no unique index.
 func kbpsToMikrotik(upload, download int) string {
 	unit := func(kbps int) string {
 		if kbps >= 1000 && kbps%1000 == 0 {

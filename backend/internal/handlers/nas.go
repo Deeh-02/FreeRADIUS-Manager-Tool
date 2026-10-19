@@ -49,6 +49,10 @@ func (h *Handler) ListNAS(c *gin.Context) {
 }
 
 // GetNAS returns a single NAS client by ID.
+// Unlike ListNAS (which masks it as "***"), this returns the shared secret in clear, and
+// the route is open to the operator role, so operators can read every NAS secret.
+// FreeRADIUS reads NAS clients from the nas table at startup (read_clients = yes), so a
+// new or changed NAS only takes effect after FreeRADIUS is restarted/reloaded.
 func (h *Handler) GetNAS(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -170,6 +174,10 @@ func (h *Handler) DeleteNAS(c *gin.Context) {
 
 // TestNAS sends a test RADIUS Access-Request to the FreeRADIUS server using
 // the stored NAS credentials, verifying the server can handle that NAS client.
+// The probe always claims NAS-IP-Address 127.0.0.1 and is sent from the backend's own
+// address, so FreeRADIUS matches it against clients.conf by source IP, not against this
+// NAS row; "secret accepted" therefore really means "the server answered". Any reply,
+// even Access-Reject, counts as success.
 func (h *Handler) TestNAS(c *gin.Context) {
 	id, err := mustInt(c, "id")
 	if err != nil {
@@ -296,6 +304,10 @@ func (h *Handler) TestRADIUS(c *gin.Context) {
 }
 
 // DiscoverNAS scans a subnet for RADIUS-capable devices.
+// Probes at most 254 addresses one at a time with a 2s timeout each, inside a single
+// HTTP request. A mostly-empty /24 can take minutes, longer than the server's 30s
+// WriteTimeout, so the response may never reach the browser; the nmap-based network
+// scanner (network_scan.go) is the supported way to discover devices.
 func (h *Handler) DiscoverNAS(c *gin.Context) {
 	var req models.DiscoverRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -344,6 +356,9 @@ func (h *Handler) DiscoverNAS(c *gin.Context) {
 // ─── RADIUS packet helpers (pure Go, no external library) ────────────────────
 
 // buildAccessRequest constructs a minimal RADIUS Access-Request packet.
+// Hand-rolled to avoid a RADIUS library dependency. It carries no Message-Authenticator;
+// that is why freeradius/clients.conf sets require_message_authenticator = no — a stricter
+// setting would make the server drop these probes.
 func buildAccessRequest(username, password, secret string) []byte {
 	// Random authenticator (16 bytes)
 	authenticator := make([]byte, 16)

@@ -49,6 +49,9 @@ func GenerateAccessToken(userID int, username, role, sessionID string) (string, 
 }
 
 // GenerateRefreshToken creates an opaque refresh token and its hash for storage.
+// Only the SHA-256 hash is stored (refresh_tokens.token_hash), so a database leak does
+// not hand out usable refresh tokens. A fast hash is fine here: the token is 256 bits
+// of randomness, unlike a human password.
 func GenerateRefreshToken() (token string, hash string, err error) {
 	b := make([]byte, 32)
 	if _, err = rand.Read(b); err != nil {
@@ -105,6 +108,9 @@ func RefreshExpiry() time.Duration {
 	return d
 }
 
+// getJWTSecret falls back to a hard-coded string when JWT_SECRET is unset. Anyone who
+// knows that string can forge admin tokens, so production must always set JWT_SECRET
+// (docker-compose also supplies a well-known default if .env omits it).
 func getJWTSecret() string {
 	s := os.Getenv("JWT_SECRET")
 	if s == "" {

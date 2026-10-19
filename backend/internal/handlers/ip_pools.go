@@ -190,6 +190,11 @@ func (h *Handler) ListPoolIPs(c *gin.Context) {
 }
 
 // AssignIP assigns a specific IP to a user (or auto-picks a free one).
+// NOTE: the radreply write below uses ON CONFLICT (username,attribute), but init-db.sql
+// creates radreply_username as a plain (non-unique) index, so Postgres has no matching
+// constraint and the INSERT is expected to error. The error is ignored, so the API
+// reports success and the pool table is updated while FreeRADIUS never receives a
+// Framed-IP-Address. (Read from the schema; not run against a database.)
 func (h *Handler) AssignIP(c *gin.Context) {
 	var req struct {
 		Username  string  `json:"username" binding:"required"`
@@ -274,7 +279,8 @@ func enumerateIPs(ipNet *net.IPNet) []string {
 	if end < start {
 		return ips
 	}
-	// Cap at 1022 IPs to avoid huge pools
+	// Cap at 1022 IPs to avoid huge pools. Larger networks are silently truncated:
+	// only the first 1022 usable addresses become assignable.
 	if end-start > 1022 {
 		end = start + 1022
 	}

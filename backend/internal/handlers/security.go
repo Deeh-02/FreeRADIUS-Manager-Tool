@@ -57,7 +57,10 @@ func lookupIP(h *Handler, ip string) (*GeoIPInfo, error) {
 		return &info, nil
 	}
 
-	// Call ip-api.com (free, no key required)
+	// Call ip-api.com (free, no key required). Plain HTTP (the free tier has no HTTPS),
+	// so lookups are unencrypted, and ip-api's free plan is limited to non-commercial use
+	// and ~45 requests/minute: a paid key or another provider is needed for a business.
+	// The ip is also placed in the URL unescaped.
 	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(
 		fmt.Sprintf("http://ip-api.com/json/%s?fields=countryCode,country,city,isp,proxy", ip))
 	if err != nil {
@@ -178,6 +181,10 @@ func StartCredStuffingDetector(db *database.DB, log *logrus.Logger) {
 
 // CheckCredStuffing is called on every failed auth to update the sliding window.
 // Returns true if the IP should be blocked.
+// NOTE: nothing calls this function (grep for callers finds none), and FreeRADIUS does not
+// consult cred_stuffing_blocks, so these blocks and the "critical" alerts it would raise
+// currently never happen. Only manual BlockIP entries and the 5-minute radpostauth
+// pattern scan (credStuffingAnalysisWorker) produce data, and neither blocks traffic.
 func CheckCredStuffing(h *Handler, ip, username string) bool {
 	if ip == "" || ip == "127.0.0.1" || ip == "::1" {
 		return false
