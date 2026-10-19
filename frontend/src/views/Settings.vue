@@ -3,12 +3,12 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">Settings</h1>
-        <p class="text-sm text-gray-500 mt-0.5">System configuration and security settings</p>
+        <p class="text-sm text-gray-500 mt-0.5">Business rules, security and backups. Changes apply immediately.</p>
       </div>
-      <button @click="saveSettings" class="btn-primary" :disabled="saving">
+      <button @click="saveSettings" class="btn-primary" :disabled="saving || !dirtyKeys.length">
         <span v-if="saving" class="w-4 h-4 border-2 border-white/30 border-t-white rounded-full spinner"></span>
         <CheckIcon v-else class="w-4 h-4" />
-        Save Changes
+        Save Changes<span v-if="dirtyKeys.length"> ({{ dirtyKeys.length }})</span>
       </button>
     </div>
 
@@ -17,116 +17,87 @@
     </div>
 
     <div v-else class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-      <!-- Password Policy -->
-      <div class="card space-y-4">
+      <div v-for="section in sections" :key="section.title" class="card space-y-4" :class="section.wide ? 'lg:col-span-2' : ''">
         <h3 class="font-semibold text-gray-900 flex items-center gap-2">
-          <LockClosedIcon class="w-5 h-5 text-blue-600" />
-          Password Policy
+          <component :is="section.icon" class="w-5 h-5 text-blue-600" />
+          {{ section.title }}
         </h3>
-        <div>
-          <label class="form-label">Minimum Password Length</label>
-          <input v-model="settings.password_min_length" type="number" min="8" max="32" class="form-input" />
-        </div>
-        <div>
-          <label class="form-label">Password Expiry (days)</label>
-          <select v-model="settings.password_expiry_days" class="form-select">
-            <option value="30">30 days</option>
-            <option value="60">60 days</option>
-            <option value="90">90 days</option>
-            <option value="180">180 days</option>
-            <option value="365">365 days (1 year)</option>
-            <option value="0">Never</option>
-          </select>
-        </div>
-        <div>
-          <label class="form-label">Max Device Limit Per User</label>
-          <input v-model="settings.max_device_limit" type="number" min="1" max="50" class="form-input" />
+        <p v-if="section.note" class="text-xs text-gray-500 -mt-2">{{ section.note }}</p>
+        <div :class="section.wide ? 'grid grid-cols-1 md:grid-cols-2 gap-4' : 'space-y-4'">
+          <template v-for="f in section.fields" :key="f.key">
+            <div v-if="values[f.key] !== undefined" :class="f.type === 'textarea' ? 'md:col-span-2' : ''">
+              <label v-if="f.type === 'bool'" class="flex items-start gap-2 text-sm text-gray-700">
+                <input type="checkbox" class="rounded mt-0.5" :checked="values[f.key] === 'true'"
+                       @change="values[f.key] = $event.target.checked ? 'true' : 'false'" />
+                <span>{{ f.label }}<span v-if="f.help" class="block text-xs text-gray-500">{{ f.help }}</span></span>
+              </label>
+              <template v-else>
+                <label class="form-label">{{ f.label }}</label>
+                <textarea v-if="f.type === 'textarea'" v-model="values[f.key]" rows="2" class="form-input"></textarea>
+                <input v-else v-model="values[f.key]" :type="f.type || 'text'" :min="f.min" :max="f.max"
+                       :maxlength="f.maxlength" class="form-input" :class="f.upper ? 'uppercase' : ''" />
+                <p v-if="f.help" class="text-xs text-gray-500 mt-1">{{ f.help }}</p>
+              </template>
+            </div>
+          </template>
         </div>
       </div>
 
-      <!-- Security -->
-      <div class="card space-y-4">
-        <h3 class="font-semibold text-gray-900 flex items-center gap-2">
-          <ShieldCheckIcon class="w-5 h-5 text-blue-600" />
-          Security
-        </h3>
-        <div>
-          <label class="form-label">Session Timeout (seconds)</label>
-          <input v-model="settings.session_timeout" type="number" min="300" class="form-input" />
-        </div>
-        <div>
-          <label class="form-label">Rate Limit (requests/minute)</label>
-          <input v-model="settings.rate_limit_per_min" type="number" min="10" class="form-input" />
-        </div>
-        <div>
-          <label class="form-label">Max Failed Login Attempts</label>
-          <input v-model="settings.brute_force_attempts" type="number" min="3" max="20" class="form-input" />
-        </div>
-        <div>
-          <label class="form-label">Lockout Duration (minutes)</label>
-          <input v-model="settings.brute_force_lockout" type="number" min="1" class="form-input" />
-        </div>
-        <div class="flex items-center gap-2">
-          <input
-            v-model="mfaRequired"
-            type="checkbox"
-            id="mfa-required"
-            class="rounded"
-          />
-          <label for="mfa-required" class="text-sm text-gray-700">Require MFA for all admin users</label>
-        </div>
-      </div>
-
-      <!-- Email / SMTP -->
+      <!-- Email -->
       <div class="card space-y-4">
         <h3 class="font-semibold text-gray-900 flex items-center gap-2">
           <EnvelopeIcon class="w-5 h-5 text-blue-600" />
           Email (SMTP)
         </h3>
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="form-label">SMTP Host</label>
-            <input v-model="settings.smtp_host" type="text" class="form-input" placeholder="smtp.gmail.com" />
-          </div>
-          <div>
-            <label class="form-label">SMTP Port</label>
-            <input v-model="settings.smtp_port" type="number" class="form-input" placeholder="587" />
-          </div>
+        <p class="text-sm text-gray-600">
+          The mail server is set in <code class="bg-gray-100 px-1 rounded">.env</code>
+          (SMTP_HOST, SMTP_PORT 587, SMTP_USER, SMTP_PASS, SMTP_FROM). It sends alerts, the daily report and expiry reminders.
+        </p>
+        <div class="flex gap-2">
+          <input v-model.trim="testEmailTo" type="email" class="form-input" placeholder="you@example.com" />
+          <button @click="testEmail" class="btn-secondary whitespace-nowrap" :disabled="!testEmailTo || sendingEmail">
+            <PaperAirplaneIcon class="w-4 h-4" />
+            Send test
+          </button>
         </div>
-        <div>
-          <label class="form-label">SMTP Username</label>
-          <input v-model="settings.smtp_user" type="text" class="form-input" placeholder="user@example.com" />
-        </div>
-        <div>
-          <label class="form-label">From Address</label>
-          <input v-model="settings.smtp_from" type="email" class="form-input" />
-        </div>
-        <button @click="testEmail" class="btn-secondary w-full justify-center">
-          <PaperAirplaneIcon class="w-4 h-4" />
-          Send Test Email
-        </button>
       </div>
 
-      <!-- Backup -->
+      <!-- Backups -->
       <div class="card space-y-4">
         <h3 class="font-semibold text-gray-900 flex items-center gap-2">
           <ArchiveBoxIcon class="w-5 h-5 text-blue-600" />
-          Backup
+          Backups
         </h3>
-        <div>
-          <label class="form-label">Backup Schedule (Cron)</label>
-          <input v-model="settings.backup_schedule" type="text" class="form-input" placeholder="0 2 * * *" />
-          <p class="text-xs text-gray-500 mt-1">Current: {{ crondesc }}</p>
-        </div>
-        <div>
-          <label class="form-label">Retention (days)</label>
-          <input v-model="settings.backup_retention" type="number" min="1" class="form-input" />
-        </div>
+        <p class="text-xs text-gray-500 -mt-2">
+          The "Database Backup" scheduled task writes a dump every day to the server's backups folder and deletes ones older
+          than the retention above. Download copies regularly: a backup on the same disk does not survive losing that disk.
+        </p>
         <div class="flex gap-2">
-          <button @click="createBackup" class="btn-secondary flex-1 justify-center">
-            <ArrowDownTrayIcon class="w-4 h-4" />
-            Backup Now
+          <button @click="createBackup" class="btn-secondary" :disabled="backups.running">
+            <span v-if="backups.running" class="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full spinner"></span>
+            <ArchiveBoxIcon v-else class="w-4 h-4" />
+            {{ backups.running ? 'Backup running…' : 'Back up now' }}
           </button>
+          <button @click="loadBackups" class="btn-secondary"><ArrowPathIcon class="w-4 h-4" /></button>
+          <button @click="showRestore" class="btn-secondary">How to restore</button>
+        </div>
+        <p v-if="backups.last_error" class="text-xs text-red-600">Last backup failed: {{ backups.last_error }}</p>
+        <div class="max-h-56 overflow-y-auto divide-y divide-gray-100 border border-gray-100 rounded-lg">
+          <p v-if="!backups.backups?.length" class="text-sm text-gray-400 p-3">No backups yet.</p>
+          <div v-for="b in backups.backups" :key="b.name" class="flex items-center justify-between px-3 py-2 text-sm">
+            <div>
+              <p class="font-mono text-xs">{{ b.name }}</p>
+              <p class="text-xs text-gray-400">{{ new Date(b.created_at).toLocaleString() }} · {{ size(b.size_bytes) }}</p>
+            </div>
+            <div class="flex gap-1">
+              <button @click="download(b)" class="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600" title="Download">
+                <ArrowDownTrayIcon class="w-4 h-4" />
+              </button>
+              <button @click="removeBackup(b)" class="p-1.5 rounded hover:bg-red-50 text-gray-400 hover:text-red-600" title="Delete">
+                <TrashIcon class="w-4 h-4" />
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -136,8 +107,8 @@
           <SignalIcon class="w-5 h-5 text-blue-600" />
           RADIUS Test
         </h3>
-        <p class="text-sm text-gray-600">Test authentication against the RADIUS server with a specific username/password.</p>
-        <div class="grid grid-cols-3 gap-3">
+        <p class="text-sm text-gray-600">Sends a real login request to FreeRADIUS, as a router would.</p>
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div>
             <label class="form-label">Username</label>
             <input v-model="radiusTest.username" type="text" class="form-input" />
@@ -168,12 +139,13 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useToast } from 'vue-toastification'
-import { settingsAPI, radiusAPI } from '@/api'
+import { settingsAPI, radiusAPI, alertsAPI, saveBlob } from '@/api'
+import { apiError } from '@/utils/money'
 import {
-  CheckIcon, LockClosedIcon, ShieldCheckIcon, EnvelopeIcon,
-  ArchiveBoxIcon, SignalIcon, ArrowDownTrayIcon, PaperAirplaneIcon,
+  CheckIcon, LockClosedIcon, ShieldCheckIcon, EnvelopeIcon, BanknotesIcon, UsersIcon, BellAlertIcon,
+  ArchiveBoxIcon, SignalIcon, ArrowDownTrayIcon, PaperAirplaneIcon, TrashIcon, ArrowPathIcon,
 } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -181,79 +153,148 @@ const loading = ref(false)
 const saving = ref(false)
 const testingRadius = ref(false)
 const radiusTestResult = ref(null)
-const settingsRaw = ref({})
-
 const radiusTest = ref({ username: '', password: '', nasname: '' })
+const testEmailTo = ref('')
+const sendingEmail = ref(false)
+const backups = ref({ backups: [] })
+let backupPoll = null
 
-const settings = ref({
-  password_min_length: '12',
-  password_expiry_days: '90',
-  session_timeout: '3600',
-  mfa_required: 'false',
-  max_device_limit: '20',
-  rate_limit_per_min: '100',
-  brute_force_attempts: '5',
-  brute_force_lockout: '15',
-  smtp_host: '',
-  smtp_port: '587',
-  smtp_user: '',
-  smtp_from: '',
-  backup_schedule: '0 2 * * *',
-  backup_retention: '30',
-})
+// Only keys the backend reads. A field is shown when the key exists in system_settings.
+const sections = [
+  {
+    title: 'Business & Billing', icon: BanknotesIcon, wide: true,
+    note: 'Prepaid: a customer on a paid plan is online while their paid-until date has not passed. Paying an invoice adds the plan\'s days.',
+    fields: [
+      { key: 'org_name', label: 'Business name', help: 'Shown on receipts and the customer portal.' },
+      { key: 'org_email', label: 'Business email', type: 'email', help: 'Shown on receipts.' },
+      { key: 'default_currency', label: 'Default currency', maxlength: 3, upper: true, help: 'ISO code, e.g. KES. Used when a plan or invoice does not name one.' },
+      { key: 'invoice_due_days', label: 'Invoice due after (days)', type: 'number', min: 0, max: 365 },
+      { key: 'renewal_invoice_days', label: 'Raise renewal invoice (days before paid-until)', type: 'number', min: 0, max: 60, help: 'The "Raise Renewal Invoices" task bills customers this many days before they run out.' },
+      { key: 'billing_grace_days', label: 'Grace days after paid-until', type: 'number', min: 0, max: 60, help: 'Customers stay online this many days after their paid-until date.' },
+      { key: 'suspend_overdue', label: 'Block customers with overdue postpaid invoices', type: 'bool', help: 'For invoices whose period was started before payment ("start now").' },
+      { key: 'report_email', label: 'Daily report email', type: 'email', help: 'Empty = not emailed.' },
+      { key: 'reminder_days', label: 'Expiry reminder (days before)', type: 'number', min: 0, max: 60, help: '0 = no reminders. Sent by SMS (phone) or email.' },
+      { key: 'reminder_message', label: 'Reminder text', type: 'textarea', help: 'Placeholders: {username} {expiry} {amount}' },
+    ],
+  },
+  {
+    title: 'Staff Security', icon: ShieldCheckIcon,
+    fields: [
+      { key: 'password_min_length', label: 'Minimum staff password length', type: 'number', min: 8, max: 128 },
+      { key: 'session_timeout', label: 'Idle sign-out (seconds)', type: 'number', min: 300, max: 604800 },
+      { key: 'brute_force_attempts', label: 'Failed logins before lockout', type: 'number', min: 1, max: 100 },
+      { key: 'brute_force_lockout', label: 'Lockout duration (minutes)', type: 'number', min: 1, max: 1440 },
+      { key: 'mfa_required', label: 'Require two-factor authentication for all staff', type: 'bool', help: 'Staff without it can only use their Profile page until they set it up. Set up your own first.' },
+    ],
+  },
+  {
+    title: 'Customer Accounts', icon: UsersIcon,
+    fields: [
+      { key: 'max_device_limit', label: 'Highest device limit allowed per customer', type: 'number', min: 1, max: 500 },
+      { key: 'password_expiry_days', label: 'Customer password expiry stamp (days)', type: 'number', min: 1, max: 3650, help: 'Recorded on new accounts; not enforced at login.' },
+      { key: 'portal_max_attempts', label: 'Customer portal: failed logins before lockout', type: 'number', min: 1, max: 100 },
+      { key: 'portal_lockout_minutes', label: 'Customer portal: lockout (minutes)', type: 'number', min: 1, max: 1440 },
+    ],
+  },
+  {
+    title: 'Attack Detection', icon: BellAlertIcon,
+    note: 'Credential stuffing: many failed logins from one IP in a short window blocks that IP from the staff and customer logins.',
+    fields: [
+      { key: 'cs_max_fails', label: 'Failed logins that trigger a block', type: 'number', min: 1, max: 10000 },
+      { key: 'cs_window_secs', label: 'Within (seconds)', type: 'number', min: 10, max: 86400 },
+      { key: 'cs_block_mins', label: 'Block for (minutes)', type: 'number', min: 1, max: 100000 },
+    ],
+  },
+  {
+    title: 'Backup Retention', icon: LockClosedIcon,
+    fields: [
+      { key: 'backup_retention_days', label: 'Keep daily backups for (days)', type: 'number', min: 0, max: 3650, help: '0 = keep forever.' },
+    ],
+  },
+]
 
-const mfaRequired = computed({
-  get: () => settings.value.mfa_required === 'true',
-  set: (v) => { settings.value.mfa_required = v ? 'true' : 'false' },
-})
-
-const crondesc = computed(() => {
-  const c = settings.value.backup_schedule
-  if (c === '0 2 * * *') return 'Daily at 2:00 AM'
-  if (c === '0 * * * *') return 'Hourly'
-  return 'Custom schedule'
-})
+const values = ref({})
+const original = ref({})
+const dirtyKeys = computed(() => Object.keys(values.value).filter((k) => values.value[k] !== original.value[k]))
 
 async function loadSettings() {
   loading.value = true
   try {
     const { data } = await settingsAPI.get()
-    Object.entries(data).forEach(([k, v]) => {
-      if (settings.value[k] !== undefined) {
-        settings.value[k] = v.value
-      }
-    })
-  } catch { toast.error('Failed to load settings') }
+    const known = new Set(sections.flatMap((s) => s.fields.map((f) => f.key)))
+    const v = {}
+    Object.entries(data).forEach(([k, entry]) => { if (known.has(k)) v[k] = entry.value })
+    values.value = { ...v }
+    original.value = { ...v }
+  } catch (err) { toast.error(apiError(err, 'Failed to load settings')) }
   finally { loading.value = false }
 }
 
-// Saves every field to the system_settings table. Most of these keys are informational: the
-// backend reads session timeout, rate limit, lockout, password rules and SMTP from environment
-// variables, so changing them here does not change behaviour (see handlers/dashboard.go
-// UpdateSettings). The same goes for the "require MFA" box, which nothing enforces.
 async function saveSettings() {
   saving.value = true
   try {
     const updates = {}
-    Object.entries(settings.value).forEach(([k, v]) => { updates[k] = String(v) })
+    dirtyKeys.value.forEach((k) => { updates[k] = String(values.value[k]).trim() })
+    if (updates.default_currency) updates.default_currency = updates.default_currency.toUpperCase()
     await settingsAPI.update(updates)
-    toast.success('Settings saved successfully')
-  } catch { toast.error('Failed to save settings') }
+    original.value = { ...values.value, ...updates }
+    values.value = { ...original.value }
+    toast.success('Settings saved')
+  } catch (err) { toast.error(apiError(err, 'Failed to save settings')) }
   finally { saving.value = false }
 }
 
-// The endpoint is a stub: the toast says "backup initiated" but no backup file is created.
+async function loadBackups() {
+  try {
+    backups.value = (await settingsAPI.getBackups()).data
+  } catch (err) { toast.error(apiError(err, 'Failed to list backups')) }
+  clearTimeout(backupPoll)
+  if (backups.value.running) backupPoll = setTimeout(loadBackups, 3000)
+}
+
 async function createBackup() {
   try {
     const { data } = await settingsAPI.createBackup()
-    toast.success(data.message)
-  } catch { toast.error('Backup failed') }
+    toast.info(data.message)
+    backups.value.running = true
+    setTimeout(loadBackups, 1500)
+  } catch (err) { toast.error(apiError(err, 'Backup failed')) }
 }
 
-// Does not send anything or call the API (the backend has POST /alerts/test-email); it only
-// shows this message.
+async function download(b) {
+  try {
+    const { data } = await settingsAPI.downloadBackup(b.name)
+    saveBlob(data, b.name)
+  } catch (err) { toast.error(apiError(err, 'Download failed')) }
+}
+
+async function removeBackup(b) {
+  if (!confirm(`Delete ${b.name}? Make sure you have a copy elsewhere.`)) return
+  try {
+    await settingsAPI.deleteBackup(b.name)
+    loadBackups()
+  } catch (err) { toast.error(apiError(err, 'Delete failed')) }
+}
+
+async function showRestore() {
+  try {
+    const { data } = await settingsAPI.restoreInstructions()
+    alert(data.message)
+  } catch (err) { toast.error(apiError(err)) }
+}
+
+function size(bytes) {
+  if (bytes > 1048576) return `${(bytes / 1048576).toFixed(1)} MB`
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`
+}
+
 async function testEmail() {
-  toast.info('Email test functionality requires SMTP configuration')
+  sendingEmail.value = true
+  try {
+    const { data } = await alertsAPI.testEmail({ to: testEmailTo.value })
+    toast.success(data.message)
+  } catch (err) { toast.error(apiError(err, 'Test email failed')) }
+  finally { sendingEmail.value = false }
 }
 
 async function runRadiusTest() {
@@ -263,11 +304,12 @@ async function runRadiusTest() {
     const { data } = await radiusAPI.test(radiusTest.value)
     radiusTestResult.value = data
   } catch (err) {
-    radiusTestResult.value = { success: false, message: err.response?.data?.error || 'Test failed', latency_ms: 0 }
+    radiusTestResult.value = { success: false, message: apiError(err, 'Test failed'), latency_ms: 0 }
   } finally {
     testingRadius.value = false
   }
 }
 
-onMounted(loadSettings)
+onMounted(() => { loadSettings(); loadBackups() })
+onUnmounted(() => clearTimeout(backupPoll))
 </script>

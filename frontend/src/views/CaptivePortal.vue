@@ -113,6 +113,14 @@
                 </select>
               </div>
               <div class="col-span-2">
+                <label class="form-label">Router login URL</label>
+                <input v-model.trim="form.login_url" type="url" class="form-input" placeholder="http://10.5.50.1/login (leave empty for MikroTik)" />
+                <p class="text-xs text-gray-500 mt-1">
+                  Where the form posts the customer's login: the hotspot router's own login page. Leave empty when the
+                  router sends its address itself (MikroTik external login page: link-login-only).
+                </p>
+              </div>
+              <div class="col-span-2">
                 <label class="form-label">Redirect URL (after login)</label>
                 <input v-model="form.redirect_url" type="url" class="form-input" placeholder="http://example.com" />
               </div>
@@ -190,7 +198,7 @@ const saving = ref(false)
 const showModal = ref(false)
 const editing = ref(null)
 const portals = ref([])
-const form = reactive({ name: '', title: 'WiFi Login', subtitle: '', logo_url: '', bg_color: '#f0f4ff', primary_color: '#3b82f6', auth_type: 'userpass', redirect_url: 'http://example.com', terms_text: '', footer_text: '', is_active: true, zone_id: null })
+const form = reactive({ name: '', title: 'WiFi Login', subtitle: '', logo_url: '', bg_color: '#f0f4ff', primary_color: '#3b82f6', auth_type: 'userpass', redirect_url: 'http://example.com', terms_text: '', footer_text: '', login_url: '', is_active: true, zone_id: null })
 
 async function load() {
   loading.value = true
@@ -202,13 +210,13 @@ async function load() {
 
 function openCreate() {
   editing.value = null
-  Object.assign(form, { name: '', title: 'WiFi Login', subtitle: '', logo_url: '', bg_color: '#f0f4ff', primary_color: '#3b82f6', auth_type: 'userpass', redirect_url: 'http://example.com', terms_text: '', footer_text: '', is_active: true, zone_id: null })
+  Object.assign(form, { name: '', title: 'WiFi Login', subtitle: '', logo_url: '', bg_color: '#f0f4ff', primary_color: '#3b82f6', auth_type: 'userpass', redirect_url: 'http://example.com', terms_text: '', footer_text: '', login_url: '', is_active: true, zone_id: null })
   showModal.value = true
 }
 
 function openEdit(p) {
   editing.value = p.id
-  Object.assign(form, { name: p.name, title: p.title, subtitle: p.subtitle || '', logo_url: p.logo_url || '', bg_color: p.bg_color, primary_color: p.primary_color, auth_type: p.auth_type, redirect_url: p.redirect_url, terms_text: p.terms_text || '', footer_text: p.footer_text || '', is_active: p.is_active, zone_id: p.zone_id })
+  Object.assign(form, { name: p.name, title: p.title, subtitle: p.subtitle || '', logo_url: p.logo_url || '', bg_color: p.bg_color, primary_color: p.primary_color, auth_type: p.auth_type, redirect_url: p.redirect_url, terms_text: p.terms_text || '', footer_text: p.footer_text || '', login_url: p.login_url || '', is_active: p.is_active, zone_id: p.zone_id })
   showModal.value = true
 }
 
@@ -218,7 +226,7 @@ async function save() {
     if (editing.value) { await captiveAPI.update(editing.value, form); toast.success('Updated') }
     else { await captiveAPI.create(form); toast.success('Created') }
     showModal.value = false; load()
-  } catch (err) { toast.error(err.response?.data?.error || 'Failed') }
+  } catch (err) { toast.error(err.response?.data?.error || 'Failed to save portal') }
   finally { saving.value = false }
 }
 

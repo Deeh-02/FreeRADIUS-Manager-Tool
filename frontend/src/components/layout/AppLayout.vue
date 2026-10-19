@@ -15,7 +15,7 @@
         </div>
         <div>
           <div class="font-bold text-gray-900 text-sm leading-tight">RADIUS Manager Pro</div>
-          <div class="text-xs text-blue-600 font-medium">v2.0 Pro</div>
+          <div class="text-xs text-blue-600 font-medium">v1.1.0</div>
         </div>
       </div>
 

@@ -131,8 +131,7 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { nasStatusAPI } from '@/api'
-import axios from 'axios'
+import { nasStatusAPI, liveStatsAPI } from '@/api'
 import { format, parseISO } from 'date-fns'
 import { ServerIcon, UsersIcon, SignalIcon, ArrowPathIcon } from '@heroicons/vue/24/outline'
 
@@ -141,7 +140,6 @@ const devices = ref([])
 const selectedDev = ref(null)
 const liveStats = ref({})
 let refreshTimer
-let statsSource
 
 const onlineCount = computed(() => devices.value.filter(d => d.ping_status === 'up').length)
 const offlineCount = computed(() => devices.value.filter(d => d.ping_status === 'down').length)
@@ -173,15 +171,9 @@ async function load() {
 
 async function loadCurrentStats() {
   try {
-    // NOTE: the app stores the login token under 'access_token' (see store/auth.js), not 'token',
-    // so this lookup finds nothing, no Authorization header is sent, and the request gets a
-    // 401 that the catch below hides: the live-stats panel on this page stays empty.
-    const token = localStorage.getItem('token') || sessionStorage.getItem('token') || ''
-    const { data } = await axios.get('/api/v1/live/stats/current', {
-      headers: token ? { Authorization: 'Bearer ' + token } : {}
-    })
+    const { data } = await liveStatsAPI.current()
     liveStats.value = data
-  } catch { /* silent */ }
+  } catch { /* the panel just stays empty */ }
 }
 
 onMounted(() => {

@@ -6,7 +6,7 @@
         <p class="text-sm text-gray-500 mt-0.5">Generate and manage prepaid access vouchers</p>
       </div>
       <div class="flex gap-2">
-        <button @click="showGenModal = true" class="btn-primary">
+        <button @click="showGenModal = true; loadPlans()" class="btn-primary">
           <PlusIcon class="w-4 h-4" />
           Generate Vouchers
         </button>
@@ -142,6 +142,29 @@
             <label class="form-label">Batch Name</label>
             <input v-model="genForm.batch_name" type="text" class="form-input" placeholder="e.g. Hotel-Room-June" />
           </div>
+          <div>
+            <label class="form-label">Plan (optional)</label>
+            <select v-model="genForm.plan_id" class="form-input" @change="onPlanChange">
+              <option :value="null">No plan</option>
+              <option v-for="p in plans" :key="p.id" :value="p.id">{{ p.name }} · {{ p.currency }} {{ p.price }}</option>
+            </select>
+            <p class="text-xs text-gray-500 mt-1">Uses the plan's speed, device count and data cap.</p>
+          </div>
+          <div class="grid grid-cols-3 gap-4">
+            <div>
+              <label class="form-label">Price each</label>
+              <input v-model.number="genForm.price" type="number" min="0" step="0.01" class="form-input" placeholder="0" />
+            </div>
+            <div>
+              <label class="form-label">Currency</label>
+              <input v-model.trim="genForm.currency" type="text" maxlength="3" class="form-input uppercase" placeholder="default" />
+            </div>
+            <div>
+              <label class="form-label">Devices</label>
+              <input v-model.number="genForm.devices" type="number" min="1" max="50" class="form-input" placeholder="1" />
+            </div>
+          </div>
+          <p class="text-xs text-gray-500 -mt-2">The price is recorded for your sales figures; vouchers are sold offline.</p>
           <div class="grid grid-cols-2 gap-4">
             <div>
               <label class="form-label">Data Limit (MB)</label>
@@ -171,7 +194,7 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
-import { voucherAPI } from '@/api'
+import { voucherAPI, plansAPI } from '@/api'
 import { format, parseISO } from 'date-fns'
 import { PlusIcon, ArrowDownTrayIcon, PrinterIcon, XMarkIcon } from '@heroicons/vue/24/outline'
 
@@ -187,7 +210,20 @@ const selectedIds = ref([])
 let searchTimer
 
 const filters = reactive({ batch: '', status: '' })
-const genForm = reactive({ count: 10, batch_name: '', data_limit_mb: null, time_limit_minutes: null, valid_days: 30 })
+const blankGen = () => ({ count: 10, batch_name: '', data_limit_mb: null, time_limit_minutes: null, valid_days: 30,
+  plan_id: null, price: null, currency: '', devices: null })
+const genForm = reactive(blankGen())
+const plans = ref([])
+
+async function loadPlans() {
+  if (plans.value.length) return
+  try { plans.value = ((await plansAPI.list()).data.data || []).filter((p) => p.is_active) } catch { /* optional */ }
+}
+
+function onPlanChange() {
+  const p = plans.value.find((x) => x.id === genForm.plan_id)
+  if (p) { genForm.price = p.price; genForm.currency = p.currency; genForm.valid_days = p.validity_days || genForm.valid_days }
+}
 
 const stats = computed(() => ({
   total: total.value,
@@ -239,10 +275,13 @@ async function generate() {
     if (!payload.data_limit_mb) delete payload.data_limit_mb
     if (!payload.time_limit_minutes) delete payload.time_limit_minutes
     if (!payload.valid_days) payload.valid_days = 30
+    if (!payload.price) delete payload.price
+    if (!payload.devices) delete payload.devices
+    if (!payload.currency) delete payload.currency
     const { data } = await voucherAPI.generate(payload)
     toast.success(data.message)
     showGenModal.value = false
-    Object.assign(genForm, { count: 10, batch_name: '', data_limit_mb: null, time_limit_minutes: null, valid_days: 30 })
+    Object.assign(genForm, blankGen())
     loadVouchers()
   } catch (err) {
     toast.error(err.response?.data?.error || 'Generation failed')

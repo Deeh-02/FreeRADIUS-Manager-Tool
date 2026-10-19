@@ -95,6 +95,41 @@
         </div>
       </div>
 
+      <!-- Invoices -->
+      <div v-if="data?.invoices?.length" class="bg-white rounded-2xl shadow p-5">
+        <h3 class="font-semibold text-gray-900 mb-1">Invoices</h3>
+        <p v-if="openInvoices.length" class="text-sm text-amber-700 mb-3">
+          {{ openInvoices.length }} unpaid. Pay {{ data.provider?.name || 'your provider' }} and quote the invoice number<span v-if="data.provider?.email"> ({{ data.provider.email }})</span>.
+        </p>
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="text-gray-400 text-xs border-b border-gray-100">
+              <th class="text-left py-1.5">Invoice</th>
+              <th class="text-left">Plan</th>
+              <th class="text-right">Amount</th>
+              <th class="text-right">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="inv in data.invoices" :key="inv.invoice_number" class="border-b border-gray-50">
+              <td class="py-1.5 font-mono text-xs text-gray-700">{{ inv.invoice_number }}<span class="block text-gray-400">{{ inv.created_at }}</span></td>
+              <td class="text-gray-600">{{ inv.plan_name || '—' }}</td>
+              <td class="text-right font-medium whitespace-nowrap">
+                {{ inv.currency }} {{ inv.amount.toFixed(2) }}
+                <span v-if="inv.amount_paid > 0 && inv.status !== 'paid'" class="block text-xs text-gray-400">paid {{ inv.amount_paid.toFixed(2) }}</span>
+              </td>
+              <td class="text-right">
+                <span class="text-xs px-2 py-0.5 rounded-full"
+                  :class="inv.status === 'paid' ? 'bg-green-100 text-green-700' : inv.status === 'overdue' ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-700'">
+                  {{ inv.status }}
+                </span>
+                <span v-if="inv.due_date && inv.status !== 'paid'" class="block text-xs text-gray-400">due {{ inv.due_date }}</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <!-- Active sessions -->
       <div v-if="data?.active_sessions?.length" class="bg-white rounded-2xl shadow p-5">
         <h3 class="font-semibold text-gray-900 mb-3 flex items-center gap-2">
@@ -146,22 +181,25 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import axios from 'axios'
+import { API_BASE } from '@/api'
 import { ArrowRightOnRectangleIcon } from '@heroicons/vue/24/outline'
 
 // The customer portal is separate from the admin app: it uses its own opaque token (sent as
 // X-Portal-Token, valid 24h on the server), kept under this localStorage key, and bypasses
 // the axios instance/interceptors in api/index.js. It is read-only: customers can see plan,
-// expiry and usage but cannot pay, renew or change anything from here.
+// expiry, usage and invoices but cannot pay, renew or change anything from here (payments
+// are made to the provider, who records them).
 const SESSION_KEY = 'portal_token'
-const API = '/api/v1/portal'
+const API = `${API_BASE}/portal`
 
 const session = ref(null)
 const data = ref(null)
 const logging = ref(false)
 const loginError = ref('')
 const creds = reactive({ username: '', password: '' })
+const openInvoices = computed(() => (data.value?.invoices || []).filter((i) => i.status === 'pending' || i.status === 'overdue'))
 
 function formatMB(mb) {
   if (!mb) return '0 MB'

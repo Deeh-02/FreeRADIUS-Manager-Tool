@@ -4,14 +4,9 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">RADIUS Users</h1>
-        <p class="text-sm text-gray-500 mt-0.5">Manage network access users</p>
+        <p class="text-sm text-gray-500 mt-0.5">Customer network logins, their plans and paid-until dates</p>
       </div>
       <div class="flex items-center gap-2" v-if="authStore.isAdmin">
-        <label class="btn-secondary cursor-pointer">
-          <ArrowUpTrayIcon class="w-4 h-4" />
-          Import CSV
-          <input type="file" accept=".csv" class="hidden" @change="handleImport" />
-        </label>
         <button @click="exportUsers" class="btn-secondary">
           <ArrowDownTrayIcon class="w-4 h-4" />
           Export
@@ -68,11 +63,11 @@
               <tr>
                 <th>Username</th>
                 <th>Name / Email</th>
-                <th>Department</th>
+                <th>Plan</th>
                 <th>Status</th>
                 <th>Devices</th>
                 <th>Sessions</th>
-                <th>Expires</th>
+                <th>Paid until</th>
                 <th class="text-right">Actions</th>
               </tr>
             </thead>
@@ -86,9 +81,12 @@
                 </td>
                 <td>
                   <div class="text-sm font-medium text-gray-900">{{ user.full_name || '—' }}</div>
-                  <div class="text-xs text-gray-500">{{ user.email || '—' }}</div>
+                  <div class="text-xs text-gray-500">{{ user.phone || user.email || '—' }}</div>
                 </td>
-                <td class="text-gray-500">{{ user.department || '—' }}</td>
+                <td class="text-sm">
+                  <span class="text-gray-700">{{ user.plan_name || '—' }}</span>
+                  <span v-if="user.open_invoices" class="badge-yellow ml-1" :title="`${user.open_invoices} unpaid invoice(s)`">{{ user.open_invoices }} unpaid</span>
+                </td>
                 <td>
                   <span :class="statusBadge(user.status)" class="badge">
                     {{ user.status }}
@@ -111,7 +109,7 @@
                     {{ user.active_sessions }} active
                   </span>
                 </td>
-                <td class="text-gray-500 text-xs">
+                <td class="text-xs" :class="isPast(user.account_expiry) ? 'text-red-600 font-medium' : 'text-gray-500'">
                   {{ user.account_expiry ? formatDate(user.account_expiry) : 'Never' }}
                 </td>
                 <td>
@@ -124,6 +122,13 @@
                       <KeyIcon class="w-4 h-4" />
                     </button>
                     <template v-if="authStore.isAdmin">
+                      <button
+                        @click="openAssignPlan(user)"
+                        class="p-1.5 text-gray-400 hover:text-indigo-600 hover:bg-indigo-50 rounded"
+                        title="Assign Plan"
+                      >
+                        <CreditCardIcon class="w-4 h-4" />
+                      </button>
                       <button
                         @click="openEdit(user)"
                         class="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded"
@@ -195,6 +200,15 @@
       @saved="onSaved"
     />
 
+    <AssignPlanModal
+      v-if="planUser"
+      :user="planUser"
+      @close="planUser = null"
+      @saved="loadUsers"
+      @pay="(inv) => { planUser = null; payInvoice = inv }"
+    />
+    <RecordPaymentModal v-if="payInvoice" :invoice="payInvoice" @close="payInvoice = null" @saved="loadUsers" />
+
     <!-- Reset Password Modal -->
     <ResetPasswordModal
       v-if="showResetModal"
@@ -225,7 +239,8 @@
           <div class="bg-blue-50 border border-blue-200 rounded-xl p-3 text-xs text-blue-800">
             <p class="font-semibold mb-1">Required CSV columns:</p>
             <code class="font-mono">username, password</code>
-            <p class="mt-1">Optional: <code class="font-mono">email, plan_name, data_limit_mb, validity_days, description</code></p>
+            <p class="mt-1">Optional: <code class="font-mono">email, full_name, department, phone, device_limit, expiry (YYYY-MM-DD), validity_days, plan_name, data_limit_mb, notes</code></p>
+            <p class="mt-1">plan_name applies the plan's limits only; nothing is billed. Set expiry (or validity_days) for the paid-until date.</p>
           </div>
           <div
             class="border-2 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer hover:border-blue-400 transition-colors"
@@ -286,13 +301,16 @@
 import { ref, computed, onMounted } from 'vue'
 import { useAuthStore } from '@/store/auth'
 import { useToast } from 'vue-toastification'
-import { radiusUsersAPI, importAPI } from '@/api'
+import { radiusUsersAPI, importAPI, saveBlob } from '@/api'
+import { apiError } from '@/utils/money'
 import { format, parseISO } from 'date-fns'
 import {
   PlusIcon, PencilIcon, TrashIcon, KeyIcon, PauseIcon, PlayIcon,
-  ArrowUpTrayIcon, ArrowDownTrayIcon, SignalSlashIcon, XMarkIcon,
+  ArrowUpTrayIcon, ArrowDownTrayIcon, SignalSlashIcon, XMarkIcon, CreditCardIcon,
 } from '@heroicons/vue/24/outline'
 import UserModal from '@/components/users/UserModal.vue'
+import AssignPlanModal from '@/components/users/AssignPlanModal.vue'
+import RecordPaymentModal from '@/components/billing/RecordPaymentModal.vue'
 import ResetPasswordModal from '@/components/users/ResetPasswordModal.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 
@@ -311,6 +329,8 @@ const showModal = ref(false)
 const showResetModal = ref(false)
 const showDeleteConfirm = ref(false)
 const editingUser = ref(null)
+const planUser = ref(null)
+const payInvoice = ref(null)
 
 let searchTimer
 
@@ -362,6 +382,10 @@ function openEdit(user) {
   showModal.value = true
 }
 
+function openAssignPlan(user) {
+  planUser.value = user
+}
+
 function openResetPassword(user) {
   editingUser.value = user
   showResetModal.value = true
@@ -379,7 +403,7 @@ async function deleteUser() {
     toast.success('User deleted successfully')
     loadUsers()
   } catch (err) {
-    toast.error(err.response?.data?.error || 'Failed to delete user')
+    toast.error(apiError(err, 'Failed to delete user'))
   }
 }
 
@@ -398,51 +422,44 @@ async function toggleStatus(user) {
   }
 }
 
+// The router is asked to end each session (RADIUS Disconnect-Request). If it does not
+// confirm, offer to mark the sessions closed anyway (for sessions that are already gone).
 async function disconnectUser(user) {
   try {
     const { data } = await radiusUsersAPI.disconnect(user.id)
-    toast.success(data.message)
-    loadUsers()
-  } catch {
-    toast.error('Failed to disconnect user')
-  }
-}
-
-async function handleImport(event) {
-  const file = event.target.files[0]
-  if (!file) return
-  const formData = new FormData()
-  formData.append('file', file)
-  try {
-    const { data } = await radiusUsersAPI.import(formData)
-    toast.success(`Imported ${data.created} users`)
-    if (data.errors?.length) {
-      console.warn('Import errors:', data.errors)
+    if (data.disconnected > 0) {
+      toast.success(data.message)
+    } else if (confirm(`The router did not confirm:\n${(data.details || []).join('\n')}\n\n` +
+        'Mark the session(s) as closed anyway? (Only if the customer is really offline.)')) {
+      const forced = await radiusUsersAPI.disconnect(user.id, true)
+      toast.info(forced.data.message)
     }
     loadUsers()
   } catch (err) {
-    toast.error(err.response?.data?.error || 'Import failed')
+    toast.error(apiError(err, 'Failed to disconnect user'))
   }
-  event.target.value = ''
 }
 
 async function exportUsers() {
   try {
     const { data } = await radiusUsersAPI.export()
-    const url = URL.createObjectURL(new Blob([data]))
-    const a = document.createElement('a')
-    a.href = url
-    a.download = 'radius_users.csv'
-    a.click()
-    URL.revokeObjectURL(url)
+    saveBlob(data, 'radius_users.csv')
   } catch {
     toast.error('Export failed')
   }
 }
 
-function onSaved() {
+function isPast(d) {
+  return !!d && d.slice(0, 10) < new Date().toISOString().slice(0, 10)
+}
+
+function onSaved(created) {
   showModal.value = false
   loadUsers()
+  // New customer on a paid plan: go straight to recording the first payment.
+  if (created?.invoice_id && confirm(`${created.message}\n\nRecord the payment now?`)) {
+    payInvoice.value = { id: created.invoice_id }
+  }
 }
 
 function onPasswordReset() {

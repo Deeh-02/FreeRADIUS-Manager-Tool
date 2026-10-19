@@ -2,8 +2,10 @@ import axios from 'axios'
 import { useAuthStore } from '@/store/auth'
 import router from '@/router'
 
+export const API_BASE = import.meta.env.VITE_API_URL || '/api/v1'
+
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || '/api/v1',
+  baseURL: API_BASE,
   timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
@@ -46,6 +48,15 @@ api.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config
 
+    // "Require MFA" is on and this account has no MFA yet: only the Profile page (MFA setup)
+    // works until it is enabled.
+    if (error.response?.status === 403 && error.response?.data?.code === 'MFA_SETUP_REQUIRED') {
+      if (router.currentRoute.value.path !== '/profile') {
+        router.push({ path: '/profile', query: { mfa: 'required' } })
+      }
+      return Promise.reject(error)
+    }
+
     if (error.response?.status === 401 && !originalRequest._retry) {
       const code = error.response?.data?.code
 
@@ -80,10 +91,8 @@ api.interceptors.response.use(
         }
 
         try {
-          const { data } = await axios.post(
-            `${import.meta.env.VITE_API_URL || ''}/api/v1/auth/refresh`,
-            { refresh_token: refreshToken }
-          )
+          // Plain axios (not `api`), so a failing refresh does not re-enter this interceptor.
+          const { data } = await axios.post(`${API_BASE}/auth/refresh`, { refresh_token: refreshToken })
           localStorage.setItem('access_token', data.access_token)
           localStorage.setItem('refresh_token', data.refresh_token)
           api.defaults.headers.common.Authorization = `Bearer ${data.access_token}`
@@ -99,6 +108,15 @@ api.interceptors.response.use(
         } finally {
           isRefreshing = false
         }
+      }
+
+      // Any other 401 on a signed-in request (e.g. the token was signed with an old
+      // JWT_SECRET): the stored credentials are useless, so sign in again. A wrong password
+      // on the login form is also a 401 and must stay on the form.
+      const url = originalRequest.url || ''
+      if (!url.startsWith('/auth/login') && localStorage.getItem('access_token')) {
+        useAuthStore().clearAuth()
+        router.push('/login')
       }
     }
 
@@ -145,7 +163,9 @@ export const radiusUsersAPI = {
   resetPassword: (id, data) => api.post(`/radius/users/${id}/reset-password`, data),
   suspend: (id) => api.post(`/radius/users/${id}/suspend`),
   activate: (id) => api.post(`/radius/users/${id}/activate`),
-  disconnect: (id) => api.post(`/radius/users/${id}/disconnect`),
+  // Sends a RADIUS Disconnect-Request to the router; force also closes sessions the router
+  // did not confirm (ones that are really gone but never got an accounting Stop).
+  disconnect: (id, force = false) => api.post(`/radius/users/${id}/disconnect`, null, { params: force ? { force: 'true' } : {} }),
   getSessions: (id) => api.get(`/radius/users/${id}/sessions`),
   import: (formData) => api.post('/radius/users/import', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
@@ -185,6 +205,21 @@ export const settingsAPI = {
   update: (data) => api.put('/settings', data),
   getBackups: () => api.get('/backups'),
   createBackup: () => api.post('/backup'),
+  downloadBackup: (name) => api.get(`/backups/${encodeURIComponent(name)}`, { responseType: 'blob', timeout: 0 }),
+  deleteBackup: (name) => api.delete(`/backups/${encodeURIComponent(name)}`),
+  restoreInstructions: () => api.post('/restore'),
+}
+
+// saveBlob offers an axios blob response to the browser as a file download.
+export function saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 // --- Health ---
@@ -227,20 +262,21 @@ export const reportsAPI = {
 }
 
 // ── Tier 2 Pro: User Plans ────────────────────────────────────────────────
-// NOTE: assignToUser (POST /radius/users/:id/plan) is the only call that applies a plan's
-// limits and raises its invoice, but no view calls it yet, so plans cannot be assigned from
-// the UI. The user form sets account expiry and device limit by hand instead.
+// assignToUser applies the plan's limits and, for a paid plan, raises its invoice; the
+// period starts when the invoice is paid unless start_now is set.
 export const plansAPI = {
   list: () => api.get('/plans'),
   create: (data) => api.post('/plans', data),
   update: (id, data) => api.put(`/plans/${id}`, data),
   delete: (id) => api.delete(`/plans/${id}`),
-  assignToUser: (userId, planId) => api.post(`/radius/users/${userId}/plan`, { plan_id: planId }),
+  // data: { plan_id, start_now, promo_code }; plan_id null unlinks the plan.
+  assignToUser: (userId, data) => api.post(`/radius/users/${userId}/plan`, data),
 }
 
 // ── Tier 2 Pro: Billing ───────────────────────────────────────────────────
 export const billingAPI = {
   list: (params) => api.get('/invoices', { params }),
+  get: (id) => api.get(`/invoices/${id}`),
   create: (data) => api.post('/invoices', data),
   update: (id, data) => api.put(`/invoices/${id}`, data),
   delete: (id) => api.delete(`/invoices/${id}`),
@@ -315,15 +351,58 @@ export const smsAPI = {
   config: () => api.get('/sms/config'),
 }
 
-// ── Tier 4 Pro: Live Stats (SSE helper) ───────────────────────────────────
+// ── Tier 4 Pro: Live Stats (server-sent events) ───────────────────────────
+// EventSource cannot send an Authorization header and the API no longer accepts tokens in
+// the URL, so the stream is read with fetch. openStream returns an object with close(), like
+// EventSource; onMessage gets each parsed `data:` payload. It reconnects after errors (with
+// the current token, so a refreshed token is picked up) until closed.
 export const liveStatsAPI = {
   current: () => api.get('/live/stats/current'),
-  // EventSource cannot set an Authorization header, so the JWT goes in the URL (the backend
-  // accepts ?token=). It therefore appears in server logs. The path is hard-coded to
-  // /api/v1 and ignores VITE_API_URL, so it works only when the API is on the same origin.
-  createEventSource: () => {
-    const token = localStorage.getItem('access_token') || ''
-    return new EventSource(`/api/v1/live/stats?token=${encodeURIComponent(token)}`)
+  openStream: (onMessage, onState = () => {}) => {
+    let closed = false
+    let controller = null
+    const run = async () => {
+      while (!closed) {
+        controller = new AbortController()
+        try {
+          const res = await fetch(`${API_BASE}/live/stats`, {
+            headers: { Authorization: `Bearer ${localStorage.getItem('access_token') || ''}` },
+            signal: controller.signal,
+          })
+          if (res.status === 401) {
+            // Let the axios interceptor refresh the token, then reconnect.
+            await api.get('/live/stats/current').catch(() => {})
+            throw new Error('unauthorized')
+          }
+          if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+          onState('open')
+          const reader = res.body.getReader()
+          const decoder = new TextDecoder()
+          let buf = ''
+          for (;;) {
+            const { value, done } = await reader.read()
+            if (done) break
+            buf += decoder.decode(value, { stream: true })
+            let idx
+            while ((idx = buf.indexOf('\n\n')) >= 0) {
+              const event = buf.slice(0, idx)
+              buf = buf.slice(idx + 2)
+              const data = event.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim()).join('\n')
+              if (data) {
+                try { onMessage(JSON.parse(data)) } catch { /* ignore malformed event */ }
+              }
+            }
+          }
+        } catch {
+          if (closed) return
+        }
+        if (closed) return
+        onState('error')
+        await new Promise((r) => setTimeout(r, 5000))
+      }
+    }
+    run()
+    return { close: () => { closed = true; controller?.abort() } }
   },
 }
 
@@ -373,11 +452,32 @@ export const webhooksAPI = {
 }
 
 // ── Tier 6 Pro: Payments ──────────────────────────────────────────────────
+// Payments are never deleted, only reversed (the invoice re-opens and the plan period it
+// granted is taken back).
 export const paymentsAPI = {
   list: (params) => api.get('/payments', { params }),
   create: (data) => api.post('/payments', data),
-  delete: (id) => api.delete(`/payments/${id}`),
+  reverse: (id, reason) => api.post(`/payments/${id}/reverse`, { reason }),
   summary: () => api.get('/payments/summary'),
+  receipt: (id) => api.get(`/payments/${id}/receipt`, { responseType: 'text' }),
+}
+
+// openReceipt fetches a receipt with the auth header and shows it in a new tab (the
+// receipt page is self-contained HTML with a Print button).
+export async function openReceipt(id) {
+  // Opened before the request so popup blockers treat it as a direct click.
+  const win = window.open('', '_blank')
+  let data
+  try {
+    ({ data } = await paymentsAPI.receipt(id))
+  } catch (e) {
+    win?.close()
+    throw e
+  }
+  const url = URL.createObjectURL(new Blob([data], { type: 'text/html' }))
+  if (win) win.location.href = url
+  else window.location.href = url
+  setTimeout(() => URL.revokeObjectURL(url), 60000)
 }
 
 // ── Tier 6 Pro: RADIUS Attribute Templates ────────────────────────────────
@@ -391,8 +491,8 @@ export const templatesAPI = {
 }
 
 // ── Tier 6 Pro: Promotions ────────────────────────────────────────────────
-// NOTE: `apply` is never called from a view, and neither validate nor apply touches an
-// invoice, so promotions are currently a calculator, not a discount on what is billed.
+// A code reduces what is billed when it is given with an invoice or a plan assignment
+// (promo_code); validate only previews the discount.
 export const promotionsAPI = {
   list: () => api.get('/promotions'),
   create: (data) => api.post('/promotions', data),

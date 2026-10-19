@@ -3,62 +3,56 @@
     <div class="page-header">
       <div>
         <h1 class="page-title">Payments</h1>
-        <p class="text-sm text-gray-500 mt-0.5">Track all customer payments and generate receipts</p>
+        <p class="text-sm text-gray-500 mt-0.5">Money received. Payments are never deleted; a mistake or refund is reversed.</p>
       </div>
-      <button @click="openCreate" class="btn-primary" v-if="authStore.isAdmin">
+      <button @click="showModal = true" class="btn-primary" v-if="authStore.isAdmin">
         <PlusIcon class="w-4 h-4" />
         Record Payment
       </button>
     </div>
 
-    <!-- Summary cards -->
-    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <!-- Summary cards (admins; never mixing currencies) -->
+    <div v-if="summary" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
       <div class="card p-4 flex items-center gap-3">
-        <div class="w-9 h-9 bg-green-100 rounded-xl flex items-center justify-center">
+        <div class="w-9 h-9 bg-green-100 rounded-xl flex items-center justify-center shrink-0">
           <CurrencyDollarIcon class="w-5 h-5 text-green-600" />
         </div>
         <div>
-          <p class="text-xs text-gray-500">This Month</p>
-          <p class="text-xl font-bold text-green-600">${{ summary.total_month?.toFixed(2) || '0.00' }}</p>
+          <p class="text-xs text-gray-500">This month</p>
+          <p class="text-lg font-bold text-green-600">{{ formatTotals(summary.this_month) }}</p>
+          <p class="text-xs text-gray-400">{{ countOf(summary.this_month) }} payments</p>
         </div>
       </div>
       <div class="card p-4 flex items-center gap-3">
-        <div class="w-9 h-9 bg-blue-100 rounded-xl flex items-center justify-center">
+        <div class="w-9 h-9 bg-blue-100 rounded-xl flex items-center justify-center shrink-0">
           <BanknotesIcon class="w-5 h-5 text-blue-600" />
         </div>
         <div>
-          <p class="text-xs text-gray-500">All Time</p>
-          <p class="text-xl font-bold text-blue-600">${{ summary.total_all?.toFixed(2) || '0.00' }}</p>
+          <p class="text-xs text-gray-500">All time</p>
+          <p class="text-lg font-bold text-blue-600">{{ formatTotals(summary.all_time) }}</p>
+          <p class="text-xs text-gray-400">{{ countOf(summary.all_time) }} payments</p>
         </div>
       </div>
       <div class="card p-4 flex items-center gap-3">
-        <div class="w-9 h-9 bg-purple-100 rounded-xl flex items-center justify-center">
-          <ReceiptPercentIcon class="w-5 h-5 text-purple-600" />
+        <div class="w-9 h-9 bg-amber-100 rounded-xl flex items-center justify-center shrink-0">
+          <ReceiptPercentIcon class="w-5 h-5 text-amber-600" />
         </div>
         <div>
-          <p class="text-xs text-gray-500">This Month (count)</p>
-          <p class="text-xl font-bold text-purple-600">{{ summary.count_month || 0 }}</p>
-        </div>
-      </div>
-      <div class="card p-4 flex items-center gap-3">
-        <div class="w-9 h-9 bg-orange-100 rounded-xl flex items-center justify-center">
-          <ReceiptPercentIcon class="w-5 h-5 text-orange-600" />
-        </div>
-        <div>
-          <p class="text-xs text-gray-500">Total (count)</p>
-          <p class="text-xl font-bold text-orange-600">{{ summary.count_all || 0 }}</p>
+          <p class="text-xs text-gray-500">Outstanding on open invoices</p>
+          <p class="text-lg font-bold text-amber-600">{{ formatTotals(summary.outstanding) }}</p>
+          <p class="text-xs text-gray-400">{{ countOf(summary.outstanding) }} invoices</p>
         </div>
       </div>
     </div>
 
     <!-- Method breakdown -->
-    <div v-if="summary.by_method?.length" class="card">
-      <h3 class="font-semibold text-gray-900 mb-3 text-sm">Revenue by Payment Method</h3>
+    <div v-if="summary?.by_method?.length" class="card">
+      <h3 class="font-semibold text-gray-900 mb-3 text-sm">Revenue by payment method</h3>
       <div class="flex flex-wrap gap-3">
-        <div v-for="m in summary.by_method" :key="m.method"
+        <div v-for="m in summary.by_method" :key="m.method + m.currency"
           class="flex items-center gap-2 bg-gray-50 rounded-xl px-3 py-2">
           <span class="text-xs font-medium capitalize">{{ m.method.replace('_',' ') }}</span>
-          <span class="text-sm font-bold text-blue-700">${{ m.total?.toFixed(2) }}</span>
+          <span class="text-sm font-bold text-blue-700">{{ money(m.total, m.currency) }}</span>
           <span class="text-xs text-gray-400">({{ m.count }})</span>
         </div>
       </div>
@@ -74,185 +68,148 @@
         <option value="mobile_money">Mobile Money</option>
         <option value="card">Card</option>
         <option value="online">Online</option>
+        <option value="voucher">Voucher</option>
+        <option value="other">Other</option>
       </select>
+      <select v-model="filterStatus" class="form-input w-36 text-sm" @change="load">
+        <option value="">All statuses</option>
+        <option value="confirmed">Confirmed</option>
+        <option value="reversed">Reversed</option>
+      </select>
+      <span v-if="filterUsername && totals.length" class="text-sm text-gray-500">
+        Confirmed for "{{ filterUsername }}": <strong>{{ formatTotals(totals) }}</strong>
+      </span>
     </div>
 
     <!-- Payments table -->
     <div class="card p-0 overflow-hidden">
-      <table class="table">
-        <thead>
-          <tr>
-            <th>Receipt</th>
-            <th>Customer</th>
-            <th>Invoice</th>
-            <th>Amount</th>
-            <th>Method</th>
-            <th>Date</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-if="loading"><td colspan="7" class="text-center py-8 text-gray-400">Loading…</td></tr>
-          <tr v-else-if="!payments.length"><td colspan="7" class="text-center py-8 text-gray-400">No payments found</td></tr>
-          <tr v-for="p in payments" :key="p.id">
-            <td><span class="font-mono text-xs">{{ p.receipt_number }}</span></td>
-            <td class="text-sm font-medium">{{ p.username || '—' }}</td>
-            <td class="text-xs text-gray-500">{{ p.invoice_number || '—' }}</td>
-            <td>
-              <span class="font-bold text-green-600">{{ p.currency }} {{ p.amount?.toFixed(2) }}</span>
-            </td>
-            <td>
-              <span class="badge badge-blue text-xs capitalize">{{ p.payment_method?.replace('_',' ') }}</span>
-            </td>
-            <td class="text-xs text-gray-400">{{ formatDate(p.created_at) }}</td>
-            <td>
-              <div class="flex gap-1">
-                <!-- A plain link cannot send the Authorization header, and the API requires it for
-                     receipts, so from here the new tab gets a 401 JSON error (see GetPaymentReceipt). -->
-                <a :href="`/api/v1/payments/${p.id}/receipt`" target="_blank"
-                  class="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600" title="View Receipt">
-                  <ReceiptPercentIcon class="w-4 h-4" />
-                </a>
-                <button v-if="authStore.isSuperAdmin" @click="deletePayment(p)"
-                  class="p-1.5 rounded hover:bg-red-50 text-gray-400 hover:text-red-500">
-                  <TrashIcon class="w-4 h-4" />
-                </button>
-              </div>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <!-- Record Payment Modal -->
-    <div v-if="showModal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
-        <div class="flex items-center justify-between p-6 border-b">
-          <h3 class="text-lg font-semibold">Record Payment</h3>
-          <button @click="showModal = false" class="text-gray-400 hover:text-gray-600"><XMarkIcon class="w-5 h-5" /></button>
-        </div>
-        <form @submit.prevent="save" class="p-6 space-y-4">
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <label class="form-label">Username</label>
-              <input v-model="form.username" type="text" class="form-input" placeholder="RADIUS username" />
-            </div>
-            <div>
-              <label class="form-label">Amount <span class="text-red-500">*</span></label>
-              <input v-model.number="form.amount" type="number" step="0.01" min="0.01" class="form-input" required />
-            </div>
-          </div>
-          <div class="grid grid-cols-2 gap-3">
-            <div>
-              <label class="form-label">Currency</label>
-              <input v-model="form.currency" type="text" class="form-input" placeholder="USD" />
-            </div>
-            <div>
-              <label class="form-label">Payment Method</label>
-              <select v-model="form.payment_method" class="form-input">
-                <option value="cash">Cash</option>
-                <option value="bank_transfer">Bank Transfer</option>
-                <option value="mobile_money">Mobile Money</option>
-                <option value="card">Card</option>
-                <option value="online">Online</option>
-              </select>
-            </div>
-          </div>
-          <div>
-            <label class="form-label">Gateway Reference</label>
-            <input v-model="form.gateway_ref" type="text" class="form-input" placeholder="Transaction ID, MPESA ref, etc." />
-          </div>
-          <div>
-            <label class="form-label">Notes</label>
-            <input v-model="form.notes" type="text" class="form-input" placeholder="Optional note" />
-          </div>
-          <div v-if="lastReceipt" class="p-3 bg-green-50 rounded-xl text-sm text-green-700 flex items-center justify-between">
-            <span>Receipt: <strong>{{ lastReceipt }}</strong></span>
-            <a :href="`/api/v1/payments/${lastPaymentId}/receipt`" target="_blank"
-              class="text-xs px-3 py-1 bg-green-600 text-white rounded-lg">View</a>
-          </div>
-          <div class="flex justify-end gap-3 pt-2">
-            <button type="button" @click="showModal = false" class="btn-secondary">Close</button>
-            <button type="submit" class="btn-primary" :disabled="saving">
-              <span v-if="saving" class="w-4 h-4 border-2 border-white/30 border-t-white rounded-full spinner"></span>
-              Record & Generate Receipt
-            </button>
-          </div>
-        </form>
+      <div class="table-container rounded-none border-0">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Receipt</th>
+              <th>Customer</th>
+              <th>Invoice</th>
+              <th>Amount</th>
+              <th>Method</th>
+              <th>Status</th>
+              <th>Date</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="loading"><td colspan="8" class="text-center py-8 text-gray-400">Loading…</td></tr>
+            <tr v-else-if="!payments.length"><td colspan="8" class="text-center py-8 text-gray-400">No payments found</td></tr>
+            <tr v-for="p in payments" :key="p.id" :class="{ 'opacity-60': p.status === 'reversed' }">
+              <td><span class="font-mono text-xs">{{ p.receipt_number }}</span></td>
+              <td class="text-sm font-medium">{{ p.username || '—' }}</td>
+              <td class="text-xs text-gray-500">{{ p.invoice_number || '—' }}</td>
+              <td class="whitespace-nowrap">
+                <span class="font-bold" :class="p.status === 'reversed' ? 'line-through text-gray-500' : 'text-green-600'">{{ money(p.amount, p.currency) }}</span>
+                <span v-if="p.gateway_ref" class="block text-xs text-gray-400 font-mono">{{ p.gateway_ref }}</span>
+              </td>
+              <td>
+                <span class="badge badge-blue text-xs capitalize">{{ p.payment_method?.replace('_',' ') }}</span>
+              </td>
+              <td>
+                <span class="badge" :class="p.status === 'reversed' ? 'badge-red' : 'badge-green'">{{ p.status }}</span>
+                <span v-if="p.reversal_reason" class="block text-xs text-gray-400" :title="p.reversal_reason">{{ p.reversal_reason }}</span>
+              </td>
+              <td class="text-xs text-gray-400">{{ formatDate(p.created_at) }}</td>
+              <td>
+                <div class="flex gap-1">
+                  <button @click="viewReceipt(p)" class="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600" title="View receipt">
+                    <ReceiptPercentIcon class="w-4 h-4" />
+                  </button>
+                  <button v-if="authStore.isSuperAdmin && p.status === 'confirmed'" @click="reverse(p)"
+                    class="p-1.5 rounded hover:bg-red-50 text-gray-400 hover:text-red-500" title="Reverse payment">
+                    <ArrowUturnLeftIcon class="w-4 h-4" />
+                  </button>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </div>
+
+    <div class="flex items-center justify-between text-sm text-gray-500">
+      <span>{{ total }} payments</span>
+      <div class="flex gap-2">
+        <button @click="page--; load()" :disabled="page <= 1" class="btn-secondary px-3 py-1 text-xs">Prev</button>
+        <span class="px-2 py-1">Page {{ page }}</span>
+        <button @click="page++; load()" :disabled="page * 20 >= total" class="btn-secondary px-3 py-1 text-xs">Next</button>
+      </div>
+    </div>
+
+    <RecordPaymentModal v-if="showModal" @close="showModal = false" @saved="load" />
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
-import { paymentsAPI } from '@/api'
+import { paymentsAPI, openReceipt } from '@/api'
 import { format, parseISO } from 'date-fns'
-import { PlusIcon, XMarkIcon, TrashIcon, CurrencyDollarIcon, BanknotesIcon, ReceiptPercentIcon } from '@heroicons/vue/24/outline'
+import { PlusIcon, CurrencyDollarIcon, BanknotesIcon, ReceiptPercentIcon, ArrowUturnLeftIcon } from '@heroicons/vue/24/outline'
+import RecordPaymentModal from '@/components/billing/RecordPaymentModal.vue'
+import { money, formatTotals, apiError } from '@/utils/money'
 
 const toast = useToast()
 const authStore = useAuthStore()
 const loading = ref(false)
-const saving = ref(false)
 const showModal = ref(false)
 const payments = ref([])
-const summary = ref({})
+const total = ref(0)
+const totals = ref([])
+const page = ref(1)
+const summary = ref(null)
 const filterUsername = ref('')
 const filterMethod = ref('')
-const lastReceipt = ref('')
-const lastPaymentId = ref(null)
+const filterStatus = ref('')
 let debounceTimer
 
-// This form has no invoice field, so a payment recorded here is never linked to an invoice
-// (the API supports invoice_id, which would also mark that invoice paid). Totals in the
-// summary cards are shown with a fixed "$" regardless of each payment's currency.
-const form = reactive({ username: '', amount: '', currency: 'USD', payment_method: 'cash', gateway_ref: '', notes: '' })
-
 function formatDate(d) { try { return format(parseISO(d), 'MMM d, yyyy HH:mm') } catch { return d } }
+const countOf = (list) => (list || []).reduce((n, t) => n + (t.count || 0), 0)
 
 async function load() {
   loading.value = true
   try {
-    const [r1, r2] = await Promise.all([
-      paymentsAPI.list({ username: filterUsername.value, method: filterMethod.value }),
-      paymentsAPI.summary()
-    ])
-    payments.value = r1.data.data || []
-    summary.value = r2.data
-  } catch { } finally { loading.value = false }
+    const { data } = await paymentsAPI.list({
+      page: page.value, username: filterUsername.value, method: filterMethod.value, status: filterStatus.value,
+    })
+    payments.value = data.data || []
+    total.value = data.total || 0
+    totals.value = data.totals || []
+  } catch (err) {
+    toast.error(apiError(err, 'Failed to load payments'))
+  } finally { loading.value = false }
+  // The revenue summary is for admins only; operators just do not see the cards.
+  if (authStore.isAdmin) {
+    try { summary.value = (await paymentsAPI.summary()).data } catch { summary.value = null }
+  }
 }
 
 function debouncedLoad() {
   clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(load, 300)
+  debounceTimer = setTimeout(() => { page.value = 1; load() }, 300)
 }
 
-function openCreate() {
-  Object.assign(form, { username: '', amount: '', currency: 'USD', payment_method: 'cash', gateway_ref: '', notes: '' })
-  lastReceipt.value = ''
-  lastPaymentId.value = null
-  showModal.value = true
+async function viewReceipt(p) {
+  try { await openReceipt(p.id) } catch (err) { toast.error(apiError(err, 'Could not load receipt')) }
 }
 
-async function save() {
-  saving.value = true
+async function reverse(p) {
+  const reason = prompt(
+    `Reverse payment ${p.receipt_number} (${money(p.amount, p.currency)})?\n` +
+    'Its invoice re-opens and any plan days it paid for are taken back.\n\nReason:')
+  if (reason === null) return
   try {
-    const { data } = await paymentsAPI.create(form)
-    lastReceipt.value = data.receipt_number
-    lastPaymentId.value = data.id
-    toast.success(`Payment recorded — Receipt: ${data.receipt_number}`)
-    Object.assign(form, { username: '', amount: '', currency: 'USD', payment_method: 'cash', gateway_ref: '', notes: '' })
+    const { data } = await paymentsAPI.reverse(p.id, reason)
+    toast.success(data.message || 'Payment reversed')
     load()
-  } catch (err) { toast.error(err.response?.data?.error || 'Failed') }
-  finally { saving.value = false }
-}
-
-async function deletePayment(p) {
-  if (!confirm(`Delete payment ${p.receipt_number}?`)) return
-  try { await paymentsAPI.delete(p.id); toast.success('Deleted'); load() }
-  catch { toast.error('Failed') }
+  } catch (err) { toast.error(apiError(err, 'Failed to reverse payment')) }
 }
 
 onMounted(load)

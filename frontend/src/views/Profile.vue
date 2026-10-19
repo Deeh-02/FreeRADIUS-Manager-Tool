@@ -7,6 +7,10 @@
       </div>
     </div>
 
+    <div v-if="mfaForced && !profile.mfa_enabled" class="p-4 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800">
+      Two-factor authentication is required on this system. Set it up below to continue.
+    </div>
+
     <div v-if="loading" class="h-48 flex items-center justify-center">
       <span class="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full spinner"></span>
     </div>
@@ -85,7 +89,7 @@
         </div>
 
         <ul class="text-xs text-gray-500 space-y-1 bg-gray-50 rounded-lg p-3">
-          <li :class="ruleClass(passwordRules.minLength)">At least 12 characters</li>
+          <li :class="ruleClass(passwordRules.minLength)">At least 12 characters (or the minimum set on the Settings page)</li>
           <li :class="ruleClass(passwordRules.upper)">One uppercase letter</li>
           <li :class="ruleClass(passwordRules.lower)">One lowercase letter</li>
           <li :class="ruleClass(passwordRules.digit)">One digit</li>
@@ -101,18 +105,45 @@
         </div>
       </div>
 
-      <!-- MFA status (read-only info) -->
+      <!-- Two-factor authentication -->
       <div v-if="profile.mfa_enabled" class="card flex items-center gap-3 text-sm text-green-700 bg-green-50 border border-green-100">
         <ShieldCheckIcon class="w-5 h-5 flex-shrink-0" />
-        Two-factor authentication is enabled on your account.
+        Two-factor authentication is enabled on your account. To move it to a new phone, ask a super admin to reset it.
+      </div>
+      <div v-else class="card space-y-4">
+        <h3 class="font-semibold text-gray-900 flex items-center gap-2">
+          <ShieldCheckIcon class="w-5 h-5 text-blue-600" />
+          Two-Factor Authentication
+        </h3>
+        <p class="text-sm text-gray-600">
+          Use an authenticator app (Google Authenticator, Microsoft Authenticator, Authy…). After this, signing in asks for the
+          6-digit code from the app.
+        </p>
+        <button v-if="!mfa.secret" @click="startMFA" class="btn-primary" :disabled="mfa.busy">Set up two-factor authentication</button>
+        <template v-else>
+          <ol class="text-sm text-gray-700 space-y-2 list-decimal list-inside">
+            <li>In the app, choose <em>Add account → Enter a setup key</em> and enter:
+              <div class="mt-1 flex items-center gap-2">
+                <code class="font-mono text-base tracking-wider bg-gray-100 rounded px-2 py-1 select-all break-all">{{ mfa.secret }}</code>
+                <button type="button" class="text-xs text-blue-600 hover:underline" @click="copySecret">Copy</button>
+              </div>
+              <p class="text-xs text-gray-500 mt-1">Type: time-based. On a phone you can also <a :href="mfa.otpauth" class="text-blue-600 underline">open it in the app</a>.</p>
+            </li>
+            <li>Enter the 6-digit code the app shows:</li>
+          </ol>
+          <div class="flex gap-2">
+            <input v-model.trim="mfa.code" inputmode="numeric" maxlength="6" class="form-input w-36 font-mono tracking-widest" placeholder="123456" @keyup.enter="verifyMFA" />
+            <button @click="verifyMFA" class="btn-primary" :disabled="mfa.busy || mfa.code.length !== 6">Verify and enable</button>
+          </div>
+        </template>
       </div>
     </template>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, reactive, computed, onMounted } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { useToast } from 'vue-toastification'
 import {
   UserCircleIcon, LockClosedIcon, CheckIcon, KeyIcon, ShieldCheckIcon,
@@ -122,7 +153,10 @@ import { useAuthStore } from '@/store/auth'
 
 const toast = useToast()
 const router = useRouter()
+const route = useRoute()
 const authStore = useAuthStore()
+const mfaForced = computed(() => route.query.mfa === 'required')
+const mfa = reactive({ secret: '', otpauth: '', code: '', busy: false })
 
 const loading = ref(true)
 const savingProfile = ref(false)
@@ -228,6 +262,37 @@ async function changePassword() {
     toast.error(err.response?.data?.error || 'Failed to change password')
   }
   savingPassword.value = false
+}
+
+async function startMFA() {
+  mfa.busy = true
+  try {
+    const { data } = await authAPI.setupMFA()
+    mfa.secret = data.secret
+    mfa.otpauth = data.otpauth
+  } catch (err) {
+    toast.error(err.response?.data?.error || 'Could not start MFA setup')
+  }
+  mfa.busy = false
+}
+
+async function verifyMFA() {
+  mfa.busy = true
+  try {
+    await authAPI.verifyMFA(mfa.code)
+    toast.success('Two-factor authentication enabled')
+    Object.assign(mfa, { secret: '', otpauth: '', code: '' })
+    await loadProfile()
+    if (authStore.user) authStore.setUser({ ...authStore.user, mfa_enabled: true })
+    if (mfaForced.value) router.push('/')
+  } catch (err) {
+    toast.error(err.response?.data?.error || 'Code not accepted; check the phone clock and try again')
+  }
+  mfa.busy = false
+}
+
+function copySecret() {
+  navigator.clipboard?.writeText(mfa.secret).then(() => toast.info('Copied'), () => {})
 }
 
 onMounted(loadProfile)

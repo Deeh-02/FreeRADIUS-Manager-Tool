@@ -38,8 +38,9 @@
               </select>
             </div>
             <div>
-              <label class="form-label">Port</label>
-              <input v-model.number="form.ports" type="number" class="form-input" placeholder="1812" />
+              <label class="form-label">Disconnect (CoA) port</label>
+              <input v-model.number="form.coa_port" type="number" min="1" max="65535" class="form-input" placeholder="3799" />
+              <p class="text-xs text-gray-500 mt-1">Where the router accepts Disconnect requests (MikroTik: /radius incoming, port 3799).</p>
             </div>
           </div>
 
@@ -63,7 +64,7 @@
                 </button>
               </div>
             </div>
-            <p class="text-xs text-gray-500 mt-1">Minimum 8 characters. Use 32+ for production.</p>
+            <p class="text-xs text-gray-500 mt-1">Minimum 8 characters; use the generator (32 random characters). Enter the same secret on the router.</p>
           </div>
 
           <div>
@@ -112,7 +113,7 @@ const showSecret = ref(false)
 const error = ref('')
 
 const form = ref({
-  nasname: '', shortname: '', type: 'other', ports: null, secret: '',
+  nasname: '', shortname: '', type: 'other', ports: null, coa_port: 3799, secret: '',
   server: '', community: '', description: '', status: 'active',
 })
 
@@ -120,11 +121,19 @@ watch(() => props.device, (d) => {
   if (d) Object.assign(form.value, { ...form.value, ...d, secret: '' })
 }, { immediate: true })
 
-// Math.random is not a cryptographic generator, so secrets made by this button are
-// weaker than ones from `openssl rand`; use a proper generator for production devices.
+// 32 characters from the browser's cryptographic generator. Letters and digits only: some
+// routers mishandle symbols in RADIUS secrets. Rejection sampling avoids modulo bias.
 function generateSecret() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*'
-  form.value.secret = Array.from({ length: 32 }, () => chars[Math.floor(Math.random() * chars.length)]).join('')
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+  const out = []
+  const buf = new Uint8Array(64)
+  while (out.length < 32) {
+    crypto.getRandomValues(buf)
+    for (const b of buf) {
+      if (b < 248 && out.length < 32) out.push(chars[b % 62])
+    }
+  }
+  form.value.secret = out.join('')
   showSecret.value = true
 }
 

@@ -28,7 +28,7 @@
           {{ smtpConfigured ? 'SMTP configured — email alerts enabled' : 'SMTP not configured — email alerts disabled' }}
         </p>
         <p class="text-xs mt-0.5" :class="smtpConfigured ? 'text-green-600' : 'text-yellow-600'">
-          {{ smtpConfigured ? `Sending from: ${smtpFrom}` : 'Go to Settings → add SMTP_HOST, SMTP_USER, SMTP_PASS environment variables' }}
+          {{ smtpConfigured ? `Sending from: ${smtpFrom}` : 'Set SMTP_HOST, SMTP_USER, SMTP_PASS (and SMTP_FROM) in .env and restart the backend' }}
         </p>
       </div>
     </div>
@@ -86,19 +86,22 @@
           </div>
           <div v-if="!editing">
             <label class="form-label">Event Type <span class="text-red-500">*</span></label>
-            <!-- The backend (handlers/alerts.go checkAlerts) only evaluates data_limit_100pct,
-                 account_expiry_3d, account_expiry_7d and nas_down. The other options below
-                 (data_limit_80pct, login_failure, new_user) can be saved but never fire. -->
             <select v-model="form.event_type" class="form-input" required>
               <option value="">Select event…</option>
-              <option value="data_limit_80pct">Data at 80% of limit</option>
-              <option value="data_limit_100pct">Data limit reached</option>
-              <option value="account_expiry_3d">Account expiring in 3 days</option>
-              <option value="account_expiry_7d">Account expiring in 7 days</option>
-              <option value="login_failure">Repeated login failures</option>
-              <option value="nas_down">NAS device down</option>
-              <option value="new_user">New user created</option>
+              <option v-for="(desc, key) in events" :key="key" :value="key">{{ eventLabel(key) }} — {{ desc }}</option>
             </select>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="form-label">Threshold</label>
+              <input v-model.number="form.threshold" type="number" min="0" class="form-input" placeholder="default" />
+              <p class="text-xs text-gray-400 mt-1">Minimum count before it fires (e.g. failed logins). 0 = default.</p>
+            </div>
+            <div>
+              <label class="form-label">Cooldown (minutes)</label>
+              <input v-model.number="form.cooldown_minutes" type="number" min="0" class="form-input" />
+              <p class="text-xs text-gray-400 mt-1">Quiet time after an alert, so one problem is not emailed every 5 minutes.</p>
+            </div>
           </div>
           <div>
             <label class="form-label">Notify Email Address</label>
@@ -165,14 +168,21 @@ const testEmail = ref('')
 const editing = ref(null)
 const rules = ref([])
 
-const smtpConfigured = computed(() => {
-  // Detect based on whether alert send would work — use a simple env indicator
-  // Backend will return error if SMTP not set, we check on test email
-  return rules.value.some(r => r.is_active)
-})
-const smtpFrom = ref(import.meta.env.VITE_SMTP_FROM || 'configured in .env')
+// Reported by the API (SMTP_HOST set in .env).
+const smtpConfigured = computed(() => !!smtpFromServer.value)
+const smtpFrom = ref('')
+const smtpFromServer = ref(null)
+const events = ref({})
+const eventLabels = {
+  data_limit_80pct: 'Data at 80% of cap', data_limit_100pct: 'Data cap reached',
+  account_expiry_3d: 'Expiring in 3 days', account_expiry_7d: 'Expiring in 7 days',
+  login_failure: 'Login failures', nas_down: 'Router (NAS) down', new_user: 'New customers',
+  invoice_overdue: 'Overdue invoices', backup_failed: 'Backup failed',
+}
+const eventLabel = (k) => eventLabels[k] || k
 
-const form = reactive({ name: '', event_type: '', notify_email: true, email_address: '', is_active: true })
+const blank = () => ({ name: '', event_type: '', notify_email: true, email_address: '', is_active: true, threshold: 0, cooldown_minutes: 360 })
+const form = reactive(blank())
 
 function eventColor(t) {
   const map = {
@@ -197,18 +207,22 @@ async function load() {
   try {
     const { data } = await alertsAPI.list()
     rules.value = data.data || []
+    events.value = data.events || {}
+    smtpFromServer.value = !!data.smtp_configured
+    smtpFrom.value = data.smtp_from || 'SMTP_FROM'
   } catch { /* silent */ } finally { loading.value = false }
 }
 
 function openCreate() {
   editing.value = null
-  Object.assign(form, { name: '', event_type: '', notify_email: true, email_address: '', is_active: true })
+  Object.assign(form, blank())
   showModal.value = true
 }
 
 function openEdit(r) {
   editing.value = r.id
-  Object.assign(form, { name: r.name, event_type: r.event_type, notify_email: r.notify_email, email_address: r.email_address || '', is_active: r.is_active })
+  Object.assign(form, { name: r.name, event_type: r.event_type, notify_email: r.notify_email, email_address: r.email_address || '',
+    is_active: r.is_active, threshold: r.threshold || 0, cooldown_minutes: r.cooldown_minutes ?? 360 })
   showModal.value = true
 }
 

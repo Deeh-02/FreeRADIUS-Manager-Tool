@@ -37,7 +37,7 @@
             </div>
             <div>
               <label class="label">Shared Secret</label>
-              <input v-model="form.secret" class="input w-full" placeholder="testing123 (from env if empty)" />
+              <input v-model="form.secret" class="input w-full" placeholder="RADIUS_SECRET from .env if empty" />
             </div>
             <div>
               <label class="label">Called-Station-Id</label>

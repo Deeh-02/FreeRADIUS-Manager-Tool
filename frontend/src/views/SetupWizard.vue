@@ -66,6 +66,13 @@
                 You will set up your organisation details, create the primary administrator account,
                 and configure your RADIUS and security policies. It only takes a few minutes.
               </p>
+              <div v-if="tokenRequired" class="text-left mb-6">
+                <label class="block text-sm font-medium text-slate-300 mb-1.5">Setup token <span class="text-red-400">*</span></label>
+                <input v-model.trim="form.setup_token" type="text" autocomplete="off" @blur="touch('setup_token')"
+                  class="w-full bg-slate-800 border rounded-xl px-4 py-3 text-white placeholder-slate-500 font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 transition"
+                  :class="errors['setup_token'] ? 'border-red-500' : 'border-slate-700'" placeholder="Printed by setup.sh (SETUP_TOKEN in .env)" />
+                <p v-if="errors['setup_token']" class="mt-1 text-xs text-red-400">{{ errors['setup_token'] }}</p>
+              </div>
               <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center mb-8">
                 <div v-for="item in ['Organisation', 'Admin Account', 'RADIUS Config', 'Security']" :key="item"
                   class="bg-slate-800/60 rounded-xl p-3 border border-slate-700/50">
@@ -136,7 +143,7 @@
                   <label class="block text-sm font-medium text-slate-300 mb-1.5">Password <span class="text-red-400">*</span></label>
                   <div class="relative">
                     <input v-model="form.admin.password" :type="showPass ? 'text' : 'password'"
-                      placeholder="Min. 8 characters" @blur="touch('admin.password')"
+                      :placeholder="`Min. ${minLen} characters`" @blur="touch('admin.password')"
                       class="w-full bg-slate-800 border rounded-xl px-4 py-3 pr-11 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 transition"
                       :class="errors['admin.password'] ? 'border-red-500' : 'border-slate-700'" />
                     <button type="button" @click="showPass = !showPass"
@@ -156,6 +163,7 @@
                       :class="passwordStrength >= n ? strengthColor : 'bg-slate-700'" />
                   </div>
                   <p class="mt-1 text-xs" :class="strengthTextColor">{{ strengthLabel }}</p>
+                  <p class="mt-1 text-xs text-slate-500">At least {{ minLen }} characters with upper and lower case, a number and a symbol.</p>
                   <p v-if="errors['admin.password']" class="mt-1 text-xs text-red-400">{{ errors['admin.password'] }}</p>
                 </div>
                 <div>
@@ -178,27 +186,13 @@
               <svg class="w-5 h-5 text-blue-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
-              <p class="text-blue-300 text-sm">The RADIUS shared secret must also be set in your <code class="text-blue-200 bg-slate-800 px-1 rounded">RADIUS_SECRET</code> environment variable and in your NAS device configurations to take effect.</p>
+              <p class="text-blue-300 text-sm">
+                Routers authenticate with a shared secret. After setup, add each router on the
+                <strong>NAS Devices</strong> page with its own secret. Routers not listed there use the fallback
+                <code class="text-blue-200 bg-slate-800 px-1 rounded">RADIUS_SECRET</code> from <code class="text-blue-200 bg-slate-800 px-1 rounded">.env</code>.
+              </p>
             </div>
             <div class="space-y-5">
-              <div>
-                <label class="block text-sm font-medium text-slate-300 mb-1.5">Default RADIUS Shared Secret</label>
-                <div class="relative">
-                  <input v-model="form.radius.default_secret" :type="showSecret ? 'text' : 'password'"
-                    placeholder="Enter RADIUS shared secret"
-                    class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 pr-11 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 transition" />
-                  <button type="button" @click="showSecret = !showSecret"
-                    class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200">
-                    <svg v-if="showSecret" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
-                    </svg>
-                    <svg v-else class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                    </svg>
-                  </button>
-                </div>
-              </div>
               <div>
                 <label class="block text-sm font-medium text-slate-300 mb-1.5">
                   Maximum Devices per User
@@ -209,7 +203,7 @@
               </div>
               <div>
                 <label class="block text-sm font-medium text-slate-300 mb-1.5">
-                  Session Timeout
+                  Staff Session Idle Timeout
                   <span class="text-slate-500 font-normal ml-1">(seconds, default: 3600 = 1 hour)</span>
                 </label>
                 <input v-model.number="form.security.session_timeout" type="number" min="300" max="86400"
@@ -230,10 +224,10 @@
                     class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition" />
                 </div>
                 <div>
-                  <label class="block text-sm font-medium text-slate-300 mb-1.5">Password Expiry (days)</label>
-                  <input v-model.number="form.security.password_expiry_days" type="number" min="0" max="365"
+                  <label class="block text-sm font-medium text-slate-300 mb-1.5">Customer Password Expiry (days)</label>
+                  <input v-model.number="form.security.password_expiry_days" type="number" min="1" max="3650"
                     class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-blue-500 transition" />
-                  <p class="mt-1 text-xs text-slate-500">Set to 0 to disable expiry.</p>
+                  <p class="mt-1 text-xs text-slate-500">Stamped on new customer accounts; not enforced at login.</p>
                 </div>
               </div>
               <div>
@@ -283,7 +277,7 @@
                   <p class="text-xs text-slate-500 uppercase tracking-wider mb-3">Security Policies</p>
                   <div class="grid grid-cols-2 gap-2 text-sm">
                     <span class="text-slate-400">Min Password Length</span><span class="text-white">{{ form.security.password_min_length }} chars</span>
-                    <span class="text-slate-400">Password Expiry</span><span class="text-white">{{ form.security.password_expiry_days === 0 ? 'Never' : form.security.password_expiry_days + ' days' }}</span>
+                    <span class="text-slate-400">Password Expiry</span><span class="text-white">{{ form.security.password_expiry_days }} days</span>
                     <span class="text-slate-400">Session Timeout</span><span class="text-white">{{ form.security.session_timeout }}s</span>
                     <span class="text-slate-400">MFA Required</span>
                     <span :class="form.security.mfa_required ? 'text-green-400' : 'text-slate-400'">
@@ -319,7 +313,7 @@
                 </div>
                 <div class="flex justify-between text-sm">
                   <span class="text-slate-400">URL</span>
-                  <span class="text-blue-400 font-mono">http://localhost:8081</span>
+                  <span class="text-blue-400 font-mono">{{ origin }}</span>
                 </div>
               </div>
             </div>
@@ -369,7 +363,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { setupAPI } from '@/api/index'
 import { markSetupComplete } from '@/router'
@@ -388,14 +382,24 @@ const steps = [
 const currentStep = ref(0)
 const transitionName = ref('slide-left')
 const showPass = ref(false)
-const showSecret = ref(false)
 const submitting = ref(false)
 const submitError = ref('')
 const completed = ref(false)
 const redirectCountdown = ref(3)
+const tokenRequired = ref(false)
+const origin = window.location.origin
 let countdownTimer = null
 
+onMounted(async () => {
+  try {
+    const { data } = await setupAPI.status()
+    tokenRequired.value = !!data.token_required
+    if (data.password_min > form.security.password_min_length) form.security.password_min_length = data.password_min
+  } catch { /* the form still works; the server re-checks everything */ }
+})
+
 const form = reactive({
+  setup_token: '',
   org: {
     name: '',
     logo_text: '',
@@ -409,7 +413,6 @@ const form = reactive({
     confirm: '',
   },
   radius: {
-    default_secret: '',
     max_devices: 20,
   },
   security: {
@@ -423,6 +426,13 @@ const form = reactive({
 
 const errors = reactive({})
 
+// Re-check fields that show an error while the user types, so the message goes away before
+// they click Next. (Clearing it on blur moved the button under the cursor mid-click.)
+const fieldValue = (f) => f.split('.').reduce((o, k) => o?.[k], form)
+watch(form, () => {
+  Object.keys(errors).forEach((f) => { if (fieldValue(f) !== undefined) validateField(f) })
+}, { deep: true })
+
 const touched = reactive({})
 function touch(field) {
   touched[field] = true
@@ -431,6 +441,9 @@ function touch(field) {
 
 function validateField(field) {
   delete errors[field]
+  if (field === 'setup_token' && tokenRequired.value && !form.setup_token) {
+    errors['setup_token'] = 'The setup token is required'
+  }
   if (field === 'org.name' && !form.org.name.trim()) {
     errors['org.name'] = 'Organisation name is required'
   }
@@ -446,8 +459,8 @@ function validateField(field) {
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.admin.email)) errors['admin.email'] = 'Invalid email address'
   }
   if (field === 'admin.password') {
-    if (!form.admin.password) errors['admin.password'] = 'Password is required'
-    else if (form.admin.password.length < 8) errors['admin.password'] = 'Minimum 8 characters'
+    const msg = passwordProblem(form.admin.password)
+    if (msg) errors['admin.password'] = msg
   }
   if (field === 'admin.confirm') {
     if (form.admin.confirm !== form.admin.password) errors['admin.confirm'] = 'Passwords do not match'
@@ -456,6 +469,7 @@ function validateField(field) {
 
 function validateStep(step) {
   const fields = {
+    0: ['setup_token'],
     1: ['org.name'],
     2: ['admin.username', 'admin.full_name', 'admin.email', 'admin.password', 'admin.confirm'],
   }
@@ -478,6 +492,19 @@ function stepCircleClass(i) {
   if (i < currentStep.value) return 'bg-blue-600 text-white'
   if (i === currentStep.value) return 'bg-blue-500 text-white ring-4 ring-blue-500/30'
   return 'bg-slate-800 text-slate-500 border border-slate-700'
+}
+
+// Same rules as the server (auth.ValidatePasswordWithMin), checked here so the wizard does
+// not fail only at the last step. The minimum is the one chosen on the Security step.
+const minLen = computed(() => Math.max(8, form.security.password_min_length || 12))
+function passwordProblem(p) {
+  if (!p) return 'Password is required'
+  if ([...p].length < minLen.value) return `Minimum ${minLen.value} characters`
+  if (!/[A-Z]/.test(p)) return 'Add an upper-case letter'
+  if (!/[a-z]/.test(p)) return 'Add a lower-case letter'
+  if (!/[0-9]/.test(p)) return 'Add a number'
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(p)) return 'Add a symbol, e.g. ! @ # $'
+  return ''
 }
 
 // Password strength
@@ -506,9 +533,16 @@ const strengthLabel = computed(() => {
 
 async function submitSetup() {
   submitError.value = ''
+  // The minimum length may have been raised on the Security step after the password was set.
+  const pwMsg = passwordProblem(form.admin.password)
+  if (pwMsg) {
+    submitError.value = `Admin password: ${pwMsg}. Go back to the Admin step to change it.`
+    return
+  }
   submitting.value = true
   try {
     await setupAPI.complete({
+      setup_token: form.setup_token,
       organization: {
         name: form.org.name,
         timezone: form.org.timezone,
@@ -521,7 +555,6 @@ async function submitSetup() {
         password: form.admin.password,
       },
       radius: {
-        default_secret: form.radius.default_secret,
         max_devices: form.radius.max_devices,
       },
       security: {

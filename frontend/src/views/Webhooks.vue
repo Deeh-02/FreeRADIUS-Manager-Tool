@@ -166,7 +166,8 @@ const hooks = ref([])
 const logs = ref([])
 const form = reactive({ name: '', url: '', secret: '', events: [], is_active: true })
 
-const availableEvents = ['user.created', 'user.suspended', 'user.expired', 'session.started', 'session.stopped', 'invoice.paid', 'ticket.created', 'nas.down', 'test']
+// Filled from the API so the list always matches what the server sends.
+const availableEvents = ref(['user.created', 'user.suspended', 'user.expired', 'invoice.created', 'invoice.paid', 'payment.received', 'payment.reversed', 'ticket.created', 'nas.down', 'nas.up', 'test'])
 
 function formatDate(d) {
   try { return format(parseISO(d), 'MMM d HH:mm') } catch { return d }
@@ -180,7 +181,11 @@ function toggleEvent(e) {
 
 async function load() {
   loading.value = true
-  try { const { data } = await webhooksAPI.list(); hooks.value = data.data || [] }
+  try {
+    const { data } = await webhooksAPI.list()
+    hooks.value = data.data || []
+    if (data.events?.length) availableEvents.value = data.events
+  }
   catch { } finally { loading.value = false }
 }
 
