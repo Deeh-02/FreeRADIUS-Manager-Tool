@@ -4,19 +4,12 @@
 -- ============================================================
 --
 -- READ THIS FIRST
---  * Not re-runnable: the CREATE TRIGGER statements have no IF NOT EXISTS, so a second run
---    errors (and stops, under ON_ERROR_STOP). Docker runs it once, on an empty data volume (docker-compose.yml);
---    run-local.sh only runs it when app_users does not exist.
---  * Incomplete for the application: the Go handlers also use these tables, which no SQL file
---    in this repo creates: alert_rules, api_keys, bulk_operations, captive_portals,
---    cred_stuffing_blocks, customers, geoip_cache, geoip_rules, honeypot_logs, hotspot_zones,
---    ip_pool_assignments, ip_pools, organizations, portal_sessions, radius_templates,
---    security_alerts, sms_logs, tickets, webhook_logs, webhooks.
---    They also use columns missing here: nas.ping_status / ping_latency_ms / last_ping /
---    zone_id / org_id, radius_users.org_id and app_users.org_id. Those features need
---    their schema added before they can work on a fresh database.
---  * Billing tables (user_plans, invoices, payments, promotions, scheduled_tasks) live in
---    migrations/009_billing.sql, applied after this file.
+--  * Re-runnable: every statement is IF NOT EXISTS / ON CONFLICT DO NOTHING, and triggers are
+--    dropped before being recreated. Docker runs it once, on an empty data volume
+--    (docker-compose.yml); run-local.sh and deploy-update.sh may run it again safely.
+--  * Base schema only. The rest is in migrations/, applied in file-name order after this file:
+--    009_billing.sql (plans, invoices, payments, promotions, scheduler) and
+--    010_missing_schema.sql (CRM, security, webhooks, IP pools, portal sessions, quotas...).
 
 -- Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
@@ -63,8 +56,10 @@ CREATE TABLE IF NOT EXISTS radius_users (
 );
 
 -- radius_users.password is a bcrypt hash used by the self-service portal and password
--- history only. status / account_expiry / password_expiry / force_password_change are
--- application state: FreeRADIUS does not read them (see the FreeRADIUS section below).
+-- history only. FreeRADIUS does not read this table: the API copies status (Auth-Type
+-- Reject), account_expiry (Expiration) and device_limit (Simultaneous-Use) into radcheck
+-- (handlers/access.go). password_expiry / force_password_change are not enforced on the
+-- network.
 -- Password history to prevent reuse
 CREATE TABLE IF NOT EXISTS radius_user_password_history (
     id           SERIAL PRIMARY KEY,
@@ -80,7 +75,7 @@ CREATE TABLE IF NOT EXISTS radius_user_password_history (
 -- authenticates someone: see freeradius/mods-config/sql/main/postgresql/queries.conf.
 -- radius_users / user_plans / invoices are application tables that FreeRADIUS never sees; the
 -- app copies what matters into radcheck/radreply (password, Simultaneous-Use, Auth-Type
--- Reject, rate limits). Anything not copied there is not enforced on the network.
+-- Reject, Expiration, Max-Octets, rate limits). Anything not copied there is not enforced.
 -- radcheck.value holds Cleartext-Password in plain text because PAP/CHAP/MS-CHAP need it.
 CREATE TABLE IF NOT EXISTS radcheck (
     id        SERIAL PRIMARY KEY,
@@ -99,9 +94,8 @@ CREATE TABLE IF NOT EXISTS radreply (
     value     VARCHAR(253) NOT NULL DEFAULT ''
 );
 -- NOTE: unlike radcheck above, this index is NOT unique (matches the stock FreeRADIUS
--- schema, which allows several reply rows per attribute). Application code that does
--- INSERT INTO radreply ... ON CONFLICT (username, attribute) therefore has no constraint to
--- match and errors (see AssignIP, ApplyTemplate, bulk apply_template).
+-- schema, which allows several reply rows per attribute), so the API replaces reply rows
+-- with DELETE + INSERT rather than ON CONFLICT (handlers/access.go setReply).
 CREATE INDEX IF NOT EXISTS radreply_username ON radreply (username, attribute);
 
 CREATE TABLE IF NOT EXISTS radgroupcheck (
@@ -262,14 +256,17 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS update_app_users_updated_at ON app_users;
 CREATE TRIGGER update_app_users_updated_at
     BEFORE UPDATE ON app_users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_radius_users_updated_at ON radius_users;
 CREATE TRIGGER update_radius_users_updated_at
     BEFORE UPDATE ON radius_users
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+DROP TRIGGER IF EXISTS update_nas_updated_at ON nas;
 CREATE TRIGGER update_nas_updated_at
     BEFORE UPDATE ON nas
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -280,10 +277,11 @@ CREATE TRIGGER update_nas_updated_at
 
 -- No default admin user — credentials are created via the Setup Wizard on first launch.
 
--- Default system settings. Most keys are informational only: the backend reads session
--- timeout, rate limit, lockout, password length, SMTP and backup settings from environment
--- variables, not from this table (backup_* is not used at all). Read back from here:
--- setup_complete, org_name, org_email, honeypot_enabled and the cs_* thresholds.
+-- Default system settings, editable on the Settings page. Keys read by the API (see
+-- handlers/settings.go): password_min_length, password_expiry_days, session_timeout,
+-- mfa_required, brute_force_attempts, brute_force_lockout, max_device_limit, org_*, and the
+-- billing/portal/backup keys added in migrations/010. smtp_*, rate_limit_per_min and
+-- backup_schedule are informational: SMTP and the rate limit come from environment variables.
 INSERT INTO system_settings (key, value, description) VALUES
     ('setup_complete',      'false',     'Whether the initial setup wizard has been completed'),
     ('org_name',            'My Organisation', 'Organisation display name'),
@@ -304,12 +302,8 @@ INSERT INTO system_settings (key, value, description) VALUES
     ('brute_force_lockout', '15',        'Lockout duration in minutes')
 ON CONFLICT (key) DO NOTHING;
 
--- Default NAS entry (localhost — for local/testing connections).
--- The secret is a well-known test value; change it (or delete this row) in production.
--- FreeRADIUS loads NAS clients from this table only at startup.
-INSERT INTO nas (nasname, shortname, type, secret, description)
-VALUES ('127.0.0.1', 'localhost', 'other', 'testing123', 'Local test NAS client (update secret to match RADIUS_SECRET)')
-ON CONFLICT (nasname) DO NOTHING;
+-- No default NAS row: 127.0.0.1 and the private/Docker ranges are already clients in
+-- freeradius/clients.conf with RADIUS_SECRET. Add each router on the NAS Devices page.
 
 -- ============================================================
 -- BANDWIDTH PROFILES  (Tier 1 Pro feature)
@@ -331,6 +325,7 @@ CREATE TABLE IF NOT EXISTS bandwidth_profiles (
 ALTER TABLE radius_users
     ADD COLUMN IF NOT EXISTS bandwidth_profile_id INTEGER REFERENCES bandwidth_profiles(id) ON DELETE SET NULL;
 
+DROP TRIGGER IF EXISTS update_bandwidth_profiles_updated_at ON bandwidth_profiles;
 CREATE TRIGGER update_bandwidth_profiles_updated_at
     BEFORE UPDATE ON bandwidth_profiles
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -366,6 +361,7 @@ CREATE INDEX IF NOT EXISTS vouchers_code    ON vouchers (code);
 CREATE INDEX IF NOT EXISTS vouchers_status  ON vouchers (status);
 CREATE INDEX IF NOT EXISTS vouchers_batch   ON vouchers (batch_name);
 
+DROP TRIGGER IF EXISTS update_vouchers_updated_at ON vouchers;
 CREATE TRIGGER update_vouchers_updated_at
     BEFORE UPDATE ON vouchers
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
