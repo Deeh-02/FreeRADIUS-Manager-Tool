@@ -1,12 +1,18 @@
 # Network Device Configuration Guide
 
-This guide explains how to configure various network devices to authenticate against your FreeRADIUS Manager.
+This is the short version. [DEVICE-INTEGRATION.md](DEVICE-INTEGRATION.md) has step-by-step
+guides for more devices, testing and troubleshooting.
 
 ## Prerequisites
 
 1. Note your server's IP address (where FreeRADIUS Manager is running)
-2. Get your RADIUS shared secret from the `.env` file (`RADIUS_SECRET`)
-3. Add the device in the web UI under **NAS Devices → Add Device**
+2. Add the device in the web UI under **NAS Devices → Add Device** with its **own** shared
+   secret (use the generate button), then run `docker compose restart freeradius`.
+   Unregistered devices on private addresses fall back to `RADIUS_SECRET` from `.env`.
+3. On every device, turn on **accounting with interim updates** (≈5 min) and allow
+   **Disconnect/CoA requests on UDP 3799** from the server. Without accounting, usage, data
+   caps and device limits do not work; without CoA, the Disconnect button and cutting off
+   unpaid customers do not work.
 
 ---
 
@@ -18,10 +24,15 @@ This guide explains how to configure various network devices to authenticate aga
 add address=YOUR_SERVER_IP secret=YOUR_SECRET service=hotspot
 
 /ip hotspot profile
-set hsprof1 use-radius=yes radius-accounting=yes
+set hsprof1 use-radius=yes radius-accounting=yes radius-interim-update=5m
+
+/radius incoming
+set accept=yes port=3799
 ```
 
 ### 802.1X WiFi (WPA-Enterprise)
+EAP/PEAP needs FreeRADIUS's EAP certificates; it is not yet tested with this system, so try it
+on a test SSID first.
 ```routeros
 /radius
 add address=YOUR_SERVER_IP secret=YOUR_SECRET service=wireless
@@ -39,7 +50,10 @@ set radius-auth mode=dynamic-keys eap-methods=peap
 add address=YOUR_SERVER_IP secret=YOUR_SECRET service=ppp
 
 /ppp aaa
-set use-radius=yes accounting=yes
+set use-radius=yes accounting=yes interim-update=5m
+
+/radius incoming
+set accept=yes port=3799
 ```
 
 ---
@@ -109,11 +123,9 @@ dot1x system-auth-control
 6. Enable RADIUS accounting: `YOUR_SERVER_IP:1813`
 
 ### VPN (OpenVPN with RADIUS)
-Install the `freeradius3` package:
-```
-pkg install pfSense-pkg-freeradius3
-```
-Configure under **Services → FreeRADIUS → RADIUS → Clients**.
+**System → User Manager → Authentication Servers → Add**, type RADIUS, with the server IP,
+ports 1812/1813 and the shared secret; then select that server in the OpenVPN server's
+**Backend for authentication**. (No FreeRADIUS package is needed on pfSense.)
 
 ---
 
@@ -154,15 +166,18 @@ WireGuard doesn't natively support RADIUS, but you can use a captive portal or p
 
 ## Testing RADIUS Authentication
 
-From the command line (on Linux with `freeradius-utils`):
+Easiest: **Settings → RADIUS Test** in the web UI.
+
+From the command line (on Linux with `freeradius-utils`, from an address FreeRADIUS accepts):
 ```bash
 radtest USERNAME PASSWORD YOUR_SERVER_IP 0 YOUR_SHARED_SECRET
 ```
 
 Expected responses:
 - `Access-Accept` — Authentication successful ✓
-- `Access-Reject` — Authentication failed (wrong password or suspended user) ✗
-- `Connection refused` — FreeRADIUS not running or wrong IP/port
+- `Access-Reject` — refused: wrong password, suspended/expired, paid-until passed, data cap
+  used up, or already on the maximum number of devices ✗
+- No reply (timeout) — FreeRADIUS not running, firewall, unregistered device, or wrong secret
 
 ---
 
@@ -170,7 +185,9 @@ Expected responses:
 
 To assign VLANs based on user group, add RADIUS reply attributes:
 
-In the web UI, users can be assigned to groups. Add group reply attributes in the database:
+Group membership is not managed in the web UI; put users in a group with SQL
+(`INSERT INTO radusergroup (username, groupname, priority) VALUES ('alice', 'staff', 1);`)
+and add group reply attributes:
 
 ```sql
 INSERT INTO radgroupreply (groupname, attribute, op, value)
@@ -196,8 +213,8 @@ VALUES ('alice', 'Tunnel-Private-Group-Id', '=', '200');
 ### Authentication failing
 1. Check the NAS device is added in the web UI with the correct shared secret
 2. Test with `radtest` from the server
-3. Check FreeRADIUS logs: `docker-compose logs freeradius`
-4. Ensure the user exists and is not suspended
+3. Check FreeRADIUS logs: `docker compose logs freeradius`
+4. `docker exec radius_backend ./radius-manager access-report` lists refused customers and why
 
 ### "Invalid shared secret"
 - The device secret must exactly match what's in NAS Devices in the web UI
@@ -205,11 +222,12 @@ VALUES ('alice', 'Tunnel-Private-Group-Id', '=', '200');
 - No leading/trailing spaces
 
 ### "Access-Reject" for valid credentials
-- User may be suspended → activate in Users page
-- Password may be expired → check in Users page
+- User may be suspended or expired → activate in RADIUS Users, or record their payment
+- Paid-until date passed → record the payment for their invoice
+- Data cap used up → resets when the next period is paid
 - Device limit may be reached → check active sessions
 
 ### NAS not reaching RADIUS server
 - Firewall must allow UDP 1812 and 1813 from the NAS device IP
 - Check `iptables -L` or firewall rules
-- Ensure Docker port mappings are correct: `docker-compose ps`
+- Ensure Docker port mappings are correct: `docker compose ps`

@@ -32,11 +32,12 @@ This guide explains how to configure routers, switches, access points, and firew
 
 Before configuring any device, confirm the following:
 
-- [ ] FreeRADIUS Manager is running (`docker-compose up -d`)
-- [ ] Setup Wizard has been completed at `http://YOUR-SERVER-IP:8081/setup`
+- [ ] FreeRADIUS Manager is running (`docker compose ps` shows all containers healthy)
+- [ ] The setup wizard has been completed at `http://YOUR-SERVER-IP:8081`
 - [ ] You know your **RADIUS server IP** (the server running Docker)
-- [ ] You know your **RADIUS shared secret** (set during Setup Wizard or in `.env`)
-- [ ] Port **1812/UDP** (authentication) and **1813/UDP** (accounting) are open on the server firewall
+- [ ] The device is registered under **NAS Devices** with its **own shared secret** (section 3)
+- [ ] Port **1812/UDP** (authentication) and **1813/UDP** (accounting) are open on the server firewall, for your routers' addresses
+- [ ] The router can receive **Disconnect requests on UDP 3799** from the server (section 3)
 - [ ] At least one RADIUS user has been created in the web interface
 
 ### Key Values You Will Need
@@ -46,10 +47,12 @@ Before configuring any device, confirm the following:
 | RADIUS Server IP | `YOUR-SERVER-IP` | IP of the server running Docker |
 | Auth Port | `1812` | Fixed — do not change |
 | Accounting Port | `1813` | Fixed — do not change |
-| Shared Secret | `your-radius-secret` | Setup Wizard → or `.env` → `RADIUS_SECRET` |
+| Disconnect (CoA) Port | `3799` | On the router: accept requests from the server |
+| Shared Secret | `your-radius-secret` | The secret on the device's **NAS Devices** entry (fallback: `RADIUS_SECRET` in `.env`) |
 | Protocol | `PAP` or `CHAP` | PAP recommended for simplicity |
+| Accounting | On, with **interim updates** every 5 minutes | Needed for "online now", usage, data caps and device limits |
 
-> **Security Note:** The shared secret must be the same in both FreeRADIUS Manager and on the device. It must never be shared publicly.
+> **Security Note:** The shared secret must be the same in both FreeRADIUS Manager and on the device. It must never be shared publicly. Give each router its own secret.
 
 ---
 
@@ -80,14 +83,29 @@ Every device that talks to RADIUS must be registered first.
 2. Go to **NAS Devices** → **Add Device**
 3. Fill in:
    - **Name**: Descriptive name (e.g., `Office-AP-Floor1`)
-   - **IP Address**: The device's IP address (or CIDR range for multiple devices)
-   - **Shared Secret**: Must match what you set on the device
+   - **IP Address**: The address the device sends RADIUS packets **from** (or a CIDR range for several devices)
+   - **Shared Secret**: Click the generate button, then enter the same secret on the device
+   - **Disconnect (CoA) port**: `3799` unless the device uses another
    - **Type**: Choose the vendor (mikrotik, cisco, ubiquiti, etc.)
    - **Description**: Optional notes
 4. Click **Save**
-5. Use the **Test** button to verify connectivity after configuration
+5. **Restart FreeRADIUS** so it loads the new device: `docker compose restart freeradius`
+   (FreeRADIUS reads the device list at startup; this takes a few seconds and only drops
+   requests in flight).
 
-> If a device is not registered, FreeRADIUS will silently drop all requests from it with "Ignoring request from unknown client."
+> **Unregistered devices.** Requests from private addresses (10.x, 172.16–31.x, 192.168.x)
+> that are not registered are still accepted with the fallback `RADIUS_SECRET` from `.env`.
+> Requests from any other address are dropped with "Ignoring request from unknown client".
+
+### Accounting and Disconnect — needed on every device
+
+- **Accounting** (port 1813) with **interim updates** tells the system who is online and how
+  much data they used. Without it, device limits, data caps, usage reports and "online now"
+  do not work.
+- **Disconnect / CoA** (RFC 5176, UDP 3799): the server sends a Disconnect-Request to kick a
+  session — the **Disconnect** button, a customer who stops paying, and data-cap enforcement
+  all use it. On the device this is usually called "incoming RADIUS", "dynamic
+  authorization", "CoA" or "RFC 3576". Allow UDP 3799 from the server in the device's firewall.
 
 ---
 
@@ -103,13 +121,30 @@ This is the most common use case — users connect to WiFi and are prompted to l
 add address=YOUR-SERVER-IP secret=your-radius-secret service=hotspot \
     authentication-port=1812 accounting-port=1813 timeout=3000ms
 
-# Step 2: Enable RADIUS on your Hotspot profile
+# Step 2: Enable RADIUS and accounting (with interim updates) on your Hotspot profile
 /ip hotspot profile
-set [find name=default] use-radius=yes
+set [find name=default] use-radius=yes radius-accounting=yes radius-interim-update=5m
 
-# Step 3: Verify RADIUS is active
+# Step 3: Accept Disconnect requests from the server (Disconnect button, unpaid customers)
+/radius incoming
+set accept=yes port=3799
+
+# Step 4: Verify RADIUS is active
 /radius print
 ```
+
+To use a branded login page from **Captive Portal**, replace the body of the hotspot's
+`login.html` (Files → `hotspot/login.html`) with a redirect to the portal, passing the
+router's variables:
+
+```html
+<html><head><meta http-equiv="refresh" content="0; url=http://YOUR-SERVER-IP:8081/api/v1/captive/serve/PORTAL-ID?link-login-only=$(link-login-only)&dst=$(link-orig-esc)"></head></html>
+```
+
+The portal posts the customer's login back to `link-login-only` (leave the portal's
+"Router login URL" empty for this) and sends them on to `dst` afterwards. Add the server to
+the hotspot's **walled garden** (`/ip hotspot walled-garden ip add dst-address=YOUR-SERVER-IP`)
+so customers can load the page before logging in.
 
 ### PPPoE Authentication
 
@@ -121,14 +156,22 @@ For ISP PPPoE subscriber authentication:
 add address=YOUR-SERVER-IP secret=your-radius-secret service=ppp \
     authentication-port=1812 accounting-port=1813
 
-# Enable on PPPoE server profile
-/ppp profile
-set default use-radius=yes
+# Use RADIUS for PPP logins, with accounting and interim updates
+/ppp aaa
+set use-radius=yes accounting=yes interim-update=5m
+
+# Accept Disconnect requests from the server
+/radius incoming
+set accept=yes port=3799
 ```
+
+If both hotspot and PPPoE run on one router, add one `/radius` entry with
+`service=hotspot,ppp`.
 
 ### Login Authentication (Admin Access)
 
-To use RADIUS for router admin login:
+To use RADIUS for router admin login (staff logging in to the router itself — not
+usually wanted for customer accounts):
 
 ```routeros
 /radius
@@ -545,23 +588,26 @@ Before testing, you need users in the system.
 1. Log in at `http://YOUR-SERVER-IP:8081`
 2. Go to **RADIUS Users** → **Add User**
 3. Fill in:
-   - **Username**: e.g. `john.doe`
+   - **Username**: e.g. `john.doe` (no spaces or quotes)
    - **Password**: at least 6 characters
-   - **Status**: Active
-   - **Data Limit**: (optional) e.g. `10GB`
-   - **Expiry Date**: (optional)
-   - **Device Limit**: max simultaneous sessions
-4. Click **Save**
+   - **Plan** (optional): sets speed, data cap and device count, and raises the invoice;
+     without a plan, set **Paid until** (empty = never expires)
+   - **Device Limit**: how many devices may be online at once
+4. Click **Create**. With a paid plan you are offered to record the payment straight away;
+   until it is paid the user cannot log in (unless you ticked **Start service now**).
 
 ### Via CSV Import
 
 1. **RADIUS Users** → **Import CSV**
-2. Format: `username,password,data_limit_mb,expiry_date`
+2. The first line must be a header. Required columns: `username,password`. Optional:
+   `email,full_name,department,phone,device_limit,expiry,validity_days,plan_name,data_limit_mb,notes`
+   (`expiry` as `YYYY-MM-DD`; `plan_name` applies the plan's limits but bills nothing).
 3. Example:
    ```csv
-   john.doe,Pass@1234,10240,2026-12-31
-   jane.smith,Jane@5678,5120,2026-12-31
-   guest01,Guest@999,,
+   username,password,expiry,device_limit,plan_name
+   john.doe,Pass@1234,2026-12-31,2,Home 10
+   jane.smith,Jane@5678,2026-12-31,1,
+   guest01,Guest@999,,1,
    ```
 
 ---
@@ -570,14 +616,16 @@ Before testing, you need users in the system.
 
 ### Test from FreeRADIUS Manager (Built-in)
 
-1. Go to **NAS Devices**
-2. Find your device → click **Test**
-3. Enter a username and password
-4. You should see `Access-Accept` with green status
+1. Go to **Settings** → **RADIUS Test** (or **Security** → **RADIUS Simulator** for the full
+   attribute exchange)
+2. Enter a customer's username and password
+3. You should see `Access-Accept` with green status. This proves the account works; a login
+   from the router additionally needs the router's secret and registration to be right.
 
 ### Test from Linux Command Line
 
-Install `freeradius-utils` then:
+Install `freeradius-utils` on a machine whose address FreeRADIUS accepts (a registered NAS,
+or a private address using the fallback secret), then:
 
 ```bash
 # Basic authentication test
@@ -608,8 +656,13 @@ Test-NetConnection -ComputerName YOUR-SERVER-IP -Port 1812
 | Cause | Fix |
 |-------|-----|
 | Wrong username or password | Check credentials in RADIUS Users |
-| User is disabled/expired | Edit user → set Status to Active |
-| Data or time limit exceeded | Edit user → increase limit or reset usage |
+| Paid-until date has passed | Record the payment for their invoice (or extend **Paid until**) |
+| User is suspended or expired | **RADIUS Users** → Activate |
+| Data cap used up | It resets when the next period is paid; or assign a plan with a bigger cap |
+| Already online on the maximum number of devices | Disconnect an old session, or raise the device limit |
+
+`docker exec radius_backend ./radius-manager access-report` lists every customer that
+FreeRADIUS will refuse and why.
 
 ```bash
 # Check FreeRADIUS logs for the exact reason
@@ -620,18 +673,18 @@ docker logs radius_freeradius 2>&1 | grep -i "reject\|error\|wrong" | tail -20
 
 | Cause | Fix |
 |-------|-----|
-| Device not registered | Add device in NAS Devices with correct IP |
-| Wrong shared secret | Secret on device must match `RADIUS_SECRET` in `.env` |
+| Device not registered | Add device in NAS Devices with correct IP, then `docker compose restart freeradius` |
+| Wrong shared secret | Secret on device must match its NAS Devices entry (or `RADIUS_SECRET` in `.env` for unregistered private addresses) |
 | Firewall blocking UDP 1812 | Open port: `ufw allow 1812/udp && ufw allow 1813/udp` |
 | Wrong server IP on device | Use the Docker host's IP, not `172.x.x.x` |
-| FreeRADIUS container not running | `docker-compose ps` → restart if down |
+| FreeRADIUS container not running | `docker compose ps` → restart if down |
 
 ```bash
 # Check if ports are open on the server
 ss -ulnp | grep -E "1812|1813"
 
-# Check Docker container status
-docker-compose -f /var/www/html/free/docker-compose.yml ps
+# Check Docker container status (run in the install folder)
+docker compose ps
 
 # Open firewall ports
 ufw allow 1812/udp
@@ -645,7 +698,9 @@ ufw reload
 docker logs radius_freeradius 2>&1 | grep "unknown client"
 ```
 
-This means the device IP is not in the NAS Devices list. Register the device in the web interface with the exact IP address the device uses to send packets.
+This means the device IP is not in the NAS Devices list (and not a private address). Register
+the device in the web interface with the exact IP address the device uses to send packets,
+then restart FreeRADIUS (`docker compose restart freeradius`).
 
 ### MikroTik — "No Response" Despite Correct Config
 
@@ -665,30 +720,32 @@ Check the MikroTik's outgoing interface IP:
 ### Checking Live RADIUS Traffic
 
 ```bash
-# Run FreeRADIUS in debug mode (shows every packet)
-docker exec -it radius_freeradius freeradius -X 2>&1 | head -100
+# Run FreeRADIUS in debug mode in the foreground (shows every packet); Ctrl+C to stop
+docker compose stop freeradius
+docker compose run --rm --service-ports freeradius -X
+docker compose up -d freeradius     # back to normal afterwards
 ```
 
 Look for lines like:
 - `Received Access-Request` — packet arrived
 - `Found Auth-Type = PAP` — protocol detected
-- `User found in radcheck` — credentials matched
-- `Access-Accept` / `Access-Reject` — final verdict
+- `Expiration` / `Simultaneous-Use` / `Max-Octets` checks — why a paid-up rule refused
+- `Sent Access-Accept` / `Sent Access-Reject` — final verdict
 
 ### Firewall Quick Reference
 
 ```bash
 # UFW (Ubuntu/Debian)
+# Better: limit RADIUS to your routers, e.g. ufw allow from 203.0.113.10 to any port 1812 proto udp
 ufw allow 1812/udp comment "RADIUS Auth"
 ufw allow 1813/udp comment "RADIUS Acct"
 ufw allow 8081/tcp comment "RADIUS Manager Web"
-ufw allow 8088/tcp comment "RADIUS Manager API"
+# (the API, 8088, is only reachable from the server itself; do not open it)
 
 # firewalld (CentOS/RHEL)
 firewall-cmd --permanent --add-port=1812/udp
 firewall-cmd --permanent --add-port=1813/udp
 firewall-cmd --permanent --add-port=8081/tcp
-firewall-cmd --permanent --add-port=8088/tcp
 firewall-cmd --reload
 
 # iptables
@@ -707,12 +764,13 @@ iptables -A INPUT -p udp --dport 1813 -j ACCEPT
 ║  RADIUS Server IP   :  YOUR-SERVER-IP                    ║
 ║  Auth Port          :  1812 / UDP                        ║
 ║  Accounting Port    :  1813 / UDP                        ║
-║  Shared Secret      :  (set in Setup Wizard / .env)      ║
+║  Disconnect (CoA)   :  3799 / UDP (on the router)        ║
+║  Shared Secret      :  per device, NAS Devices page      ║
 ║  Protocol           :  PAP                               ║
+║  Accounting         :  on, interim update 5 min          ║
 ║  Timeout            :  5s    Retries: 3                  ║
 ╠══════════════════════════════════════════════════════════╣
 ║  Web Interface      :  http://YOUR-SERVER-IP:8081        ║
-║  API Endpoint       :  http://YOUR-SERVER-IP:8088        ║
 ╚══════════════════════════════════════════════════════════╝
 ```
 
