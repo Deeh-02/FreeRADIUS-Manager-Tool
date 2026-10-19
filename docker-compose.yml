@@ -1,28 +1,38 @@
 # Four containers on one private network:
-#   frontend (nginx + built Vue app, :8081) --/api--> backend (Go API, :8088) --> postgres
+#   frontend (nginx + built Vue app, :8081) --/api--> backend (Go API) --> postgres
 #   freeradius (UDP 1812/1813) reads and writes the SAME postgres database.
-# Only the host ports published below are reachable from outside; postgres is not published.
+# Only the host ports published below are reachable from outside; postgres is not published
+# and the API port is bound to 127.0.0.1 (the UI reaches it through nginx).
 #
-# Every ${VAR:-default} falls back to a well-known value (DB password, JWT secret, RADIUS
-# secret) when .env does not set it, so run setup.sh or copy .env.example and change
-# them before going live: the stack starts happily with the insecure defaults.
-version: '3.8'
+# Secrets have no defaults: `docker compose` refuses to start until .env sets DB_PASSWORD,
+# JWT_SECRET and RADIUS_SECRET. Run ./setup.sh (it generates them) or copy .env.example.
+#
+# Optional HTTPS: set DOMAIN and COMPOSE_PROFILES=https in .env, point that name at this
+# server and open ports 80/443. Caddy then fetches a certificate and serves the UI on
+# https://DOMAIN.
+
+x-tz: &tz
+  # One timezone for every container. FreeRADIUS reads the Expiration date in its local
+  # time, so this decides at what midnight unpaid customers are cut off.
+  TZ: ${TZ:-UTC}
 
 services:
   postgres:
     image: postgres:15-alpine
     container_name: radius_postgres
     environment:
+      <<: *tz
       POSTGRES_DB: ${DB_NAME:-radius}
       POSTGRES_USER: ${DB_USER:-radius_user}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-ChangeMe_Secure_Pass123!}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (run ./setup.sh)}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Files in docker-entrypoint-initdb.d run only when the data volume is EMPTY (first
-      # start). Changing them later does nothing; apply new migrations by hand or with
-      # deploy-update.sh. 008_network_scanner.sql is not mounted: init-db.sql already has it.
-      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql
-      - ./migrations/009_billing.sql:/docker-entrypoint-initdb.d/02-billing.sql
+      # start). On an existing database, deploy-update.sh applies new migrations instead.
+      # 008_network_scanner.sql is not mounted: init-db.sql already contains it.
+      - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./migrations/009_billing.sql:/docker-entrypoint-initdb.d/02-billing.sql:ro
+      - ./migrations/010_missing_schema.sql:/docker-entrypoint-initdb.d/03-missing-schema.sql:ro
     networks:
       - radius-network
     healthcheck:
@@ -38,16 +48,15 @@ services:
     ports:
       - "1812:1812/udp"
       - "1813:1813/udp"
-      # 18120 is the inner-tunnel listener, bound to 127.0.0.1 inside the container, so this
-      # published port reaches nothing.
-      - "18120:18120/udp"
     environment:
+      <<: *tz
       DB_HOST: postgres
       DB_PORT: 5432
       DB_NAME: ${DB_NAME:-radius}
       DB_USER: ${DB_USER:-radius_user}
-      DB_PASS: ${DB_PASSWORD:-ChangeMe_Secure_Pass123!}
-      RADIUS_SECRET: ${RADIUS_SECRET:-testing123}
+      DB_PASS: ${DB_PASSWORD:?set DB_PASSWORD in .env (run ./setup.sh)}
+      # Fallback secret for routers not registered on the NAS Devices page (clients.conf).
+      RADIUS_SECRET: ${RADIUS_SECRET:?set RADIUS_SECRET in .env (run ./setup.sh)}
     volumes:
       - radius_logs:/var/log/freeradius
     depends_on:
@@ -61,47 +70,62 @@ services:
     build: ./backend
     container_name: radius_backend
     environment:
+      <<: *tz
+      # Same timezone for the database session, so CURRENT_DATE matches the local day.
+      PGTZ: ${TZ:-UTC}
+      APP_ENV: ${APP_ENV:-production}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: ${DB_USER:-radius_user}
-      DB_PASSWORD: ${DB_PASSWORD:-ChangeMe_Secure_Pass123!}
+      DB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env (run ./setup.sh)}
       DB_NAME: ${DB_NAME:-radius}
       DB_SSL_MODE: ${DB_SSL_MODE:-disable}
-      JWT_SECRET: ${JWT_SECRET:-change-this-super-secret-jwt-key-in-production}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env (run ./setup.sh)}
       JWT_ACCESS_EXPIRY: ${JWT_ACCESS_EXPIRY:-1h}
       JWT_REFRESH_EXPIRY: ${JWT_REFRESH_EXPIRY:-168h}
       RADIUS_HOST: freeradius
-      RADIUS_AUTH_PORT: ${RADIUS_AUTH_PORT:-1812}
-      RADIUS_ACCT_PORT: ${RADIUS_ACCT_PORT:-1813}
-      RADIUS_SECRET: ${RADIUS_SECRET:-testing123}
-      RADIUS_TIMEOUT: ${RADIUS_TIMEOUT:-5s}
-      RADIUS_RETRIES: ${RADIUS_RETRIES:-3}
-      # Hard-coded: the backend always listens on 8088 in compose, whatever WEB_PORT says in
-      # .env (the Dockerfile healthcheck and nginx proxy_pass also assume 8088).
+      RADIUS_AUTH_PORT: 1812
+      RADIUS_SECRET: ${RADIUS_SECRET:?set RADIUS_SECRET in .env (run ./setup.sh)}
+      # Fixed: the Dockerfile healthcheck and the nginx proxy_pass both use 8088.
       WEB_PORT: 8088
+      # Optional: required by the first-run setup wizard when set.
+      SETUP_TOKEN: ${SETUP_TOKEN:-}
+      # Proxies allowed to set X-Forwarded-For (default: loopback + Docker networks).
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Only if a browser app on another origin calls the API (comma-separated origins).
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
       BCRYPT_COST: ${BCRYPT_COST:-12}
-      RATE_LIMIT: ${RATE_LIMIT:-100}
+      RATE_LIMIT: ${RATE_LIMIT:-300}
       BRUTE_FORCE_ATTEMPTS: ${BRUTE_FORCE_ATTEMPTS:-5}
       BRUTE_FORCE_LOCKOUT: ${BRUTE_FORCE_LOCKOUT:-15}
-      # Not read by any backend code (grep finds no use), so this does not restrict admin
-      # access. Restrict by firewall or proxy instead.
-      ADMIN_IP_WHITELIST: ${ADMIN_IP_WHITELIST:-0.0.0.0/0}
+      PASSWORD_MIN_LENGTH: ${PASSWORD_MIN_LENGTH:-}
       SESSION_TIMEOUT: ${SESSION_TIMEOUT:-3600}
-      SESSION_CONCURRENT_BLOCK: ${SESSION_CONCURRENT_BLOCK:-5m}
+      DEFAULT_CURRENCY: ${DEFAULT_CURRENCY:-}
+      DEFAULT_COUNTRY: ${DEFAULT_COUNTRY:-}
       NMAP_MAX_PREFIX: ${NMAP_MAX_PREFIX:-18}
       NMAP_MAX_PORTSCAN_HOSTS: ${NMAP_MAX_PORTSCAN_HOSTS:-512}
+      GEOIP_API_URL: ${GEOIP_API_URL:-}
+      # Webhooks to private/LAN addresses are refused unless this is true.
+      WEBHOOK_ALLOW_PRIVATE: ${WEBHOOK_ALLOW_PRIVATE:-false}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-noreply@radius-manager.local}
-      # No SMS_* variables are passed (see handlers/sms.go) and BACKUP_* are not read by any
-      # code: add SMS_GATEWAY etc. here to use SMS, and schedule pg_dump outside the app.
-      BACKUP_SCHEDULE: ${BACKUP_SCHEDULE:-0 2 * * *}
-      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
-      APP_ENV: ${APP_ENV:-production}
+      SMS_GATEWAY: ${SMS_GATEWAY:-}
+      SMS_API_KEY: ${SMS_API_KEY:-}
+      SMS_AUTH_HEADER: ${SMS_AUTH_HEADER:-}
+      SMS_SENDER_ID: ${SMS_SENDER_ID:-}
+      SMS_BODY_TEMPLATE: ${SMS_BODY_TEMPLATE:-}
+      SMS_CONTENT_TYPE: ${SMS_CONTENT_TYPE:-}
+      # Dumps go to ./backups on the host (see the volume below).
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
     ports:
-      - "8088:8088"
+      # Loopback only: browsers use the UI on 8081, which proxies /api to here.
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - ./backups:/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -119,16 +143,36 @@ services:
     build:
       context: ./frontend
       args:
+        # Baked into the JS bundle at build time; nginx proxies /api/ to the backend.
         VITE_API_URL: /api/v1
     container_name: radius_frontend
-    ports:
-      - "8081:80"
     environment:
-      # No effect at runtime: Vite bakes VITE_API_URL into the JS bundle at build time, from
-      # the build arg above (/api/v1). nginx then proxies /api/ to the backend.
-      - VITE_API_URL=${VITE_API_URL:-http://localhost:8080}
+      <<: *tz
+    ports:
+      - "${UI_PORT:-8081}:80"
     depends_on:
       - backend
+    networks:
+      - radius-network
+    restart: unless-stopped
+
+  # HTTPS in front of the UI (optional, see the top of this file).
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: radius_caddy
+    profiles: ["https"]
+    environment:
+      <<: *tz
+      DOMAIN: ${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
     networks:
       - radius-network
     restart: unless-stopped
@@ -138,10 +182,14 @@ networks:
     driver: bridge
 
 # postgres_data holds ALL business data (users, invoices, payments, accounting). Removing it
-# (`docker compose down -v`) deletes everything and re-runs the init scripts. Nothing here
-# backs it up; see docs/ARCHITECTURE.md for the pg_dump command.
+# (`docker compose down -v`) deletes everything and re-runs the init scripts. The backend's
+# backup_database task writes daily dumps to ./backups; copy them off this server.
 volumes:
   postgres_data:
     driver: local
   radius_logs:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
     driver: local

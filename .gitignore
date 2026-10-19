@@ -30,3 +30,6 @@ backups/
 
 # run-local.sh output
 .local/
+
+# Compiled backend binary (built by the Dockerfile or `go build`)
+backend/radius-manager

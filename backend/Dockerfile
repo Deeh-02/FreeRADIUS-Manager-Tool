@@ -5,30 +5,28 @@ RUN apk add --no-cache git ca-certificates tzdata
 
 WORKDIR /app
 
-COPY go.mod ./
-# Download dependencies (go.sum will be generated if missing)
-RUN go mod download || true
+# Dependencies first (cached layer), pinned by the committed go.sum.
+COPY go.mod go.sum ./
+RUN go mod download
 
 COPY . .
-# go mod tidy resolves and pins all deps, then we build. Note `tidy` may rewrite go.mod/go.sum
-# inside the image, so the image can end up with dependency versions that differ from the
-# committed files; the build also needs network access to the Go module proxy.
-RUN go mod tidy && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-w -s" -o radius-manager ./main.go
+# Builds for the machine running the build (amd64 or arm64).
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o radius-manager .
 
 # ---- Runtime Stage ----
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates tzdata curl nmap nmap-scripts
+# postgresql16-client provides pg_dump for the backup_database task; a newer pg_dump can
+# dump the older postgres:15 server, not the other way round.
+RUN apk add --no-cache ca-certificates tzdata curl nmap nmap-scripts postgresql16-client
 
 WORKDIR /app
 
 COPY --from=builder /app/radius-manager .
 
-# nmap needs raw socket access for some scan types. The API therefore runs as root inside
-# the container (plus NET_RAW from docker-compose.yml); consider a non-root user and only
-# the needed capability if the network scanner is not used.
+# nmap needs raw sockets for ARP/ICMP discovery, and backups are written to the ./backups
+# host folder, so the API runs as root inside the container (plus NET_RAW/NET_ADMIN from
+# docker-compose.yml). The container is not reachable from outside except through nginx.
 USER root
 
 EXPOSE 8088

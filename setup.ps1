@@ -1,124 +1,89 @@
-# FreeRADIUS Manager - Windows Setup Script
-# Run as Administrator: PowerShell -ExecutionPolicy Bypass -File setup.ps1
+# FreeRADIUS Manager - first-time setup (Windows, Docker Desktop)
+# Run: PowerShell -ExecutionPolicy Bypass -File setup.ps1
+# Writes .env with generated secrets (from .env.example), builds and starts the stack.
+# Re-running it keeps an existing .env.
+$ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
-Write-Host "=================================================" -ForegroundColor Blue
-Write-Host "   FreeRADIUS Manager - Windows Setup Script     " -ForegroundColor Blue
-Write-Host "=================================================" -ForegroundColor Blue
-Write-Host ""
+Write-Host "=== FreeRADIUS Manager - setup ===" -ForegroundColor Blue
 
-# Check Docker
-try {
-    docker --version | Out-Null
-    Write-Host "[OK] Docker found" -ForegroundColor Green
-} catch {
-    Write-Host "[ERROR] Docker Desktop not found. Install from https://www.docker.com/products/docker-desktop" -ForegroundColor Red
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    Write-Host "[ERROR] Docker Desktop not found: https://www.docker.com/products/docker-desktop" -ForegroundColor Red
     exit 1
 }
-
-# Check Docker is running
-try {
-    docker info 2>$null | Out-Null
-    Write-Host "[OK] Docker daemon is running" -ForegroundColor Green
-} catch {
+docker info *> $null
+if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Docker is not running. Start Docker Desktop first." -ForegroundColor Red
     exit 1
 }
-
-# Generate passwords
-# NOTE: Get-Random is not a cryptographic random generator (setup.sh uses `openssl rand`),
-# so the DB password, JWT secret and RADIUS secret generated here are weaker than on Linux.
-# For production, replace them with values from a proper generator. This script also calls the
-# old `docker-compose` binary, so it needs Compose v1 (or an alias for `docker compose`).
-function New-RandomPassword {
-    param([int]$Length = 40)
-    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-    -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+docker compose version *> $null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "[ERROR] 'docker compose' is not available. Update Docker Desktop." -ForegroundColor Red
+    exit 1
 }
+Write-Host "[OK] Docker and Compose found" -ForegroundColor Green
 
-function New-RandomHex {
-    param([int]$Bytes = 32)
-    -join (1..$Bytes | ForEach-Object { '{0:X2}' -f (Get-Random -Maximum 256) })
+# Cryptographic random generator (Get-Random is not one).
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+function New-Secret([int]$Length) {
+    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    $bytes = New-Object byte[] $Length
+    $rng.GetBytes($bytes)
+    -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
+}
+function New-Hex([int]$Bytes) {
+    $b = New-Object byte[] $Bytes
+    $rng.GetBytes($b)
+    -join ($b | ForEach-Object { '{0:x2}' -f $_ })
 }
 
 if (Test-Path ".env") {
-    Write-Host "[WARN] .env already exists, skipping password generation" -ForegroundColor Yellow
+    Write-Host "[WARN] .env already exists; keeping it." -ForegroundColor Yellow
 } else {
-    Write-Host "[INFO] Generating secure passwords..." -ForegroundColor Cyan
-
-    $DbPass = New-RandomPassword
-    $JwtSecret = New-RandomHex
-    $RadiusSecret = New-RandomPassword 32
-
-    $envContent = @"
-# FreeRADIUS Manager - Auto-generated Configuration
-# Generated on: $(Get-Date)
-
-DB_HOST=postgres
-DB_PORT=5432
-DB_USER=radius_user
-DB_PASSWORD=$DbPass
-DB_NAME=radius
-DB_SSL_MODE=disable
-
-JWT_SECRET=$JwtSecret
-JWT_ACCESS_EXPIRY=1h
-JWT_REFRESH_EXPIRY=168h
-
-RADIUS_HOST=freeradius
-RADIUS_AUTH_PORT=1812
-RADIUS_ACCT_PORT=1813
-RADIUS_SECRET=$RadiusSecret
-RADIUS_TIMEOUT=5s
-RADIUS_RETRIES=3
-
-WEB_PORT=8088
-VITE_API_URL=/api/v1
-
-ADMIN_IP_WHITELIST=0.0.0.0/0
-SESSION_TIMEOUT=3600
-BCRYPT_COST=12
-RATE_LIMIT=100
-BRUTE_FORCE_ATTEMPTS=5
-BRUTE_FORCE_LOCKOUT=15
-
-APP_ENV=production
-
-SMTP_HOST=
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASS=
-SMTP_FROM=noreply@radius-manager.local
-
-BACKUP_SCHEDULE=0 2 * * *
-BACKUP_RETENTION_DAYS=30
-"@
-
-    $envContent | Out-File -FilePath ".env" -Encoding utf8
-    Write-Host "[OK] .env file created" -ForegroundColor Green
+    $text = Get-Content ".env.example" -Raw
+    $text = $text -replace '(?m)^DB_PASSWORD=.*$', "DB_PASSWORD=$(New-Secret 40)"
+    $text = $text -replace '(?m)^JWT_SECRET=.*$', "JWT_SECRET=$(New-Hex 32)"
+    $text = $text -replace '(?m)^RADIUS_SECRET=.*$', "RADIUS_SECRET=$(New-Secret 32)"
+    $text = $text -replace '(?m)^SETUP_TOKEN=.*$', "SETUP_TOKEN=$(New-Secret 24)"
+    # Containers want an IANA name (e.g. Africa/Nairobi); Windows ids differ, so UTC is
+    # written unless the conversion is available.
+    $tz = "UTC"
+    try {
+        $iana = $null
+        if ([System.TimeZoneInfo]::TryConvertWindowsIdToIanaId([System.TimeZoneInfo]::Local.Id, [ref]$iana)) { $tz = $iana }
+    } catch { }
+    $text = $text -replace '(?m)^TZ=.*$', "TZ=$tz"
+    # UTF-8 without BOM, LF line endings: Compose misreads a BOM on the first line.
+    [System.IO.File]::WriteAllText((Join-Path $PWD ".env"), ($text -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "[OK] .env created with generated secrets (timezone: $tz). Edit DEFAULT_CURRENCY and SMTP there." -ForegroundColor Green
 }
 
-# Build and start
-Write-Host ""
-Write-Host "[INFO] Building Docker images (3-10 minutes)..." -ForegroundColor Cyan
-docker-compose build --parallel
+New-Item -ItemType Directory -Force -Path "backups" | Out-Null
 
-Write-Host ""
+Write-Host "[INFO] Building Docker images (3-10 minutes the first time)..." -ForegroundColor Cyan
+docker compose build
+if ($LASTEXITCODE -ne 0) { Write-Host "[ERROR] Build failed." -ForegroundColor Red; exit 1 }
 Write-Host "[INFO] Starting services..." -ForegroundColor Cyan
-docker-compose up -d
+docker compose up -d
+if ($LASTEXITCODE -ne 0) { Write-Host "[ERROR] Start failed. Check: docker compose logs" -ForegroundColor Red; exit 1 }
 
-Write-Host ""
-Write-Host "[INFO] Waiting for services (30 seconds)..." -ForegroundColor Cyan
-Start-Sleep -Seconds 30
+foreach ($c in "radius_postgres", "radius_backend", "radius_freeradius", "radius_frontend") {
+    $ok = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        $s = docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' $c 2>$null
+        if ($s -eq "healthy") { $ok = $true; break }
+        Start-Sleep -Seconds 3
+    }
+    if ($ok) { Write-Host "[OK] $c is healthy" -ForegroundColor Green }
+    else { Write-Host "[WARN] $c is not healthy. Check: docker logs $c" -ForegroundColor Yellow }
+}
 
+$token = (Select-String -Path ".env" -Pattern '^SETUP_TOKEN=(.*)$').Matches[0].Groups[1].Value
 Write-Host ""
-Write-Host "=================================================" -ForegroundColor Green
-Write-Host "   Setup Complete!                               " -ForegroundColor Green
-Write-Host "=================================================" -ForegroundColor Green
+Write-Host "=== Setup complete ===" -ForegroundColor Green
+Write-Host "  Web UI:       http://localhost:8081"
+Write-Host "  RADIUS:       UDP 1812 (auth) / 1813 (accounting)"
+Write-Host "  Setup token:  $token   (the setup wizard asks for it; also in .env)"
 Write-Host ""
-Write-Host "  Web Interface:  http://localhost:8081" -ForegroundColor Cyan
-Write-Host "  Backend API:    http://localhost:8088" -ForegroundColor Cyan
-Write-Host "  RADIUS Port:    localhost:1812/UDP" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "  First run: open the web interface and complete the setup wizard" -ForegroundColor Yellow
-Write-Host "  to create your admin account (there is no default login)."
-Write-Host ""
+Write-Host "  Next: open the web UI, complete the setup wizard, then add your routers on the"
+Write-Host "  NAS Devices page (see DEVICE-INTEGRATION.md)."

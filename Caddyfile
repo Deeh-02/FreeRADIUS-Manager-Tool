@@ -1,0 +1,11 @@
+# HTTPS front for the web UI, used only with `docker compose --profile https up -d`.
+# DOMAIN comes from .env and must already resolve to this server, with ports 80 and 443 open,
+# so Let's Encrypt can issue the certificate (stored in the caddy_data volume).
+{$DOMAIN} {
+	encode gzip
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy frontend:80 {
+		# Live stats is a long-lived event stream.
+		flush_interval -1
+	}
+}
