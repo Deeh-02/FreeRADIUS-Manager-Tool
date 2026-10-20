@@ -11,11 +11,15 @@ done in code and tested against real PostgreSQL and FreeRADIUS. Billing now cont
 - a customer who doesn't pay is refused after their paid-until date
 - paying lets them back on
 
-What's left:
+Since then the billing code has automated tests (concurrency, a 560-day time simulation, edge
+cases: [ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)). They found and
+fixed about ten real bugs (B11–B19, Q8). **Passing them does not make it ready to deploy:** they
+cannot show how real routers, your server, your timezone and your staff behave. Order of work:
 
 - your decisions (Phase 0)
-- a trial on real hardware (Phase A)
-- automated tests (Phase B)
+- a trial on real hardware, including failure and load tests (Phase A)
+- a small pilot with real customers (Phase P): the gate before full launch
+- hardening after launch (Phase B)
 - larger features for later (Phase C)
 
 Sizes are rough: **S** = hours, **M** = a few days, **L** = a week or more.
@@ -68,6 +72,10 @@ These were defaulted in code; all are changeable on the **Settings** page.
 - [ ] **Reminders:** days before expiry and the message. Default: 3 days, SMS/email.
 - [ ] **How customers pay:** staff-recorded (works now), or a gateway such as M-Pesa (Phase C).
 - [ ] **Currency and tax:** set `DEFAULT_CURRENCY`; decide whether invoices need VAT (Phase C).
+- [ ] **Deleting a customer who still owes** [B20]: cancel their open invoices on delete, or keep
+      them as bad debt? Today they stay open, unlinked, and count as outstanding revenue.
+- [ ] **Who may reverse payments and delete customers?** Today any admin can. Decide whether
+      that should be limited to a super admin.
 
 **Done when** the Settings page reflects these choices.
 
@@ -75,16 +83,83 @@ These were defaulted in code; all are changeable on the **Settings** page.
 
 ## Phase A: trial on real hardware (before the first paying customer)
 
+Do this on a test server that matches production, with one real router.
+
+**A-1. Set up**
+
 | # | Task | Size |
 |---|---|---|
-| A.1 | Build and run the Docker images on a test server (`./setup.sh`); check every container is healthy; enable HTTPS with `COMPOSE_PROFILES=https`. | S |
+| A.1 | Build and run the Docker images on a test server (`./setup.sh`); check every container is healthy; enable HTTPS with `COMPOSE_PROFILES=https`. Nothing in the Docker setup has been run yet. | S |
+| A.1a | **Before applying migration 011** to any database that already holds payments: check there are no duplicate payment references (`SELECT gateway, upper(gateway_ref), count(*) FROM payments WHERE status='confirmed' AND gateway_ref IS NOT NULL GROUP BY 1,2 HAVING count(*)>1`). The new unique index fails to create if there are. Fix them first. | S |
+| A.1b | **Timezone:** set `TZ` once in `.env` to your local zone and confirm PostgreSQL, FreeRADIUS and the backend all use it. Then check a customer whose paid-until is today is refused at 00:00 local time, not at 00:00 UTC. | S |
+| A.5 | Set up SMTP (and SMS if used); send a test email; create alert rules for `nas_down` and `backup_failed`. Confirm the alert actually reaches you. | S |
+
+**A-2. Real router and the customer journey**
+
+| # | Task | Size |
+|---|---|---|
 | A.2 | Connect one test MikroTik (hotspot and/or PPPoE) as in [DEVICE-INTEGRATION.md](../DEVICE-INTEGRATION.md): accounting with interim updates, `/radius incoming` for Disconnect. Check login, "online now", usage, speed profile, device limit, Disconnect button. | S–M |
 | A.3 | Walk a test customer through: assign plan → offline until paid → record payment → online → expire (set paid-until to yesterday, run *Expire Accounts*) → kicked off → pay again → back online. | S |
-| A.4 | Restore a backup into a scratch database once (README → Backups and restore). | S |
-| A.5 | Set up SMTP (and SMS if used); send a test email; create alert rules for `nas_down` and `backup_failed`. | S |
+| A.3a | Real routers retry and time out in their own ways: record a payment while the browser is throttled or the request is cut off, and check the Record Payment dialog's retry produces one payment and one receipt. | S |
+
+**A-3. Failure and recovery** (the tests the repository does not have yet)
+
+| # | Task | Size |
+|---|---|---|
+| A.7 | Restart PostgreSQL while payments are being recorded (script a loop of payments, restart the container). Afterwards run the invariant checks: no payment without its days, no days without a payment. | S–M |
+| A.8 | Stop FreeRADIUS, record payments and an expiry, start it again: the paying customer must get online, the expired one must not. | S |
+| A.9 | Make the router ignore Disconnect (firewall port 3799): billing must still complete, and the failed disconnect must be visible to staff. If it is not visible, that is a bug to fix. | S |
+| A.4 | **Restore a backup** into a scratch database, then re-run the invariant checks against it (`backend/internal/handlers/invariants_test.go`, `checkMoney` and `checkEnforcement`). Time how long a restore takes. | S |
+| A.10 | Kill the backend container in the middle of a payment (repeatedly, under a payment loop): after each restart the books must balance. | S |
+
+**A-4. Load and volume** (measure on the production-class server, not a laptop)
+
+| # | Task | Target | Size |
+|---|---|---|---|
+| A.11 | Logins through a RADIUS load tool (`radclient`/`radperf`). Every login runs about 5 queries including a data-usage total. | Several hundred per second at your expected customer count; tell me your number. | M |
+| A.12 | Accounting flood: all sessions sending interim updates every 5 minutes, sustained for hours. | 5,000 sessions ≈ 17 updates/second with no backlog. | M |
+| A.13 | Fill the usage table (`radacct`) with 1–5 million rows; check login speed and the data-cap total. Probable fix: an index on `(username, acctstarttime)`. | Both stay in milliseconds. | S–M |
+| A.14 | Renewal and expiry tasks over your customer count, run while staff use the panel. | No lock waits that block staff. | S |
+| A.15 | Billing and Payments pages and reports with 100,000 invoices. | Pages stay quick. | S–M |
+
+**A-5. Operations**
+
+| # | Task | Size |
+|---|---|---|
+| A.16 | Write down and rehearse your recovery steps: reverse a wrong payment, resync a customer's access (`resync-access`), reset a password and MFA, restore from backup. | S |
+| A.17 | Confirm the daily backup runs by itself, is copied off the server, and a failed backup alerts you. | S |
 | A.6 | **Upgrading an existing 1.0 install:** run `./deploy-update.sh` and read the list of customers who will be refused before confirming; extend anyone who has paid. | S |
 
-**Done when** A.1–A.5 pass on the test server. (A.6 only if you have a 1.0 install.)
+**Done when** A.1–A.5 and A.7–A.17 pass on the test server. (A.6 only if you have a 1.0 install.)
+Any failure in A.7–A.10 or A.13 is a bug to fix before continuing.
+
+---
+
+## Phase P: pilot (the gate before full launch)
+
+Real customers, real money, but few of them, and every payment checked by hand.
+
+- [ ] Start with about 10–20 friendly customers on one router. Do not move everyone at once.
+- [ ] Run for at least **one full billing cycle** and ideally two, so you see renewals, expiry,
+      late payers and at least one reversal for real.
+- [ ] **Every day**, reconcile: the Payments page total against your cash, bank and mobile-money
+      records, per currency. Any difference is a bug or a staff error; find out which.
+- [ ] **Every day**, run `access-report` and check nobody who paid is blocked and nobody who
+      didn't pay is online.
+- [ ] Keep a log of every surprise (a customer cut off wrongly, a duplicate, a confusing screen).
+- [ ] Watch the alerts and the backup status each day.
+
+**Go-live gate: all of these must be true**
+
+- [ ] Phase A is done and every failure test passed.
+- [ ] The pilot ran a full cycle with **no unexplained difference** in the daily reconciliation.
+- [ ] No customer was wrongly cut off, or wrongly left online, without a cause you understand.
+- [ ] You have restored a backup, and rehearsed the recovery steps.
+- [ ] You know your answers to Phase 0 (including tax and deleted-customer invoices).
+- [ ] The billing tests (`make test-integration`) pass on the version you are about to run.
+
+Then onboard in stages (for example a quarter of customers, then half, then all), repeating the
+daily reconciliation for the first week of each stage.
 
 ---
 
@@ -92,8 +167,9 @@ These were defaulted in code; all are changeable on the **Settings** page.
 
 | # | Task | Why | Size |
 |---|---|---|---|
-| B.1 | **Tests in the repository + CI** [Q1]: **billing tests are in** (concurrency, 560-day time simulation, edge cases; `make test-integration`, see [ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)). Still to do: run them on every push (CI), and add tests for the rest of the API, FreeRADIUS and a browser smoke test. | The billing and enforcement paths cost money if they break. | S–M |
-| B.1a | **Failure and load tests on your hardware:** restart PostgreSQL mid-payment, FreeRADIUS down while paying, a router that ignores Disconnect, restore-and-recheck; then logins/second, accounting flood, 1–5 million usage rows (check an index on `radacct (username, acctstarttime)`), 100,000 invoices. | Cannot be judged on a laptop. | M |
+| B.1 | **CI** [Q1]: run the billing tests (`make test-integration`) on every push. They are in the repository ([ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)) but nothing runs them automatically. Then extend tests to the rest of the API, FreeRADIUS and a browser smoke test. | The billing and enforcement paths cost money if they break. | S–M |
+| B.1a | **Turn the Phase A failure tests (A.7–A.10) into repeatable scripts** so they run before each release. | They are manual until then. | M |
+| B.1b | **More simulation coverage:** other seeds, `suspend_overdue` on, non-default `invoice_due_days`, and a customer deleted while a payment is being recorded. Give back a promo use when an unpaid invoice is cancelled on a plan switch. | Found while writing the tests; not covered yet. | S–M |
 | B.2 | **Audit the remaining handlers for ignored errors** [D7]. | A failure should never look like "saved". | M |
 | B.3 | **EAP/PEAP** [N6], if you use WPA-Enterprise: certificates and a test with a real client. | Untested today. | M |
 | B.4 | **NAS monitor via Status-Server** [N7], so routers that block TCP probes are not shown "down". | Cosmetic but confusing. | S |
