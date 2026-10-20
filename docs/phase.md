@@ -92,7 +92,8 @@ These were defaulted in code; all are changeable on the **Settings** page.
 
 | # | Task | Why | Size |
 |---|---|---|---|
-| B.1 | **Tests in the repository + CI** [Q1]: turn the 1.1 end-to-end checks (API against PostgreSQL + FreeRADIUS, browser smoke test) into repository tests, run on every push. | The billing and enforcement paths cost money if they break. | M |
+| B.1 | **Tests in the repository + CI** [Q1]: **billing tests are in** (concurrency, 560-day time simulation, edge cases; `make test-integration`, see [ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)). Still to do: run them on every push (CI), and add tests for the rest of the API, FreeRADIUS and a browser smoke test. | The billing and enforcement paths cost money if they break. | S–M |
+| B.1a | **Failure and load tests on your hardware:** restart PostgreSQL mid-payment, FreeRADIUS down while paying, a router that ignores Disconnect, restore-and-recheck; then logins/second, accounting flood, 1–5 million usage rows (check an index on `radacct (username, acctstarttime)`), 100,000 invoices. | Cannot be judged on a laptop. | M |
 | B.2 | **Audit the remaining handlers for ignored errors** [D7]. | A failure should never look like "saved". | M |
 | B.3 | **EAP/PEAP** [N6], if you use WPA-Enterprise: certificates and a test with a real client. | Untested today. | M |
 | B.4 | **NAS monitor via Status-Server** [N7], so routers that block TCP probes are not shown "down". | Cosmetic but confusing. | S |

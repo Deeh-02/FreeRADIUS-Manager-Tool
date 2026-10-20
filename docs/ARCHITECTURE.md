@@ -687,13 +687,24 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 | S8 | Medium | No TLS; CORS `*`; API port published. | **Fixed.** Optional Caddy HTTPS; CORS off unless `CORS_ORIGINS`; API bound to 127.0.0.1; nginx security headers on every response. Caddy **not yet run** here. |
 | S9 | Medium | Organizations are not multi-tenant. | **Open.** User limits per organisation are enforced, but nothing isolates data. Do not give resellers staff accounts. |
 | S10 | Medium | GeoIP, credential-stuffing blocks and API keys not enforced. | **Fixed** for staff and portal logins and API keys. Note: they do not filter RADIUS logins from routers. |
+| B11 | Critical | An early renewal recorded the wrong number of days (the days still left plus one extra), so reversing that payment took back too many and cut off time the customer had paid for. | **Fixed** (found by the new tests). `grantPlanPeriod` read the old date inside the same SQL statement that changed it, which returned nothing. Covered by the concurrency and time-simulation tests. |
+| B12 | Critical | The renewal task and staff "Assign plan" could each raise an invoice for the same customer at the same moment (check-then-insert with nothing behind it); in the test one customer ended with 31 open invoices. | **Fixed.** Both now lock the customer first and re-check. Not a unique index, because reversals legitimately re-open an invoice. Tested. |
+| B13 | High | Retrying a cash payment (browser timeout, double click) recorded it twice; the same M-Pesa reference typed without a "gateway" could be recorded any number of times. | **Fixed.** `Idempotency-Key` on `POST /payments` (the Record Payment dialog sends one) and a reference index that treats an empty gateway and letter case properly (migration 011). Tested with 10 simultaneous copies. |
+| B14 | High | Two backend copies could each run the same scheduled task, one after the other. | **Fixed.** A task is now claimed with one atomic `UPDATE` before it runs (15-minute lease if the claimer dies). Tested. |
+| B15 | High | Cancelling or re-pricing an invoice while a payment landed on it could leave a cancelled invoice with money on it. | **Fixed.** The check and the change now happen in one transaction with the invoice locked. Tested. |
+| B16 | Medium | Percentage discounts were a cent out on exact half-cents (33% of 25.50). | **Fixed.** Whole-cent arithmetic; checked against exact fractions for 440,000 price/discount pairs. |
+| B17 | Medium | Editing a plan changed what its open invoices bought (shortening a plan to 7 days after an invoice for 30 days was raised). | **Fixed.** The invoice remembers its days (`plan_days`, migration 011). |
+| B18 | Medium | Switching plans left the old plan's unpaid invoice open beside the new one. | **Fixed.** Unpaid, no-payment invoices for the old plan are cancelled automatically; invoices with money on them, or started on credit, are left for staff. |
+| B19 | Low | With grace days, a brand-new unpaid customer's paid-until date was set to "yesterday", which grace then made look current. | **Fixed.** `blockUntilPaid` also subtracts the grace days. |
+| B20 | Open | **Deleting a customer who still owes** keeps the invoice (history survives) but leaves it open and unlinked: it still counts as outstanding revenue and can still be paid, with no effect on access. | **Open: your decision.** Cancel such invoices on delete, or keep them as bad debt. Tested that nothing breaks either way. |
 | S11 | Low | Audit redaction shallow; GeoIP free plan non-commercial over HTTP. | **Partly.** Recursive redaction. **Open:** default GeoIP service is ip-api.com (non-commercial, HTTP) — set `GEOIP_API_URL`. |
 
 ### 10.5 Quality and operations
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| Q1 | High | No automated tests or CI. | **Open.** 1.1 was checked with external scripts (10.7); they are not yet in the repository. |
+| Q1 | High | No automated tests or CI. | **Partly.** Billing now has repository tests ([10.8](#108-automated-billing-tests)). **Open:** CI, and tests for the rest of the API, FreeRADIUS and the browser. |
+| Q8 | High | Every billing step that reads a setting (grace days, due days) opened a second database connection while already holding one in a transaction. With enough simultaneous payments every connection waited for another, and the backend froze. | **Fixed.** Settings are held in memory and refreshed every 15 seconds; a lookup never touches the database. Found when 100 simultaneous requests hung the test run. |
 | Q2 | Medium | Compiled binary committed to git. | **Fixed** in the 1.1 commits (removed and ignored). |
 | Q3 | Medium | Single-instance design. | **Partly.** Advisory locks on tasks, `RUN_WORKERS`. **Open:** rate limiter and lockout windows are per process; one PostgreSQL. |
 | Q4 | Medium | `deploy-update.sh` could pull into a working branch and swallowed errors. | **Fixed.** Tested with a stand-in for Docker. |
@@ -738,7 +749,7 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
    - whether overdue invoices block service
 
    Set them on the Settings page.
-3. **Put the end-to-end checks into the repository as tests, and add CI** (Q1).
+3. **Add CI** (Q1) to run the billing tests ([10.8](#108-automated-billing-tests)) on every push, and extend them to the API, FreeRADIUS and the browser.
 4. **Payment gateway** (B7), if customers should pay without staff.
 5. **Tax/VAT and exact-decimal money** (B8), if your jurisdiction needs invoices with tax.
 6. **Real multi-tenancy** (S9), if you plan to resell.
@@ -781,3 +792,26 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 - **Real routers.**
 - **Protocols and providers:** EAP/PEAP; real SMTP, SMS, webhook receivers and GeoIP; nmap
   scans.
+
+### 10.8 Automated billing tests
+
+The first tests in the repository, in `backend/internal/handlers/*_test.go`. They run against
+a real PostgreSQL with the repository's schema (`scripts/test-db.sh` makes a throwaway one) and
+skip themselves when `TEST_DATABASE_URL` is not set. Run them all with `make test-integration`
+in `backend/` (about 2 minutes).
+
+| File | What it does |
+|---|---|
+| `concurrency_test.go` | Fires the same actions at the same instant, then checks the books: 20 or 30 partial payments on one invoice; one M-Pesa reference sent 10 times (with and without a gateway); paying and reversing the same invoice together (80 rounds); 100 customers on a promo limited to 10; the renewal task against staff assigning plans; two backend copies running the scheduler; 200 parallel invoice/receipt numbers; one payment retried 10 times with the same idempotency key; cancelling an invoice while it is being paid. |
+| `sim_test.go` | **Time simulation.** Moves every date in the database back one day, runs the daily tasks, and repeats (`SIM_DAYS`, `SIM_CUSTOMERS`, `SIM_SEED`). Customers pay on time, late, in part or never; some are reversed, switch plans, use promo codes (33%, 100%, fixed, bigger than the price), have their plan's price changed under an open invoice, or are deleted while owing. After every simulated day it checks the invariants below. |
+| `invariants_test.go` | The rules checked after every day: payments never exceed an invoice; paid means fully paid and its period granted exactly once; numbers unique; **what FreeRADIUS would decide from `radcheck` matches the books for every customer** (no paying customer blocked, no non-paying customer allowed); paid-until equals the starting point plus the days of the invoices that still hold a period; one open renewal per customer; revenue per currency equals the tally of operations performed, and the Billing and Payments pages agree. |
+| `edge_test.go` | 1,000 payments of 0.01; discount rounding against exact fractions; fully discounted and free plans; the midnight `Expiration` text across month ends, the year end and 29 February; a plan edited under an open invoice; deleting a customer who owes; a payment that fails half-way leaves nothing behind. |
+
+Ran once (not in the normal run, which uses 120 days and 300 customers): 560 simulated days
+with 500 customers, crossing 29 February 2028. Before the fixes above, these tests failed on
+B11, B12, B13, B14, B15, B16, B17, B18 and Q8; each fix was confirmed by re-running them.
+
+**Not covered yet:** restarting PostgreSQL or FreeRADIUS during payments, a router that ignores
+Disconnect, restoring a backup and re-checking the books, and everything under load (logins per
+second, accounting volume, 1–5 million usage rows, 100,000 invoices). Those need your server's
+hardware and a real router (Phase A).
