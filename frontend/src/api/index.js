@@ -456,7 +456,7 @@ export const webhooksAPI = {
 // granted is taken back).
 export const paymentsAPI = {
   list: (params) => api.get('/payments', { params }),
-  create: (data) => api.post('/payments', data),
+  create: (data, config) => api.post('/payments', data, config),
   reverse: (id, reason) => api.post(`/payments/${id}/reverse`, { reason }),
   summary: () => api.get('/payments/summary'),
   receipt: (id) => api.get(`/payments/${id}/receipt`, { responseType: 'text' }),

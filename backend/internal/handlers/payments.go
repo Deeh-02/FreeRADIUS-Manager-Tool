@@ -133,9 +133,21 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		Gateway       string  `json:"gateway"`
 		GatewayRef    string  `json:"gateway_ref"`
 		Notes         string  `json:"notes"`
+		// IdempotencyKey (or the Idempotency-Key header) is a one-time ID the client creates
+		// for each payment it submits. A retry of the same request carries the same key and
+		// gets the original receipt back instead of recording the money twice.
+		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	key := strings.TrimSpace(c.GetHeader("Idempotency-Key"))
+	if key == "" {
+		key = strings.TrimSpace(req.IdempotencyKey)
+	}
+	if len(key) > 80 {
+		respondError(c, http.StatusBadRequest, "idempotency key is longer than 80 characters")
 		return
 	}
 	if req.InvoiceID == nil && strings.TrimSpace(req.Username) == "" {
@@ -150,13 +162,34 @@ func (h *Handler) CreatePayment(c *gin.Context) {
 		return
 	}
 	defer tx.Rollback()
-	out, err := recordPaymentTx(tx, paymentInput{
+	in := paymentInput{
 		InvoiceID: req.InvoiceID, Username: strings.TrimSpace(req.Username), Amount: req.Amount,
-		Currency: req.Currency, PaymentMethod: req.PaymentMethod, Gateway: req.Gateway,
-		GatewayRef: req.GatewayRef, Notes: req.Notes, ProcessedBy: &claims.UserID,
-	})
+		Currency: req.Currency, PaymentMethod: req.PaymentMethod, Gateway: strings.TrimSpace(req.Gateway),
+		GatewayRef: strings.TrimSpace(req.GatewayRef), Notes: req.Notes, ProcessedBy: &claims.UserID,
+		IdempotencyKey: key,
+	}
+	out, err := recordPaymentTx(tx, in)
+	if err == errDuplicateRequest {
+		// Lost a race against an identical request that has since committed: answer with it.
+		tx.Rollback()
+		out, _, err = replayPayment(h.db, in)
+	}
+	if err == errKeyMismatch {
+		respondError(c, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if out.Replayed {
+		c.JSON(http.StatusOK, gin.H{
+			"id":             out.PaymentID,
+			"receipt_number": out.Receipt,
+			"invoice_paid":   out.InvoicePaid,
+			"duplicate":      true,
+			"message":        "this payment was already recorded (same idempotency key); nothing new was added",
+		})
 		return
 	}
 	if err := tx.Commit(); err != nil {

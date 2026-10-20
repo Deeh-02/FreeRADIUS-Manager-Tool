@@ -90,6 +90,7 @@ import { useToast } from 'vue-toastification'
 import { XMarkIcon, CheckCircleIcon } from '@heroicons/vue/24/outline'
 import { billingAPI, paymentsAPI, openReceipt } from '@/api'
 import { money, apiError } from '@/utils/money'
+import { newIdempotencyKey } from '@/utils/idempotency'
 
 // invoice: optional invoice to pre-select (from the Billing page).
 const props = defineProps({ invoice: { type: Object, default: null } })
@@ -100,6 +101,9 @@ const openInvoices = ref([])
 const invoiceId = ref(props.invoice?.id ?? null)
 const saving = ref(false)
 const result = ref(null)
+// One key for this dialog: pressing Save twice, or the browser retrying after a timeout, can
+// never record the money twice.
+const idempotencyKey = newIdempotencyKey()
 const form = reactive({ username: '', amount: null, currency: '', payment_method: 'cash', gateway_ref: '', notes: '' })
 
 function onInvoiceChange() {
@@ -132,7 +136,7 @@ async function save() {
   try {
     const payload = { ...form, invoice_id: invoiceId.value }
     if (invoiceId.value) delete payload.currency
-    const { data } = await paymentsAPI.create(payload)
+    const { data } = await paymentsAPI.create(payload, { headers: { 'Idempotency-Key': idempotencyKey } })
     result.value = data
     emit('saved', data)
   } catch (err) {

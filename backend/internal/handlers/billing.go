@@ -199,7 +199,7 @@ func (h *Handler) CreateInvoice(c *gin.Context) {
 			respondError(c, http.StatusBadRequest, "a plan invoice needs an existing RADIUS user")
 			return
 		}
-		in.PlanID, in.PlanName = &p.ID, &p.Name
+		in.PlanID, in.PlanName, in.PlanDays = &p.ID, &p.Name, &p.ValidityDays
 		if in.Amount <= 0 {
 			in.Amount = p.Price
 		}
@@ -271,22 +271,6 @@ func (h *Handler) UpdateInvoice(c *gin.Context) {
 		return
 	}
 
-	var cur string
-	var paid float64
-	if err := h.db.QueryRow(`SELECT status, COALESCE((SELECT SUM(amount) FROM payments WHERE invoice_id=$1 AND status='confirmed'),0)
-		FROM invoices WHERE id=$1`, id).Scan(&cur, &paid); err != nil {
-		respondError(c, http.StatusNotFound, "invoice not found")
-		return
-	}
-	if cur == "paid" || cur == "cancelled" {
-		respondError(c, http.StatusConflict, "paid and cancelled invoices cannot be edited; reverse the payment first")
-		return
-	}
-	if paid > 0 && (req.Amount > 0 || req.Status == "cancelled") {
-		respondError(c, http.StatusConflict, "this invoice has payments; reverse them before changing the amount or cancelling")
-		return
-	}
-
 	var dueDate interface{}
 	if req.DueDate != "" {
 		if _, err := time.Parse("2006-01-02", req.DueDate); err != nil {
@@ -300,13 +284,45 @@ func (h *Handler) UpdateInvoice(c *gin.Context) {
 		notes = *req.Notes
 	}
 
-	if _, err := h.db.Exec(`UPDATE invoices SET status=COALESCE(NULLIF($1,''),status),
+	// Check and change inside one transaction with the invoice row locked, the same lock a
+	// payment takes. Otherwise a payment landing between the check and the update could be
+	// recorded on an invoice that is then cancelled or re-priced.
+	tx, err := h.db.Begin()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to begin transaction")
+		return
+	}
+	defer tx.Rollback()
+	var cur string
+	if err := tx.QueryRow(`SELECT status FROM invoices WHERE id=$1 FOR UPDATE`, id).Scan(&cur); err != nil {
+		respondError(c, http.StatusNotFound, "invoice not found")
+		return
+	}
+	var paid float64
+	tx.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM payments WHERE invoice_id=$1 AND status='confirmed'`, id).Scan(&paid)
+	if cur == "paid" || cur == "cancelled" {
+		respondError(c, http.StatusConflict, "paid and cancelled invoices cannot be edited; reverse the payment first")
+		return
+	}
+	if paid > 0 && (req.Amount > 0 || req.Status == "cancelled") {
+		respondError(c, http.StatusConflict, "this invoice has payments; reverse them before changing the amount or cancelling")
+		return
+	}
+	if req.Amount > 0 && round2(req.Amount) <= 0 {
+		respondError(c, http.StatusBadRequest, "amount must be at least 0.01")
+		return
+	}
+	if _, err := tx.Exec(`UPDATE invoices SET status=COALESCE(NULLIF($1,''),status),
 		amount=CASE WHEN $2::numeric > 0 THEN $2::numeric ELSE amount END,
 		due_date=COALESCE($3::date,due_date),
 		notes=COALESCE($4,notes),
 		updated_at=NOW() WHERE id=$5`,
-		req.Status, req.Amount, dueDate, notes, id); err != nil {
+		req.Status, round2(req.Amount), dueDate, notes, id); err != nil {
 		h.log.WithError(err).Error("update invoice")
+		respondError(c, http.StatusInternalServerError, "failed to update invoice")
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to update invoice")
 		return
 	}

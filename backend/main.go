@@ -204,7 +204,7 @@ func main() {
 		router.Use(cors.New(cors.Config{
 			AllowOrigins:     strings.Split(strings.ReplaceAll(origins, " ", ""), ","),
 			AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Requested-With", "X-Portal-Token"},
+			AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Requested-With", "X-Portal-Token", "Idempotency-Key"},
 			ExposeHeaders:    []string{"Content-Length", "X-Request-ID"},
 			AllowCredentials: false,
 			MaxAge:           12 * time.Hour,

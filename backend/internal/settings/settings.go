@@ -1,12 +1,7 @@
-// Package settings reads the editable system_settings table (Settings page / setup wizard).
-//
-// Lookup order for every key: the database row if it exists and parses, then the named
-// environment variable (if any), then the built-in default. Values are cached for 30 seconds
-// so per-request callers (session timeout, MFA requirement) do not hit the database each
-// time; Invalidate() is called after the Settings page saves.
 package settings
 
 import (
+	"context"
 	"database/sql"
 	"os"
 	"strconv"
@@ -15,53 +10,94 @@ import (
 	"time"
 )
 
-const ttl = 30 * time.Second
+// Package settings reads the editable system_settings table (Settings page / setup wizard).
+//
+// Lookup order for every key: the database row if it exists and parses, then the named
+// environment variable (if any), then the built-in default.
+//
+// The whole table is held in memory and refreshed in the background every few seconds, so a
+// lookup never touches the database. That matters: billing code calls settings while it
+// already holds a database connection inside a transaction, and a lookup that needed a
+// second connection could leave every pooled connection waiting for another one (a deadlock
+// under load). Invalidate() reloads at once after the Settings page saves.
 
-type entry struct {
-	value   string
-	found   bool
-	fetched time.Time
-}
+const refreshEvery = 15 * time.Second
 
 var (
-	db    *sql.DB
-	mu    sync.Mutex
-	cache = map[string]entry{}
+	mu     sync.RWMutex
+	values = map[string]string{}
+	db     *sql.DB
+	gen    int // bumped by Init so an old refresher goroutine exits
 )
 
-// Init gives the package its database handle. Before Init, lookups use env/defaults only.
+// Init gives the package its database handle, loads the table, and keeps it fresh. Before
+// Init, lookups use env/defaults only.
 func Init(d *sql.DB) {
 	mu.Lock()
 	db = d
-	cache = map[string]entry{}
+	gen++
+	g := gen
+	values = map[string]string{}
 	mu.Unlock()
+
+	reload(d)
+	go func() {
+		t := time.NewTicker(refreshEvery)
+		defer t.Stop()
+		for range t.C {
+			mu.RLock()
+			current := g == gen
+			mu.RUnlock()
+			if !current {
+				return
+			}
+			reload(d)
+		}
+	}()
 }
 
-// Invalidate drops cached values so the next lookup re-reads the table.
+// Invalidate reloads the table now so a just-saved setting takes effect immediately.
 func Invalidate() {
+	mu.RLock()
+	d := db
+	mu.RUnlock()
+	if d != nil {
+		reload(d)
+	}
+}
+
+// reload replaces the in-memory copy. On a database error the previous copy is kept.
+func reload(d *sql.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := d.QueryContext(ctx, `SELECT key, value FROM system_settings`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	fresh := map[string]string{}
+	for rows.Next() {
+		var k string
+		var v sql.NullString
+		if rows.Scan(&k, &v) == nil && v.Valid {
+			fresh[k] = strings.TrimSpace(v.String)
+		}
+	}
+	if rows.Err() != nil {
+		return
+	}
 	mu.Lock()
-	cache = map[string]entry{}
+	if d == db {
+		values = fresh
+	}
 	mu.Unlock()
 }
 
 func lookup(key string) (string, bool) {
-	mu.Lock()
-	e, ok := cache[key]
-	d := db
-	mu.Unlock()
-	if ok && time.Since(e.fetched) < ttl {
-		return e.value, e.found
-	}
-	if d == nil {
-		return "", false
-	}
-	var v sql.NullString
-	err := d.QueryRow(`SELECT value FROM system_settings WHERE key = $1`, key).Scan(&v)
-	e = entry{value: strings.TrimSpace(v.String), found: err == nil && v.Valid, fetched: time.Now()}
-	mu.Lock()
-	cache[key] = e
-	mu.Unlock()
-	return e.value, e.found
+	mu.RLock()
+	defer mu.RUnlock()
+	v, ok := values[key]
+	return v, ok
 }
 
 // String returns the setting, or env var envName (may be ""), or def.

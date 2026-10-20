@@ -29,6 +29,8 @@ var (
 	errInvoiceNotOpen   = errors.New("invoice is not open (already paid or cancelled)")
 	errCurrencyMismatch = errors.New("payment currency does not match the invoice")
 	errOverpayment      = errors.New("payment is larger than the amount still owed on the invoice")
+	errDuplicateRequest = errors.New("this request was already processed")
+	errKeyMismatch      = errors.New("this idempotency key was already used for a different payment")
 )
 
 // round2 rounds money to cents. Amounts are NUMERIC(12,2) in the database; Go only computes
@@ -49,21 +51,28 @@ func nextDocNumber(q dbtx, prefix, sequence string) (string, error) {
 	return fmt.Sprintf("%s-%d-%06d", prefix, time.Now().Year(), n), nil
 }
 
-// promoDiscount computes the discount a promotion gives on an amount.
+// promoDiscount computes the discount a promotion gives on an amount. The arithmetic is done
+// in whole cents: a float calculation turns exact half-cents (33% of 25.50 is 8.415) into the
+// wrong cent about once in a thousand prices. Halves round up.
 func promoDiscount(discountType string, value, amount float64) float64 {
-	var d float64
+	priceC := int64(math.Round(amount * 100))
+	valueC := int64(math.Round(value * 100)) // cents, or hundredths of a percent
+	var d int64
 	if discountType == "percent" {
-		d = amount * value / 100
+		if valueC > 10000 {
+			valueC = 10000
+		}
+		d = (priceC*valueC + 5000) / 10000
 	} else {
-		d = value
+		d = valueC
 	}
-	if d > amount {
-		d = amount
+	if d > priceC {
+		d = priceC
 	}
 	if d < 0 {
 		d = 0
 	}
-	return round2(d)
+	return float64(d) / 100
 }
 
 // redeemPromotion validates a code for a plan and consumes one use atomically, so the
@@ -128,6 +137,9 @@ type newInvoice struct {
 	ServiceApplied bool
 	AppliedDays    int
 	PeriodEnd      *time.Time
+	// PlanDays is how many days paying this invoice buys. It is copied from the plan when the
+	// invoice is raised, so editing the plan later does not change what an open invoice buys.
+	PlanDays *int
 }
 
 type createdInvoice struct {
@@ -157,9 +169,12 @@ func createInvoiceTx(q dbtx, in newInvoice) (*createdInvoice, error) {
 		out.Amount = round2(out.Amount - d)
 		promo = strings.ToUpper(strings.TrimSpace(in.PromoCode))
 	}
-	if in.DueDate == nil {
-		due := time.Now().AddDate(0, 0, settings.Int("invoice_due_days", "", 7))
-		in.DueDate = &due
+	// The default due date is worked out by the database (CURRENT_DATE), the same clock that
+	// decides what is overdue and when access ends, so a server whose Go clock or timezone
+	// differs from the database cannot shift it by a day.
+	var due interface{}
+	if in.DueDate != nil {
+		due = in.DueDate.Format("2006-01-02")
 	}
 	number, err := nextDocNumber(q, "INV", "invoice_number_seq")
 	if err != nil {
@@ -169,11 +184,11 @@ func createInvoiceTx(q dbtx, in newInvoice) (*createdInvoice, error) {
 	err = q.QueryRow(`
 		INSERT INTO invoices (invoice_number, user_id, username, plan_id, plan_name, amount, currency,
 		                      due_date, notes, created_by, promo_code, discount_amount,
-		                      service_applied, applied_days, period_end)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+		                      service_applied, applied_days, period_end, plan_days)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8::date, CURRENT_DATE + $16::int),$9,$10,$11,$12,$13,$14,$15,$17) RETURNING id`,
 		number, in.UserID, in.Username, in.PlanID, in.PlanName, out.Amount, in.Currency,
-		in.DueDate.Format("2006-01-02"), nullableString(in.Notes), in.CreatedBy, promo, out.Discount,
-		in.ServiceApplied, in.AppliedDays, in.PeriodEnd).Scan(&out.ID)
+		due, nullableString(in.Notes), in.CreatedBy, promo, out.Discount,
+		in.ServiceApplied, in.AppliedDays, in.PeriodEnd, settings.Int("invoice_due_days", "", 7), in.PlanDays).Scan(&out.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +205,9 @@ type paymentInput struct {
 	GatewayRef    string
 	Notes         string
 	ProcessedBy   *int
+	// IdempotencyKey is a one-time ID chosen by the client for this attempt. Sending the same
+	// key again returns the payment recorded the first time instead of recording another.
+	IdempotencyKey string
 }
 
 type paymentOutcome struct {
@@ -199,6 +217,36 @@ type paymentOutcome struct {
 	PeriodGranted bool
 	NewExpiry     *time.Time
 	Username      string
+	Replayed      bool // the idempotency key had been used: this is the original payment, nothing new was recorded
+}
+
+// replayPayment looks up the payment an idempotency key was used for. found is false if the
+// key is new. If the key was used for a different invoice, customer or amount it is an error:
+// the client reused an ID for a new payment.
+func replayPayment(q dbtx, in paymentInput) (out *paymentOutcome, found bool, err error) {
+	var id int
+	var receipt, status string
+	var invoiceID sql.NullInt64
+	var username sql.NullString
+	var amount float64
+	err = q.QueryRow(`SELECT id, receipt_number, invoice_id, username, amount, status FROM payments
+		WHERE idempotency_key = $1`, in.IdempotencyKey).Scan(&id, &receipt, &invoiceID, &username, &amount, &status)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	sameInvoice := (in.InvoiceID == nil && !invoiceID.Valid) ||
+		(in.InvoiceID != nil && invoiceID.Valid && int64(*in.InvoiceID) == invoiceID.Int64)
+	if !sameInvoice || round2(in.Amount) != amount {
+		return nil, true, errKeyMismatch
+	}
+	out = &paymentOutcome{PaymentID: id, Receipt: receipt, Username: username.String, Replayed: true}
+	if invoiceID.Valid {
+		q.QueryRow(`SELECT status = 'paid' FROM invoices WHERE id = $1`, invoiceID.Int64).Scan(&out.InvoicePaid)
+	}
+	return out, true, nil
 }
 
 // recordPaymentTx records money received. With an invoice it validates the invoice, and
@@ -222,17 +270,25 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 		userID         sql.NullInt64
 		planID         sql.NullInt64
 		serviceApplied bool
+		planDays       sql.NullInt64
 		paid           float64
 	}
 	if in.InvoiceID != nil {
-		err := q.QueryRow(`SELECT amount, currency, status, username, user_id, plan_id, service_applied
+		err := q.QueryRow(`SELECT amount, currency, status, username, user_id, plan_id, service_applied, plan_days
 			FROM invoices WHERE id = $1 FOR UPDATE`, *in.InvoiceID).
-			Scan(&inv.amount, &inv.currency, &inv.status, &inv.username, &inv.userID, &inv.planID, &inv.serviceApplied)
+			Scan(&inv.amount, &inv.currency, &inv.status, &inv.username, &inv.userID, &inv.planID, &inv.serviceApplied, &inv.planDays)
 		if err == sql.ErrNoRows {
 			return nil, errors.New("invoice not found")
 		}
 		if err != nil {
 			return nil, err
+		}
+		// The invoice row is locked now, so a retry of an earlier request that committed in the
+		// meantime is visible here and is answered with its original result, not "not open".
+		if in.IdempotencyKey != "" {
+			if out, found, err := replayPayment(q, in); found {
+				return out, err
+			}
 		}
 		if inv.status != "pending" && inv.status != "overdue" {
 			return nil, errInvoiceNotOpen
@@ -259,6 +315,12 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 	}
 	out.Username = in.Username
 
+	if in.InvoiceID == nil && in.IdempotencyKey != "" {
+		if out, found, err := replayPayment(q, in); found {
+			return out, err
+		}
+	}
+
 	receipt, err := nextDocNumber(q, "RCP", "receipt_number_seq")
 	if err != nil {
 		return nil, err
@@ -266,13 +328,18 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 	out.Receipt = receipt
 	err = q.QueryRow(`
 		INSERT INTO payments (invoice_id, username, amount, currency, payment_method,
-		                      gateway, gateway_ref, notes, receipt_number, status, processed_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed',$10) RETURNING id`,
+		                      gateway, gateway_ref, notes, receipt_number, status, processed_by, idempotency_key)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'confirmed',$10,$11) RETURNING id`,
 		in.InvoiceID, nullableString(in.Username), in.Amount, in.Currency, in.PaymentMethod,
 		nullableString(in.Gateway), nullableString(in.GatewayRef), nullableString(in.Notes),
-		receipt, in.ProcessedBy).Scan(&out.PaymentID)
+		receipt, in.ProcessedBy, nullableString(in.IdempotencyKey)).Scan(&out.PaymentID)
 	if err != nil {
-		if isUniqueViolation(err) {
+		switch uniqueViolationConstraint(err) {
+		case "payments_idempotency_key_unique":
+			// Two copies of one request raced past the checks above; the loser lands here.
+			return nil, errDuplicateRequest
+		case "":
+		default:
 			return nil, errors.New("a payment with this gateway reference is already recorded")
 		}
 		return nil, err
@@ -295,6 +362,9 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 		p, err := loadPlan(q, int(inv.planID.Int64))
 		if err != nil {
 			return nil, fmt.Errorf("plan of invoice: %w", err)
+		}
+		if inv.planDays.Valid && inv.planDays.Int64 > 0 {
+			p.ValidityDays = int(inv.planDays.Int64) // what the invoice was sold as
 		}
 		exp, days, err := grantPlanPeriod(q, uid, p)
 		if err != nil {
@@ -388,10 +458,25 @@ type assignResult struct {
 	Expiry    *time.Time
 }
 
+// lockUser takes the customer's row lock for the rest of the transaction. Anything that
+// decides "does this customer already have an open invoice?" and then acts on the answer
+// (assigning a plan, raising a renewal) must hold it, otherwise two of them running at the
+// same moment both see "no" and both raise an invoice. It also serialises changes to the
+// paid-until date. Returns sql.ErrNoRows if the customer no longer exists.
+func lockUser(q dbtx, userID int) error {
+	var one int
+	return q.QueryRow(`SELECT 1 FROM radius_users WHERE id = $1 FOR UPDATE`, userID).Scan(&one)
+}
+
 // assignPlanTx links a plan to a customer, applies its limits and handles billing:
 // free plans start at once; paid plans get an invoice (unless one is already open for
 // the same plan) and start when paid, or at once with startNow.
 func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool, promoCode string, by *int) (*assignResult, error) {
+	if err := lockUser(q, userID); err == sql.ErrNoRows {
+		return nil, errors.New("user not found")
+	} else if err != nil {
+		return nil, err
+	}
 	p, err := loadPlan(q, planID)
 	if err == sql.ErrNoRows {
 		return nil, errors.New("plan not found")
@@ -403,6 +488,17 @@ func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool
 		return nil, errors.New("plan is inactive")
 	}
 	if err := applyPlanLimits(q, userID, username, p); err != nil {
+		return nil, err
+	}
+	// Moving to another plan withdraws the unpaid invoices for the old one (a renewal the
+	// customer will no longer take). Invoices with money already on them, or whose period was
+	// started on credit, are left for staff to settle.
+	if _, err := q.Exec(`UPDATE invoices SET status = 'cancelled', updated_at = NOW(),
+			notes = COALESCE(notes || E'\n', '') || 'Cancelled automatically: customer moved to another plan'
+		WHERE user_id = $1 AND plan_id IS NOT NULL AND plan_id <> $2 AND status IN ('pending','overdue')
+		  AND NOT service_applied
+		  AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = invoices.id AND p.status = 'confirmed')`,
+		userID, p.ID); err != nil {
 		return nil, err
 	}
 	res := &assignResult{}
@@ -442,7 +538,7 @@ func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool
 
 	in := newInvoice{
 		UserID: &userID, Username: username, PlanID: &p.ID, PlanName: &p.Name,
-		Amount: p.Price, Currency: p.Currency, PromoCode: promoCode, CreatedBy: by,
+		Amount: p.Price, Currency: p.Currency, PromoCode: promoCode, CreatedBy: by, PlanDays: &p.ValidityDays,
 	}
 	if startNow {
 		exp, days, err := grantPlanPeriod(q, userID, p)

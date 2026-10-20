@@ -159,33 +159,69 @@ func StartScheduler(db *database.DB, log *logrus.Logger) {
 	}()
 }
 
-func runDueTasks(db *database.DB, log *logrus.Logger) {
+type dueTask struct {
+	id       int
+	taskType string
+	schedule string
+}
+
+// listDueTasks returns the active tasks whose next_run is empty or past.
+func listDueTasks(db *database.DB) ([]dueTask, error) {
 	rows, err := db.Query(`
 		SELECT id, task_type, schedule FROM scheduled_tasks
 		WHERE is_active=true AND (next_run IS NULL OR next_run <= NOW())
 		ORDER BY id`)
 	if err != nil {
-		log.WithError(err).Warn("scheduler: cannot read tasks")
-		return
+		return nil, err
 	}
-
-	type task struct {
-		id       int
-		taskType string
-		schedule string
-	}
-	tasks := []task{}
+	defer rows.Close()
+	var tasks []dueTask
 	for rows.Next() {
-		var t task
+		var t dueTask
 		if rows.Scan(&t.id, &t.taskType, &t.schedule) == nil {
 			tasks = append(tasks, t)
 		}
 	}
-	rows.Close()
+	return tasks, nil
+}
 
+// claimLease is how long a claimed task is reserved for the backend that claimed it. If that
+// backend dies mid-task, the task becomes due again after the lease.
+const claimLease = 15 * time.Minute
+
+// claimTask atomically reserves a due task for this backend. Two backend copies that read the
+// same due list both try; only one UPDATE matches, because the first one moves next_run into
+// the future. Without this a task could run twice, back to back, once the first copy had
+// released the advisory lock.
+func claimTask(db *database.DB, id int) bool {
+	res, err := db.Exec(`UPDATE scheduled_tasks SET next_run = NOW() + $2::interval
+		WHERE id = $1 AND is_active AND (next_run IS NULL OR next_run <= NOW())`,
+		id, fmt.Sprintf("%d seconds", int(claimLease.Seconds())))
+	if err != nil {
+		return false
+	}
+	n, _ := res.RowsAffected()
+	return n == 1
+}
+
+func runDueTasks(db *database.DB, log *logrus.Logger) {
+	tasks, err := listDueTasks(db)
+	if err != nil {
+		log.WithError(err).Warn("scheduler: cannot read tasks")
+		return
+	}
+	runTaskList(db, log, tasks)
+}
+
+func runTaskList(db *database.DB, log *logrus.Logger, tasks []dueTask) {
 	for _, t := range tasks {
+		if !claimTask(db, t.id) {
+			continue // another backend took it
+		}
 		result, count, ran := runTaskLocked(db, log, t.id, t.taskType)
 		if !ran {
+			// Still running elsewhere (e.g. started by hand): give the claim back.
+			db.Exec(`UPDATE scheduled_tasks SET next_run = NOW() WHERE id = $1`, t.id)
 			continue
 		}
 		db.Exec(`UPDATE scheduled_tasks SET last_run=NOW(), next_run=$1, last_result=$2 WHERE id=$3`,
@@ -193,6 +229,9 @@ func runDueTasks(db *database.DB, log *logrus.Logger) {
 		log.Infof("Scheduler: ran '%s' — %s (%d)", t.taskType, result, count)
 	}
 }
+
+// taskRunHook lets a test count how many times a task really executes. Nil in production.
+var taskRunHook func(taskType string)
 
 var localTaskLocks sync.Map
 
@@ -223,6 +262,9 @@ func runTaskLocked(db *database.DB, log *logrus.Logger, id int, taskType string)
 
 // runTask executes the logic for a given task type and returns a description and a count.
 func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int) {
+	if taskRunHook != nil {
+		taskRunHook(taskType)
+	}
 	switch taskType {
 
 	case "expire_accounts":
@@ -425,7 +467,7 @@ func collectUsers(rows *sql.Rows) []userRef {
 func raiseRenewalInvoices(db *database.DB, log *logrus.Logger) (string, int) {
 	days := settings.Int("renewal_invoice_days", "", 3)
 	rows, err := db.Query(`
-		SELECT ru.id, ru.username, ru.plan_id, ru.account_expiry
+		SELECT ru.id, ru.username
 		FROM radius_users ru
 		JOIN user_plans up ON up.id = ru.plan_id AND up.is_active
 		WHERE ru.status = 'active'
@@ -437,14 +479,13 @@ func raiseRenewalInvoices(db *database.DB, log *logrus.Logger) (string, int) {
 		return "renew_plans failed: " + err.Error(), 0
 	}
 	type cand struct {
-		id, planID int
-		name       string
-		expiry     time.Time
+		id   int
+		name string
 	}
 	var list []cand
 	for rows.Next() {
 		var c cand
-		if rows.Scan(&c.id, &c.name, &c.planID, &c.expiry) == nil {
+		if rows.Scan(&c.id, &c.name) == nil {
 			list = append(list, c)
 		}
 	}
@@ -452,13 +493,37 @@ func raiseRenewalInvoices(db *database.DB, log *logrus.Logger) (string, int) {
 
 	invoices, extended := 0, 0
 	for _, c := range list {
+		var inv *createdInvoice
+		var wasFree bool
 		err := func() error {
 			tx, err := db.Begin()
 			if err != nil {
 				return err
 			}
 			defer tx.Rollback()
-			p, err := loadPlan(tx, c.planID)
+			// The list above is a snapshot. Lock the customer and look again: a staff member may
+			// have assigned a plan, or another renewal run may have raised the invoice, in the
+			// meantime.
+			if err := lockUser(tx, c.id); err != nil {
+				return err
+			}
+			var planID int
+			var expiry, due time.Time
+			err = tx.QueryRow(`
+				SELECT ru.plan_id, ru.account_expiry, GREATEST(ru.account_expiry, CURRENT_DATE)
+				FROM radius_users ru JOIN user_plans up ON up.id = ru.plan_id AND up.is_active
+				WHERE ru.id = $1 AND ru.status = 'active' AND ru.account_expiry IS NOT NULL
+				  AND ru.account_expiry BETWEEN CURRENT_DATE - 1 AND CURRENT_DATE + $2::int
+				  AND NOT EXISTS (SELECT 1 FROM invoices i
+				                  WHERE i.user_id = ru.id AND i.status IN ('pending','overdue'))`,
+				c.id, days).Scan(&planID, &expiry, &due)
+			if err == sql.ErrNoRows {
+				return nil // no longer needs one
+			}
+			if err != nil {
+				return err
+			}
+			p, err := loadPlan(tx, planID)
 			if err != nil {
 				return err
 			}
@@ -466,29 +531,28 @@ func raiseRenewalInvoices(db *database.DB, log *logrus.Logger) (string, int) {
 				if _, _, err := grantPlanPeriod(tx, c.id, p); err != nil {
 					return err
 				}
-				extended++
+				wasFree = true
 				return tx.Commit()
 			}
-			due := c.expiry
-			if due.Before(time.Now().Truncate(24 * time.Hour)) {
-				due = time.Now()
-			}
-			inv, err := createInvoiceTx(tx, newInvoice{UserID: &c.id, Username: c.name, PlanID: &p.ID,
-				PlanName: &p.Name, Amount: p.Price, Currency: p.Currency, DueDate: &due,
-				Notes: "Renewal for the period after " + c.expiry.Format("2006-01-02")})
+			inv, err = createInvoiceTx(tx, newInvoice{UserID: &c.id, Username: c.name, PlanID: &p.ID,
+				PlanName: &p.Name, Amount: p.Price, Currency: p.Currency, DueDate: &due, PlanDays: &p.ValidityDays,
+				Notes: "Renewal for the period after " + expiry.Format("2006-01-02")})
 			if err != nil {
 				return err
 			}
-			if err := tx.Commit(); err != nil {
-				return err
-			}
-			invoices++
-			go dispatchWebhookDB(db, "invoice.created", gin.H{"invoice_id": inv.ID, "invoice_number": inv.Number,
-				"username": c.name, "amount": inv.Amount, "renewal": true})
-			return nil
+			return tx.Commit()
 		}()
 		if err != nil {
 			log.WithError(err).Warnf("renewal for %s", c.name)
+			continue
+		}
+		if wasFree {
+			extended++
+		}
+		if inv != nil {
+			invoices++
+			go dispatchWebhookDB(db, "invoice.created", gin.H{"invoice_id": inv.ID, "invoice_number": inv.Number,
+				"username": c.name, "amount": inv.Amount, "renewal": true})
 		}
 	}
 	return fmt.Sprintf("%d renewal invoice(s) raised, %d free plan(s) extended", invoices, extended), invoices + extended

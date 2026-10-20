@@ -189,20 +189,30 @@ func grantPlanPeriod(q dbtx, userID int, p *planRow) (time.Time, int, error) {
 	if days <= 0 {
 		days = 30
 	}
+	// Read the old date first (locking the row) in its own statement. Doing it in a CTE of
+	// the UPDATE looks equivalent but is not: the CTE is evaluated after the row was already
+	// updated, so the "old" date came back empty and every early renewal recorded one day too
+	// many (plus the days still left), which a later reversal then wrongly took back.
+	var old sql.NullTime
+	if err := q.QueryRow(`SELECT account_expiry FROM radius_users WHERE id = $1 FOR UPDATE`, userID).Scan(&old); err != nil {
+		return time.Time{}, 0, err
+	}
+	var oldArg interface{}
+	if old.Valid {
+		oldArg = old.Time.Format("2006-01-02")
+	}
 	var username string
 	var newExpiry time.Time
 	var moved int
 	err := q.QueryRow(`
-		WITH old AS (SELECT account_expiry FROM radius_users WHERE id = $2 FOR UPDATE)
 		UPDATE radius_users SET
 		    account_expiry = GREATEST(COALESCE(account_expiry, CURRENT_DATE), CURRENT_DATE) + $1::int,
 		    period_start   = CURRENT_DATE,
 		    status         = CASE WHEN status = 'expired' THEN 'active' ELSE status END,
 		    updated_at     = NOW()
 		WHERE id = $2
-		RETURNING username, account_expiry,
-		          account_expiry - COALESCE((SELECT account_expiry FROM old), CURRENT_DATE - 1)`,
-		days, userID).Scan(&username, &newExpiry, &moved)
+		RETURNING username, account_expiry, account_expiry - COALESCE($3::date, CURRENT_DATE - 1)`,
+		days, userID, oldArg).Scan(&username, &newExpiry, &moved)
 	if err != nil {
 		return time.Time{}, 0, err
 	}
@@ -210,11 +220,12 @@ func grantPlanPeriod(q dbtx, userID int, p *planRow) (time.Time, int, error) {
 }
 
 // blockUntilPaid sets an unpaid customer's paid-until date to yesterday (status expired)
-// unless they still have paid time left.
+// unless they still have paid time left. Grace days are subtracted as well, so a customer who
+// has never paid cannot be rescued by the grace period: it is for people who paid before.
 func blockUntilPaid(q dbtx, userID int) error {
 	var username string
 	err := q.QueryRow(`
-		UPDATE radius_users SET account_expiry = CURRENT_DATE - 1,
+		UPDATE radius_users SET account_expiry = CURRENT_DATE - 1 - $2::int,
 		       status = CASE WHEN status = 'active' THEN 'expired' ELSE status END, updated_at = NOW()
 		WHERE id = $1 AND (account_expiry IS NULL OR account_expiry + $2::int < CURRENT_DATE)
 		RETURNING username`, userID, graceDays()).Scan(&username)

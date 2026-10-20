@@ -208,6 +208,19 @@ func (h *Handler) DeleteAdminUser(c *gin.Context) {
 }
 
 // isUniqueViolation reports a PostgreSQL unique_violation (SQLSTATE 23505).
+// uniqueViolationConstraint returns the name of the unique index a failed insert violated,
+// or "" if err is not a unique violation.
+func uniqueViolationConstraint(err error) string {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+		if pqErr.Constraint == "" {
+			return "unknown"
+		}
+		return pqErr.Constraint
+	}
+	return ""
+}
+
 func isUniqueViolation(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && pqErr.Code == "23505"

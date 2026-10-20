@@ -33,6 +33,7 @@ services:
       - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./migrations/009_billing.sql:/docker-entrypoint-initdb.d/02-billing.sql:ro
       - ./migrations/010_missing_schema.sql:/docker-entrypoint-initdb.d/03-missing-schema.sql:ro
+      - ./migrations/011_billing_integrity.sql:/docker-entrypoint-initdb.d/04-billing-integrity.sql:ro
     networks:
       - radius-network
     healthcheck:
