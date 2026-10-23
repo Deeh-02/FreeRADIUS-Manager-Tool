@@ -1,9 +1,13 @@
 package handlers
 
 import (
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
+
+	"github.com/freeradius-manager/backend/internal/database"
+	"github.com/gin-gonic/gin"
 )
 
 // exactDiscountCents is the discount in whole cents worked out with exact fractions,
@@ -167,38 +171,6 @@ func TestPlanChangesWhileInvoiceOpen(t *testing.T) {
 	failIf(t, checkMoney(db))
 }
 
-// Deleting a customer who still owes: the invoice stays, can still be paid, and nothing breaks.
-func TestDeleteCustomerWithOpenInvoice(t *testing.T) {
-	db := resetTestDB(t)
-	plan := seedPlan(t, db, "Monthly", 100, 30)
-	uid := seedUser(t, db, "gone", nil)
-	res, err := assignTx(db, uid, "gone", plan.ID, false, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := payTx(db, paymentInput{InvoiceID: &res.InvoiceID, Amount: 40}); err != nil {
-		t.Fatal(err)
-	}
-	tx, _ := db.Begin()
-	if err := deleteRadiusUserTx(tx, uid, "gone"); err != nil {
-		t.Fatal(err)
-	}
-	tx.Commit()
-
-	if n := scanInt(t, db, `SELECT COUNT(*) FROM invoices WHERE username='gone' AND user_id IS NULL`); n != 1 {
-		t.Fatalf("invoice history lost on delete (%d rows)", n)
-	}
-	// The renewal task must ignore the orphan, and the remainder can still be received.
-	raiseRenewalInvoices(db, testLogger())
-	if _, err := payTx(db, paymentInput{InvoiceID: &res.InvoiceID, Amount: 60}); err != nil {
-		t.Errorf("paying the orphaned invoice failed: %v", err)
-	}
-	failIf(t, checkMoney(db))
-	if n := scanInt(t, db, `SELECT COUNT(*) FROM radcheck WHERE username='gone'`); n != 0 {
-		t.Errorf("%d radcheck rows left for a deleted customer: they could still log in", n)
-	}
-}
-
 // A failure part-way through a payment (database error, crash, lost connection) must leave
 // nothing behind: no payment without its days, no days without a payment. A trigger that
 // refuses the paid-until update stands in for the crash, after the payment row is written.
@@ -230,4 +202,70 @@ func TestPaymentIsAllOrNothing(t *testing.T) {
 		t.Errorf("paid-until moved to today%+d by a failed payment", days)
 	}
 	failIf(t, checkMoney(db))
+}
+
+// Staff extend one customer's grace after they ask: an expired-but-paid customer is let back
+// in at once, a customer who never paid is not, and shortening it blocks again.
+func TestExtendingGraceDays(t *testing.T) {
+	db := resetTestDB(t)
+	h := newTestHandler(t)
+	plan := seedPlan(t, db, "Monthly", 100, 30)
+
+	paid := seedUser(t, db, "paid-then-lapsed", nil)
+	res, _ := assignTx(db, paid, "paid-then-lapsed", plan.ID, false, "")
+	if _, err := payTx(db, paymentInput{InvoiceID: &res.InvoiceID, Amount: 100}); err != nil {
+		t.Fatal(err)
+	}
+	// Time passes: the paid period ended 3 days ago and the daily task blocked them.
+	mustExec(t, db, `UPDATE radius_users SET account_expiry = CURRENT_DATE - 3 WHERE id=$1`, paid)
+	runTask(db, testLogger(), "expire_accounts")
+	if ok, _ := radiusDecisionFor(t, db, "paid-then-lapsed"); ok {
+		t.Fatal("a customer 3 days past paid-until with no grace was still allowed")
+	}
+
+	never := seedUser(t, db, "never-paid", nil)
+	if _, err := assignTx(db, never, "never-paid", plan.ID, false, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, id := range []int{paid, never} {
+		code, resp := callHandler(h.UpdateRadiusUser, gin.Params{{Key: "id", Value: fmt.Sprint(id)}}, nil, map[string]interface{}{"grace_days": 5})
+		if code != 200 {
+			t.Fatalf("update: %d %v", code, resp)
+		}
+	}
+	if ok, why := radiusDecisionFor(t, db, "paid-then-lapsed"); !ok {
+		t.Errorf("customer within their extended grace is still blocked (%s)", why)
+	}
+	if ok, _ := radiusDecisionFor(t, db, "never-paid"); ok {
+		t.Error("a longer grace let in a customer who has never paid")
+	}
+	failIf(t, checkEnforcement(db))
+
+	// The extension runs out: the daily task blocks them again.
+	mustExec(t, db, `UPDATE radius_users SET account_expiry = CURRENT_DATE - 6 WHERE id=$1`, paid)
+	runTask(db, testLogger(), "expire_accounts")
+	if ok, _ := radiusDecisionFor(t, db, "paid-then-lapsed"); ok {
+		t.Error("customer past their extended grace is still allowed")
+	}
+	// Back to the system default (0): blocked immediately even if they were inside the extension.
+	mustExec(t, db, `UPDATE radius_users SET account_expiry = CURRENT_DATE - 2 WHERE id=$1`, paid)
+	callHandler(h.UpdateRadiusUser, gin.Params{{Key: "id", Value: fmt.Sprint(paid)}}, nil, map[string]interface{}{"grace_days": 5})
+	callHandler(h.UpdateRadiusUser, gin.Params{{Key: "id", Value: fmt.Sprint(paid)}}, nil, map[string]interface{}{"clear_grace_days": true})
+	if ok, _ := radiusDecisionFor(t, db, "paid-then-lapsed"); ok {
+		t.Error("clearing the customer's grace days did not block a customer past the default grace")
+	}
+	failIf(t, checkEnforcement(db))
+}
+
+func radiusDecisionFor(t *testing.T, db *database.DB, username string) (bool, string) {
+	t.Helper()
+	var today time.Time
+	db.QueryRow(`SELECT CURRENT_DATE`).Scan(&today)
+	var hasRows, reject bool
+	var exp *string
+	db.QueryRow(`SELECT EXISTS (SELECT 1 FROM radcheck WHERE username=$1),
+		EXISTS (SELECT 1 FROM radcheck WHERE username=$1 AND attribute='Auth-Type' AND value='Reject'),
+		(SELECT value FROM radcheck WHERE username=$1 AND attribute='Expiration')`, username).Scan(&hasRows, &reject, &exp)
+	return radiusDecision(today, hasRows, reject, exp)
 }

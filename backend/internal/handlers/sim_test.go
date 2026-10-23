@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -107,7 +108,7 @@ func TestTimeSimulation(t *testing.T) {
 	seed := int64(simEnv("SIM_SEED", 1))
 	db := resetTestDB(t)
 	mustExec(t, db, `INSERT INTO system_settings (key, value) VALUES
-		('billing_grace_days','1'), ('renewal_invoice_days','3'), ('invoice_due_days','7')`)
+		('billing_grace_days','1'), ('renewal_invoice_days','3'), ('invoice_due_days','7'), ('trial_days','4')`)
 	settings.Invalidate()
 
 	s := &simulation{t: t, db: db, h: &Handler{db: db, log: testLogger()}, rng: rand.New(rand.NewSource(seed)),
@@ -440,6 +441,20 @@ func (s *simulation) randomStaffActions(free *planRow) {
 			}
 		}
 	}
+	// A customer asks for more (or fewer) grace days; staff change it on the customer's dialog.
+	if len(s.order) > 0 && s.rng.Intn(100) < 15 {
+		c := s.custs[s.order[s.rng.Intn(len(s.order))]]
+		if c != nil && !c.deleted {
+			body := map[string]interface{}{"grace_days": s.rng.Intn(11)}
+			if s.rng.Intn(4) == 0 {
+				body = map[string]interface{}{"clear_grace_days": true}
+			}
+			if code, resp := callHandler(s.h.UpdateRadiusUser, gin.Params{{Key: "id", Value: fmt.Sprint(c.id)}}, nil, body); code != 200 {
+				s.t.Errorf("day %d: grace change for %s refused: %v", s.day, c.name, resp)
+			}
+			s.stat("grace changes by staff")
+		}
+	}
 	// Plan switch.
 	if len(s.order) > 0 && s.rng.Intn(100) < 60 {
 		c := s.custs[s.order[s.rng.Intn(len(s.order))]]
@@ -463,7 +478,12 @@ func (s *simulation) randomStaffActions(free *planRow) {
 			tx, _ := s.db.Begin()
 			if err := deleteRadiusUserTx(tx, c.id, c.name); err != nil {
 				tx.Rollback()
-				s.t.Fatalf("delete customer: %v", err)
+				var unsettled *unsettledInvoicesError
+				if !errors.As(err, &unsettled) {
+					s.t.Fatalf("delete customer: %v", err)
+				}
+				s.stat("deletes refused (money unsettled)")
+				return
 			}
 			tx.Commit()
 			c.deleted = true

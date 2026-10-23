@@ -218,7 +218,7 @@ func assignTx(db *database.DB, userID int, username string, planID int, startNow
 		return nil, err
 	}
 	defer tx.Rollback()
-	res, err := assignPlanTx(tx, userID, username, planID, startNow, promo, nil)
+	res, err := assignPlanTx(tx, userID, username, planID, startNow, promo, nil, nil)
 	if err != nil {
 		return nil, err
 	}

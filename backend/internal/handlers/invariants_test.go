@@ -126,10 +126,15 @@ func checkEnforcement(db *database.DB) []string {
 	var today time.Time
 	db.QueryRow(`SELECT CURRENT_DATE`).Scan(&today)
 	rows, err := db.Query(`SELECT ru.username, ru.status, ru.account_expiry IS NULL,
-		COALESCE(ru.account_expiry + $1::int >= CURRENT_DATE, FALSE),
+		COALESCE(ru.account_expiry + COALESCE(ru.grace_days, $1::int) >= CURRENT_DATE, FALSE),
 		EXISTS (SELECT 1 FROM radcheck r WHERE r.username = ru.username),
 		EXISTS (SELECT 1 FROM radcheck r WHERE r.username = ru.username AND r.attribute = 'Auth-Type' AND r.value = 'Reject'),
-		(SELECT r.value FROM radcheck r WHERE r.username = ru.username AND r.attribute = 'Expiration' LIMIT 1)
+		(SELECT r.value FROM radcheck r WHERE r.username = ru.username AND r.attribute = 'Expiration' LIMIT 1),
+		-- never been given a period: no invoice ever granted one, and not on a free plan. Such a
+		-- customer waits, blocked, for the first payment; the paid-until date they carry is only
+		-- a marker, so grace days must never count for them.
+		ru.trial_started IS NULL AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.user_id = ru.id AND i.service_applied)
+		  AND NOT EXISTS (SELECT 1 FROM user_plans up WHERE up.id = ru.plan_id AND up.price <= 0)
 		FROM radius_users ru`, graceDays())
 	if err != nil {
 		return []string{"query users: " + err.Error()}
@@ -137,9 +142,9 @@ func checkEnforcement(db *database.DB) []string {
 	defer rows.Close()
 	for rows.Next() {
 		var name, status string
-		var noExpiry, paidUp, hasRows, reject bool
+		var noExpiry, paidUp, hasRows, reject, neverPaid bool
 		var expiration *string
-		if err := rows.Scan(&name, &status, &noExpiry, &paidUp, &hasRows, &reject, &expiration); err != nil {
+		if err := rows.Scan(&name, &status, &noExpiry, &paidUp, &hasRows, &reject, &expiration, &neverPaid); err != nil {
 			return []string{"scan: " + err.Error()}
 		}
 		allowed, why := radiusDecision(today, hasRows, reject, expiration)
@@ -149,6 +154,8 @@ func checkEnforcement(db *database.DB) []string {
 			want = false
 		case noExpiry:
 			want = status == "active"
+		case neverPaid && status == "expired":
+			want = false
 		default:
 			want = paidUp
 		}
