@@ -77,7 +77,7 @@ These were defaulted in code; all are changeable on the **Settings** page.
 - [ ] **Renewal invoices:** how many days before paid-until. Default: 3 (`renewal_invoice_days`).
 - [ ] **Overdue postpaid invoices block service?** Default: no (`suspend_overdue`).
 - [ ] **Reminders:** days before expiry and the message. Default: 3 days, SMS/email.
-- [ ] **How customers pay:** staff-recorded (works now), or a gateway such as M-Pesa (Phase C).
+- [ ] **How customers pay:** staff-recorded, M-Pesa prompts (staff or portal) and paybill/till. M-Pesa is built and tested against a fake Daraja; choose paybill or till, and run the sandbox test ([CLOUD-TEST.md](CLOUD-TEST.md)).
 - [x] **Currency:** **KES** (new installs and new rows default to KES; existing plans keep their
       currency, so check Plans after upgrading).
 - [ ] **Tax:** decide whether invoices need VAT (Phase C).
@@ -101,7 +101,7 @@ Do this on a test server that matches production, with one real router.
 |---|---|---|
 | A.1 | Build and run the Docker images on a test server (`./setup.sh`); check every container is healthy; enable HTTPS with `COMPOSE_PROFILES=https`. Nothing in the Docker setup has been run yet. | S |
 | A.1a | **Before applying migration 011** to any database that already holds payments: check there are no duplicate payment references (`SELECT gateway, upper(gateway_ref), count(*) FROM payments WHERE status='confirmed' AND gateway_ref IS NOT NULL GROUP BY 1,2 HAVING count(*)>1`). The new unique index fails to create if there are. Fix them first. | S |
-| A.1b | **Timezone:** set `TZ` once in `.env` to your local zone and confirm PostgreSQL, FreeRADIUS and the backend all use it. Then check a customer whose paid-until is today is refused at 00:00 local time, not at 00:00 UTC. | S |
+| A.1b | **Timezone:** set `TZ` once in `.env` to your local zone and confirm PostgreSQL, FreeRADIUS and the backend all use it (the backend now logs an error at startup if it and the database disagree, Q10). Then check a customer whose paid-until is today is refused at 00:00 local time, not at 00:00 UTC. *The FreeRADIUS side is tested with a fake clock (`midnight_test.go`); check it once on the server.* | S |
 | A.5 | Set up SMTP (and SMS if used); send a test email; create alert rules for `nas_down` and `backup_failed`. Confirm the alert actually reaches you. | S |
 
 **A-2. Real router and the customer journey**
@@ -112,25 +112,34 @@ Do this on a test server that matches production, with one real router.
 | A.3 | Walk a test customer through: assign plan → offline until paid → record payment → online → expire (set paid-until to yesterday, run *Expire Accounts*) → kicked off → pay again → back online. | S |
 | A.3a | Real routers retry and time out in their own ways: record a payment while the browser is throttled or the request is cut off, and check the Record Payment dialog's retry produces one payment and one receipt. | S |
 
-**A-3. Failure and recovery** (the tests the repository does not have yet)
+**A-3. Failure and recovery**
 
-| # | Task | Size |
+All of these now exist as repeatable tests and **pass on a laptop** (`make test-e2e` in
+`backend/`, about 6 minutes; details in [ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)).
+Writing them found and fixed B23, B24, B25, N8 and Q9. What is left is to **run the same command
+on the test server** (and A.9 once against the real router).
+
+| # | Task | Status |
 |---|---|---|
-| A.7 | Restart PostgreSQL while payments are being recorded (script a loop of payments, restart the container). Afterwards run the invariant checks: no payment without its days, no days without a payment. | S–M |
-| A.8 | Stop FreeRADIUS, record payments and an expiry, start it again: the paying customer must get online, the expired one must not. | S |
-| A.9 | Make the router ignore Disconnect (firewall port 3799): billing must still complete, and the failed disconnect must be visible to staff. If it is not visible, that is a bug to fix. | S |
-| A.4 | **Restore a backup** into a scratch database, then re-run the invariant checks against it (`backend/internal/handlers/invariants_test.go`, `checkMoney` and `checkEnforcement`). Time how long a restore takes. | S |
-| A.10 | Kill the backend container in the middle of a payment (repeatedly, under a payment loop): after each restart the books must balance. | S |
+| A.7 | Restart PostgreSQL while payments are being recorded. Afterwards: no payment without its days, no days without a payment. | ✅ `TestStackPostgresCrashDuringPayments`: crash with 24 payments in flight; all settled on retry, each once; FreeRADIUS back in 200 ms (was 25 s, N8). |
+| A.8 | Stop FreeRADIUS, record payments and an expiry, start it again: the paying customer must get online, the expired one must not. | ✅ `TestStackRadiusDownDuringBilling`. |
+| A.9 | Make the router ignore Disconnect: billing must still complete, and the failed disconnect must be visible to staff. | ✅ with a fake router (`disconnect_test.go`). It was **not** visible: fixed (B24). Still check once with the real router's firewall. |
+| A.4 | **Restore a backup** into a scratch database, then re-run the invariant checks. Time how long a restore takes. | ✅ `TestStackBackupRestore`: into an empty database and over a damaged live one; every billing and RADIUS row identical, FreeRADIUS agrees. Under 1 s for 120 customers; time it on your data. |
+| A.10 | Kill the backend in the middle of a payment (repeatedly, under a payment loop): after each restart the books must balance. | ✅ `TestStackBackendKilledMidPayment`: 15 kills, 103 payments in flight, each recorded once. |
+| A.9a | Database outage: what routers and staff see, and recovery. | ✅ `TestStackDatabaseOutage`: staff were signed out by a blip (Q9, fixed); now 503 and recovery with nothing restarted. |
 
-**A-4. Load and volume** (measure on the production-class server, not a laptop)
+**A-4. Load and volume**
 
-| # | Task | Target | Size |
+Repeatable with `make test-load` (sizes via `LOAD_*`, see `load_test.go`). **Measured on a
+4-core laptop** with everything on one machine; rerun on the production-class server.
+
+| # | Task | Target | Laptop result |
 |---|---|---|---|
-| A.11 | Logins through a RADIUS load tool (`radclient`/`radperf`). Every login runs about 5 queries including a data-usage total. | Several hundred per second at your expected customer count; tell me your number. | M |
-| A.12 | Accounting flood: all sessions sending interim updates every 5 minutes, sustained for hours. | 5,000 sessions ≈ 17 updates/second with no backlog. | M |
-| A.13 | Fill the usage table (`radacct`) with 1–5 million rows; check login speed and the data-cap total. Probable fix: an index on `(username, acctstarttime)`. | Both stay in milliseconds. | S–M |
-| A.14 | Renewal and expiry tasks over your customer count, run while staff use the panel. | No lock waits that block staff. | S |
-| A.15 | Billing and Payments pages and reports with 100,000 invoices. | Pages stay quick. | S–M |
+| A.11 | Logins at full speed, answers checked against the books. | Several hundred per second. | ✅ 500/s (64 clients), 770/s (256); none lost or wrong; accepted p99 85 ms. |
+| A.12 | Accounting flood. | 5,000 sessions ≈ 17 updates/second. | ✅ 1,750/s; every update stored. Sustained-for-hours run still to do on the server. |
+| A.13 | 1–5 million usage rows; login speed and the data-cap total. | Milliseconds. | ✅ 2 M rows: capped logins p95 40 ms; no index needed. Try 5 M on the server. |
+| A.14 | Renewal and expiry tasks while staff use the panel. | No lock waits that block staff. | ✅ zero lock waits; staff latency unchanged. |
+| A.15 | Billing and Payments pages with 100,000 invoices. | Pages stay quick. | ✅ 50–350 ms. |
 
 **A-5. Operations**
 
@@ -139,6 +148,13 @@ Do this on a test server that matches production, with one real router.
 | A.16 | Write down and rehearse your recovery steps: reverse a wrong payment, resync a customer's access (`resync-access`), reset a password and MFA, restore from backup. | S |
 | A.17 | Confirm the daily backup runs by itself, is copied off the server, and a failed backup alerts you. | S |
 | A.6 | **Upgrading an existing 1.0 install:** run `./deploy-update.sh` and read the list of customers who will be refused before confirming; extend anyone who has paid. | S |
+
+**A-6. Cloud test and M-Pesa sandbox** ([CLOUD-TEST.md](CLOUD-TEST.md))
+
+| # | Task | Size |
+|---|---|---|
+| A.18 | Supabase + Render + FreeRADIUS on a laptop: the journey and real-FreeRADIUS tests over the internet; note the login latency when FreeRADIUS and the database are far apart. | S |
+| A.19 | M-Pesa sandbox: a real prompt to your phone (paid, and cancelled), simulated paybill payments (known and unknown account). | S |
 
 **Done when** A.1–A.5 and A.7–A.17 pass on the test server. (A.6 only if you have a 1.0 install.)
 Any failure in A.7–A.10 or A.13 is a bug to fix before continuing.
@@ -178,7 +194,7 @@ daily reconciliation for the first week of each stage.
 | # | Task | Why | Size |
 |---|---|---|---|
 | B.1 | **CI** [Q1]: run the billing tests (`make test-integration`) on every push. They are in the repository ([ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)) but nothing runs them automatically. Then extend tests to the rest of the API, FreeRADIUS and a browser smoke test. | The billing and enforcement paths cost money if they break. | S–M |
-| B.1a | **Turn the Phase A failure tests (A.7–A.10) into repeatable scripts** so they run before each release. | They are manual until then. | M |
+| B.1a | ~~Turn the Phase A failure tests (A.7–A.10) into repeatable scripts.~~ Done: `make test-e2e`. Run it before each release (CI needs the freeradius package on the runner). | | ✅ |
 | B.1b | **More simulation coverage:** other seeds, `suspend_overdue` on, non-default `invoice_due_days`, and a customer deleted while a payment is being recorded. Give back a promo use when an unpaid invoice is cancelled on a plan switch. | Found while writing the tests; not covered yet. | S–M |
 | B.2 | **Audit the remaining handlers for ignored errors** [D7]. | A failure should never look like "saved". | M |
 | B.3 | **EAP/PEAP** [N6], if you use WPA-Enterprise: certificates and a test with a real client. | Untested today. | M |
@@ -189,8 +205,14 @@ daily reconciliation for the first week of each stage.
 
 ## Phase C: larger features
 
-- [ ] **Payment gateway** [B7], e.g. M-Pesa STK push / C2B callbacks calling `recordPaymentTx`, so
-      customers can pay themselves and get reconnected automatically. **L**
+- [x] **M-Pesa** [B7]: STK push from staff and the portal, paybill/till (C2B), reconciliation,
+      unmatched payments for staff. Built and tested against a fake Daraja.
+  - [ ] Run [CLOUD-TEST.md](CLOUD-TEST.md) against the real sandbox (needs your Daraja app keys).
+  - [ ] Production: apply for Lipa na M-Pesa Online on your paybill/till ("Go Live" on Daraja),
+        set `MPESA_ENV=production`, the production keys and passkey, `MPESA_ALLOWED_IPS` to
+        Safaricom's published addresses, and register the C2B addresses again.
+  - [ ] Optional: Transaction Status / C2B "pull" API to catch confirmations Safaricom never
+        delivered (needs an initiator and security credential from Safaricom).
 - [ ] **Money and tax** [B8]: exact decimal amounts in code, tax/VAT lines, proration, credit
       notes. **L**
 - [ ] **Real multi-tenancy for resellers** [S9]: scope every query by organisation. Until then,

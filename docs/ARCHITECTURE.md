@@ -287,7 +287,69 @@ voucher, other):
   Payments are never deleted.
 - **Webhooks:** `payment.received`, `invoice.paid` and `payment.reversed` fire.
 
-There's no payment gateway: a gateway callback would call `recordPaymentTx` the same way.
+### 5.5a M-Pesa — [`mpesa.go`](../backend/internal/handlers/mpesa.go)
+
+Safaricom Daraja, configured by `MPESA_*` in `.env` (see `.env.example`); off until
+`MPESA_CONSUMER_KEY` is set. Two ways in, both ending in `recordPaymentTx`:
+
+- **Prompt (STK push).** Staff press *M-Pesa prompt* on an invoice (Billing), or the customer
+  presses *Pay with M-Pesa* in the portal. A customer with nothing open gets an invoice for
+  their plan's next period first. Their phone asks for the PIN, and Safaricom posts the result
+  to `/api/v1/pay/result/<token>`. Each prompt is a row in `mpesa_stk` that becomes `paid`
+  or `failed` exactly once (row lock), so a repeated callback changes nothing. If the callback
+  never comes, a loop asks Safaricom every minute (STK query, also the *mpesa_reconcile* task).
+  When the real M-Pesa code turns up later, it replaces the stand-in reference. One prompt per
+  invoice per 2 minutes. M-Pesa takes whole shillings, so cents are rounded up and the extra is
+  kept on the account.
+- **Paybill/till (C2B).** The customer pays from their phone with their username (or an
+  invoice number) as account. Safaricom posts to `/api/v1/pay/confirm/<token>`; each M-Pesa
+  code is stored once in `mpesa_c2b`. The account is matched by invoice number, then username
+  (any case), then a unique phone number. Unmatched money waits on the Payments page for an
+  admin to *Give* it to a customer. It is never dropped. Settings → M-Pesa registers the
+  addresses with Safaricom.
+
+**Where the money goes:** the named invoice, then the customer's oldest open invoices, then new
+invoices for their plan's next periods (3,000 on a 1,500 plan buys two months), then a payment
+on their account. Payments carry gateway `mpesa` and the M-Pesa code, so the same code can't be
+typed in again by hand. A code that was typed in already isn't recorded a second time.
+
+**Trust:** Safaricom does not sign callbacks. Ours are accepted only with the secret
+`MPESA_CALLBACK_TOKEN` in the path (wrong token: 404), optionally only from `MPESA_ALLOWED_IPS`.
+A result is only applied to a prompt we sent. They are exempt from the per-IP rate limit
+(Safaricom sends from few addresses). Paths avoid the words Daraja refuses in URLs ("mpesa",
+"safaricom", "query", "sql", "exe", "cmd").
+
+**Safaricom's limits** (measured against the real sandbox): its gateway takes 30 requests a
+minute with bursts of 3 and answers more with 429 *Spike arrest*; its firewall (Incapsula)
+blocks the server's address for every API, sign-in included, for 2–4 minutes after a few
+refused requests in a short time, answering with an HTML 403 page. So the client spaces calls
+1 s apart, retries a 429 after a pause (it never reached M-Pesa, so even a prompt is safe to
+resend), and after a 403 block sends nothing for 2 minutes, telling staff so in plain words
+(503). The reconcile loop asks about at most 20 prompts a run and stops at a block. Anything
+Safaricom would refuse is checked here first (phone, amount, an `https://` callback address),
+since each refusal counts towards a block. An unanswered prompt is reported three ways (500
+`500.001.1001` with or without a message, and 200 with `ResultCode` 4999 "still under
+processing"); all three mean "ask again".
+
+Tested against a fake Daraja that checks every request the way Safaricom does
+(`fake_daraja_test.go`, `mpesa_test.go`): paid, cancelled, timed out, callback lost,
+repeated, early (before the push's own answer), and racing the reconcile query; forged
+callbacks; Daraja down; tokens dropped; paybill by username, invoice number and phone; unknown
+accounts and allocation; overpayment; codes already typed in; the portal; and a storm of 60
+customers at once with real FreeRADIUS checked afterwards; Safaricom's 429s and firewall
+block. The client was also run against the **real sandbox** (`sandbox_client_test.go`): sign-in,
+a dropped token, prompts accepted, refused (amount, phone), the result query, 429s and a
+firewall block. Then through a tunnel, on 23 October 2026, with Safaricom calling the backend:
+a simulated paybill payment to a customer's username was applied within 3 seconds; one to an
+unknown account waited on the Payments page; prompts to a real phone left unanswered came back
+as 1037 "No response from user" and were marked failed with nothing recorded. **Not seen:** a
+prompt paid with a PIN. The sandbox accepted the PIN but never completed the payment (no SMS,
+no callback, its status query still "being processed" minutes later); the prompt correctly
+stayed pending. That step can only be proven on the live paybill.
+
+In live paybill notices Safaricom masks the payer's phone number, so the phone-number match
+will usually find nobody there; customers should use their username (or invoice number) as the
+account. The sandbox sends the number in full.
 
 ### 5.6 Promotions — [`promotions.go`](../backend/internal/handlers/promotions.go)
 
@@ -644,7 +706,7 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 | B4 | High | Receipts could not be opened; HTML not escaped. | **Fixed.** `html/template`, fetched with the auth header. Tested in browser. |
 | B5 | High | Promotions never reduced an invoice; Apply unguarded. | **Fixed.** Atomic redemption on invoices and plan assignment. Tested. |
 | B6 | High | No UI to assign a plan; reset expiry; duplicate invoices. | **Fixed.** Assign Plan dialog; extends from paid-until; reuses an open invoice; transactional. Tested. |
-| B7 | High | No gateway, no customer invoice view, no reminders, daily report not delivered. | **Partly.** Portal shows invoices; SMS/email reminders; daily report email. **Open: no payment gateway** (M-Pesa etc.). |
+| B7 | High | No gateway, no customer invoice view, no reminders, daily report not delivered. | **Partly.** Portal shows invoices; SMS/email reminders; daily report email. **M-Pesa built** ([5.5a](#55a-m-pesa--mpesago)): prompts from staff and the portal, paybill/till payments, reconciliation, unmatched payments for staff. Tested against a fake Daraja, and against the real sandbox with Safaricom calling the backend (paybill paid and unmatched, prompts timed out). **Still to prove:** a prompt paid with a PIN (the sandbox never completes those), on the live paybill with a small amount. |
 | B8 | Medium | Basic money handling. | **Partly.** Totals per currency, sequential invoice/receipt numbers, cents rounding. **Open:** amounts are `float64` in Go (stored as NUMERIC); no tax/VAT, proration, credit notes or line items. |
 | B9 | Medium | Vouchers: no price/plan, no redemption, limits not enforced. | **Fixed.** Price/plan, used/expired housekeeping, expiry, data and time limits enforced. Tested. |
 | B10 | Medium | Data caps not enforced. | **Fixed.** `datacounter` at login + hourly over-quota disconnect. Tested at login. |
@@ -659,6 +721,7 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 | N4 | Medium | Broad client trust; no Message-Authenticator requirement; shared secret everywhere. | **Partly.** `require_message_authenticator = auto`, `limit_proxy_state = auto`, per-NAS secrets with a generator, seed `testing123` NAS removed. **Open:** private ranges still accept the fallback secret; routers imported by the network scanner get `RADIUS_SECRET` until edited; a new NAS needs a FreeRADIUS restart. |
 | N5 | Medium | FreeRADIUS logged customer passwords. | **Fixed.** `auth_badpass`/`auth_goodpass = no`; post-auth stores no password. |
 | N6 | Medium | EAP/PEAP, groups, attribute formats untested. | **Partly.** Group-membership query added; `Expiration` format and time limits tested. **Open: EAP/PEAP untested.** |
+| N8 | High | After any database restart FreeRADIUS kept refusing every customer for about 25 seconds more (`retry_delay = 30` in its connection pool). | **Fixed.** `retry_delay = 1`: back within 200 ms of PostgreSQL. Tested by crashing PostgreSQL under load. |
 | N7 | Low | Port 18120 published to nothing; honeypot unpublished; TCP-only NAS monitor. | **Partly.** 18120 removed. **Open:** honeypot port not published (by design); NAS monitor still uses TCP probes, so a router that blocks them shows "down". |
 
 ### 10.3 Data and schema
@@ -698,6 +761,12 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 | B19 | Low | With grace days, a brand-new unpaid customer's paid-until date was set to "yesterday", which grace then made look current. | **Fixed.** `blockUntilPaid` also subtracts the grace days. |
 | B20 | Medium | Deleting a customer left their unpaid invoices open and unlinked, still counted as outstanding revenue; money on a part-paid invoice could be orphaned. | **Fixed.** Deleting cancels invoices nobody has paid on (the normal prepaid case). If an open invoice has money on it, or service was started on credit (*Start now*), the delete is **refused** (HTTP 409, with the invoice numbers) until staff settle it on purpose: reverse the payment to refund, collect the rest, or cancel a credit invoice to write it off. Suspend is the alternative. Tested. |
 | B22 | Feature | Free trial for brand-new customers. | **Built.** Settings → *Free trial for new customers (days)*, default 5 (migration 014; 0 turns it off). A new customer on a paid plan is online until today + N days. Staff can override N per customer in the New customer and Assign Plan dialogs (*Free trial days*: blank = the Settings default, a number = that many days, 0 = none), so a trial can be given or refused case by case; the first invoice falls due then; each customer gets one trial (`trial_started`), changing plan does not restart it, and an existing paying customer never gets one. Paying during the trial keeps the unused trial days on top; reversing the payment takes back only the paid period. Migration 013. Tested, and exercised by the simulation. |
+| B23 | High | A customer who used up the plan's data cap and paid for a new period the same day stayed refused until midnight: the cap counter started at the period's *date*. Counting from a timestamp instead would have been worse: `acctstarttime` comes from the router's clock, so a session on a router whose clock is slow would look older than the payment and never count. | **Fixed** (found by the real-FreeRADIUS test). The period remembers the newest usage row at the moment it is paid (`period_acct_floor`, migration 015); only rows after it count, whatever the routers' clocks say. FreeRADIUS `datacounter`, the quota task and the usage alerts all use it. A session already open at payment keeps going uncounted until it ends, which `Session-Timeout` makes happen by the old paid-until midnight. Tested with a router clock 10 minutes slow and with counters over 4 GB (gigawords). |
+| B24 | High | When a router did not answer Disconnect (port 3799 firewalled, wrong secret), staff were never told the customer was still online, and the expiry task waited 3 s per session, one after another: 40 customers took 2 minutes, 1,000 would take about 50, past the task's 15-minute lease. | **Fixed.** Disconnects run 32 at a time (40 customers: 7 s). The task result, the Suspend/Delete/Edit messages and the bulk actions say who may still be online and what to check on the router; *Online now* marks such sessions "should be offline" and lists them first. New logins are refused in either case. Tested with a fake router that acknowledges, refuses or ignores. |
+| B25 | Medium | Deleting a customer disconnected them (and force-closed their sessions in `radacct`) *before* checking whether the delete was allowed, so a refused delete (money unsettled) still kicked them off. Bulk delete and voucher delete did the same. | **Fixed.** The disconnect happens only after the delete has been committed. Tested. |
+| B26 | High | M-Pesa: Safaricom answers a status query for a prompt the customer has not answered yet with HTTP 200 and `ResultCode` 4999 ("still under processing"). The reconcile loop took it as a final answer and marked the prompt **failed** while the customer could still be typing the PIN. If the success callback was then lost, nothing asked again: a customer who paid was never credited, and the screen told them the payment failed, inviting a second one. | **Fixed** (found against the real sandbox). 4999 and "under processing" mean pending. The fake Daraja now answers "not yet" in all three forms seen on the real one; `TestMpesaQueryStillWaiting`. |
+| B27 | High | M-Pesa: the client could trip Safaricom's limits and lock the ISP out of M-Pesa for minutes. The reconcile loop asked about up to 50 prompts back to back (the gateway allows 30 a minute), a burst of prompts went out at once, and each refused request counts towards a firewall block of the server's address. During a block, sign-in failed with "check MPESA_CONSUMER_KEY/SECRET" and staff were shown Safaricom's raw HTML page. | **Fixed** (found against the real sandbox, which blocked us three times). Calls are spaced out, 429s retried, blocks waited out without sending, the reconcile loop capped and stopped at a block, refusals prevented by checking first, and messages say what happened ([5.5a](#55a-m-pesa--mpesago)). `TestMpesaSpikeArrest`, `TestMpesaFirewallBlock`; the fake checks the spacing during the 60-customer storm. |
+| B28 | Medium | A plan could be created with a negative validity or device count (only 0 was replaced by the default): paying for it would set paid-until in the past. A price or validity beyond the column's range gave a 500. | **Fixed.** Validity 1–3,660 days, devices 1–1,000, price under 10,000,000,000, data cap not negative; on create and edit. Found by the route fuzzer. |
 | B21 | Medium | Grace days were one system-wide number. | **Fixed.** Each customer can have their own (customer dialog → *Grace days*, blank = system default), so staff can extend one customer on request. Raising it lets a lapsed customer who has paid before back in at once; lowering it blocks them; it never lets in a customer who has not paid yet. Migration 012. Tested, and exercised by the simulation. |
 | S11 | Low | Audit redaction shallow; GeoIP free plan non-commercial over HTTP. | **Partly.** Recursive redaction. **Open:** default GeoIP service is ip-api.com (non-commercial, HTTP) — set `GEOIP_API_URL`. |
 
@@ -707,6 +776,10 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 |---|---|---|---|
 | Q1 | High | No automated tests or CI. | **Partly.** Billing now has repository tests ([10.8](#108-automated-billing-tests)). **Open:** CI, and tests for the rest of the API, FreeRADIUS and the browser. |
 | Q8 | High | Every billing step that reads a setting (grace days, due days) opened a second database connection while already holding one in a transaction. With enough simultaneous payments every connection waited for another, and the backend froze. | **Fixed.** Settings are held in memory and refreshed every 15 seconds; a lookup never touches the database. Found when 100 simultaneous requests hung the test run. |
+| Q9 | High | A database blip (restart, network hiccup) signed every member of staff out at once: the session check could not reach the database and answered 401 "session expired or signed out", which the UI treats as a logout. | **Fixed.** It answers 503 "database not reachable, try again" (`DB_UNAVAILABLE`, `Retry-After`) and the session survives. Same for API keys. Tested by stopping PostgreSQL. |
+| Q10 | High | Billing days come from the database's clock zone and the cut-off from FreeRADIUS's. With a managed database in UTC (Supabase) and a Kenyan ISP, payments between midnight and 03:00 were counted from yesterday and expiry ran 3 hours late; a FreeRADIUS left in UTC keeps customers online until 03:00. | **Fixed for the backend:** it sets its database sessions to `DB_TIMEZONE`/`PGTZ`/`TZ`, refuses an invalid zone name, and logs an error at startup if its date or UTC offset differs from the database's. FreeRADIUS must still be given the same `TZ` (Compose does). Tested with a fake clock across midnight (`midnight_test.go`). |
+| Q11 | Medium | Not ready for a managed database: backups used `pg_dump` 16 (Supabase runs 17, which 16 refuses), dumped the provider's own schemas (unreadable, unrestorable), and FreeRADIUS had no way to use TLS or a password with quotes. | **Fixed.** `pg_dump` 17 in the image; `BACKUP_SCHEMA=public` dumps and restores as a non-owner; FreeRADIUS takes the password and `DB_SSL_MODE` through libpq's environment, `DB_POOL_MAX` caps its connections; `scripts/db-setup.sh` prepares any database and sets its timezone; the backend honours `PORT`. Tested: TLS-only login with a password full of quotes and backslashes; a Supabase-like database with an unreadable provider schema (`TestBackupManagedDatabase`). |
+| Q12 | Medium | Bad input gave "server error" (500) instead of "bad request": a NUL character (`%00`) in any filter on six list pages, unknown or out-of-range values in template cloning, promotion and plan edits, the SMS expiry notice. And the audit row of `POST …/network/scans/hosts/:hostId/import-nas` was always lost: its route name is 51 characters and `audit_log.action` held 50. | **Fixed.** A middleware refuses NUL and invalid UTF-8 in paths, queries and JSON bodies with 400 (M-Pesa callbacks are cleaned instead, never refused); value errors from PostgreSQL map to 400/404/409; `audit_log.action` is 150 characters (migration 017). Found by `fuzz_e2e_test.go`: every route in `main.go`, 9,300 hostile requests, no 5xx, no hang, nothing hidden in the log. |
 | Q2 | Medium | Compiled binary committed to git. | **Fixed** in the 1.1 commits (removed and ignored). |
 | Q3 | Medium | Single-instance design. | **Partly.** Advisory locks on tasks, `RUN_WORKERS`. **Open:** rate limiter and lockout windows are per process; one PostgreSQL. |
 | Q4 | Medium | `deploy-update.sh` could pull into a working branch and swallowed errors. | **Fixed.** Tested with a stand-in for Docker. |
@@ -752,7 +825,7 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 
    Set them on the Settings page.
 3. **Add CI** (Q1) to run the billing tests ([10.8](#108-automated-billing-tests)) on every push, and extend them to the API, FreeRADIUS and the browser.
-4. **Payment gateway** (B7), if customers should pay without staff.
+4. **M-Pesa against the real sandbox** (B7), then production keys: [CLOUD-TEST.md](CLOUD-TEST.md).
 5. **Tax/VAT and exact-decimal money** (B8), if your jurisdiction needs invoices with tax.
 6. **Real multi-tenancy** (S9), if you plan to resell.
 
@@ -787,11 +860,15 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
   - tokens: refresh after expiry, and return to login on an invalid one
   - the setup wizard on an empty database with a setup token
 
+**Executed since** (in the repository, rerun with `make test-e2e` and `make test-load`; see
+[10.8](#108-automated-billing-tests)): the real FreeRADIUS and the real backend binary on one
+4-core laptop, with crashes and outages, and the load tests below.
+
 **Not run here:**
 
 - **Docker:** no daemon was available, so the images, healthchecks, Compose file, nginx config
   and Caddy weren't run.
-- **Real routers.**
+- **Real routers** (a fake one stands in for Disconnect).
 - **Protocols and providers:** EAP/PEAP; real SMTP, SMS, webhook receivers and GeoIP; nmap
   scans.
 
@@ -808,12 +885,44 @@ in `backend/` (about 2 minutes).
 | `sim_test.go` | **Time simulation.** Moves every date in the database back one day, runs the daily tasks, and repeats (`SIM_DAYS`, `SIM_CUSTOMERS`, `SIM_SEED`). Customers pay on time, late, in part or never; some are reversed, switch plans, use promo codes (33%, 100%, fixed, bigger than the price), have their plan's price changed under an open invoice, or are deleted while owing. After every simulated day it checks the invariants below. |
 | `invariants_test.go` | The rules checked after every day: payments never exceed an invoice; paid means fully paid and its period granted exactly once; numbers unique; **what FreeRADIUS would decide from `radcheck` matches the books for every customer** (no paying customer blocked, no non-paying customer allowed); paid-until equals the starting point plus the days of the invoices that still hold a period; one open renewal per customer; revenue per currency equals the tally of operations performed, and the Billing and Payments pages agree. |
 | `edge_test.go` | 1,000 payments of 0.01; discount rounding against exact fractions; fully discounted and free plans; the midnight `Expiration` text across month ends, the year end and 29 February; a plan edited under an open invoice; deleting a customer who owes; a payment that fails half-way leaves nothing behind. |
+| `trial_delete_test.go` | Free trials (default and per-customer length, one per customer, paying during a trial) and the delete rule for unsettled money. |
+| `radius_e2e_test.go` | **Real FreeRADIUS** (`scripts/test-radius.sh` builds the stock 3.2 config plus this repository's files, as the Docker image does, and runs it as your user). One customer from trial to deletion with FreeRADIUS asked after each step (trial, unpaid, paid, `Session-Timeout` ends at paid-until midnight, grace given by staff, suspend, reversal, delete); the device limit from accounting packets, including a router reboot (Accounting-On); the data cap, gigawords, paying again after running out, and a router whose clock is slow. With FreeRADIUS running, the time simulation also asks it about every customer every day (120 days × 300 customers ≈ 31,000 real logins, all matching the books). |
+| `disconnect_test.go`, `fake_nas_test.go` | A fake router that acknowledges, refuses or ignores Disconnect-Request (and checks its authenticator). Expiry, suspend and delete with a silent router; a refused delete leaves the customer online; the NAS's own secret is used. |
+| `stack_e2e_test.go` | **The whole system** (`scripts/test-stack.sh`: PostgreSQL, FreeRADIUS and the backend binary in production mode). A customer journey through HTTP only, including roles, a retried payment, a duplicate M-Pesa code, a tampered token and logout. **Failure tests:** PostgreSQL killed mid-burst of payments (A.7); the backend killed with `kill -9` mid-payment, 15 times (A.10); FreeRADIUS down while a customer pays and another expires (A.8); PostgreSQL down, then what routers, staff and recovery look like. |
+| `load_test.go` | Load (A.11–A.15), only with `LOAD_TEST=1`. Results below. |
+| `midnight_test.go` | FreeRADIUS with a fake clock (libfaketime) across midnight: the cut-off happens at 00:00 in its zone, a session online at 23:59:50 ends at midnight, and one left in UTC keeps a Kenyan customer online until 03:00. |
+| `backup_restore_test.go` | A.4 (above), and `TestBackupManagedDatabase`: a Supabase-like database where the login owns neither the database nor `public`. |
+| `mpesa_test.go`, `fake_daraja_test.go` | M-Pesa ([5.5a](#55a-m-pesa--mpesago)). |
+| `fuzz_e2e_test.go` | Every route in `main.go` (184) with hostile bodies, path parameters and query values, one at a time, as a super admin: no 5xx, no hang, nothing logged as an error, books intact. |
+| `sandbox_client_test.go` | Our Daraja client against the **real Safaricom sandbox**, no backend needed (`MPESA_SANDBOX_CLIENT=1` and the app's keys). Mind the firewall: run the tests one at a time. |
+| `cloud_test.go` | The real Safaricom sandbox through a deployed backend ([CLOUD-TEST.md](CLOUD-TEST.md)); skipped unless asked for. |
+
+**Failure test results:** after a PostgreSQL crash with 24 payments in flight, every client
+retry (same idempotency key) was settled, each payment is in the books once, no days without a
+payment, FreeRADIUS accepting again within 200 ms. With the backend killed mid-request 15 times
+(103 of 120 payments in flight), the same. With PostgreSQL down, routers get Access-Reject,
+staff get 503 and keep their session, and both recover with nothing restarted.
+
+**Load test results** on a 4-core laptop running PostgreSQL, FreeRADIUS and the load generator
+together (a server will do better):
+
+| Test | Result |
+|---|---|
+| Logins, 5,000 customers, 64 / 256 clients | 500 / 770 per second, none lost, none wrong; accepted p99 85 ms / 386 ms. Rejects take 1 s on purpose (`reject_delay`). |
+| Accounting: 5,000 sessions × start, 4 interims, stop | 1,750 packets/s (5,000 online customers send about 17/s); every update stored, final byte counts exact. |
+| 2 million usage rows | Logins of capped customers p95 40 ms; dashboard 0.2 s, daily usage report 0.3 s, other pages under 0.05 s; quota task 3.6 s. |
+| Daily tasks over 5,000 customers, staff working | Expire 625 in 4 s, raise 500 renewals in 4.6 s (alone); with 8 staff clients at full speed no lock waits, no errors, staff latency unchanged. |
+| 100,000 invoices and payments | Billing and Payments pages 50–350 ms (slowest: page 2,000 of the paid invoices). |
 
 Ran once (not in the normal run, which uses 120 days and 300 customers): 560 simulated days
-with 500 customers, crossing 29 February 2028. Before the fixes above, these tests failed on
+with 500 customers, crossing 29 February 2028, with real FreeRADIUS asked about every customer
+every 7th day (34,454 logins, all matching the books; 13 minutes). Before the fixes above, these tests failed on
 B11, B12, B13, B14, B15, B16, B17, B18 and Q8; each fix was confirmed by re-running them.
 
-**Not covered yet:** restarting PostgreSQL or FreeRADIUS during payments, a router that ignores
-Disconnect, restoring a backup and re-checking the books, and everything under load (logins per
-second, accounting volume, 1–5 million usage rows, 100,000 invoices). Those need your server's
-hardware and a real router (Phase A).
+Before the fixes, these tests found B23, B24, B25, B28, N8, Q9, Q10, Q11 and Q12. Checking
+against the real sandbox found B26 and B27, and that Daraja reports an expired token as HTTP
+404 (`404.001.03`), not 401; the client now signs in again on either.
+
+**Not covered yet:** the Docker images, a real router, a prompt paid with a PIN (the sandbox
+never completes those; prove it on the live paybill), the Render/Supabase deployment, and the
+load numbers on your own server.
