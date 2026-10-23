@@ -1,0 +1,109 @@
+# Render Blueprint: the API and the web UI on Render, the database on Supabase. For a cloud
+# TEST of the system (and of M-Pesa, which needs a public https address); see
+# docs/CLOUD-TEST.md for the whole procedure.
+#
+# Not on Render: FreeRADIUS. Render does not carry UDP (RADIUS is UDP 1812/1813), so FreeRADIUS
+# runs next to your routers (a small server or this laptop) and talks to the same Supabase
+# database. The API cannot send Disconnect-Requests to routers on a private network from here
+# either; staff see that on Online now (B24) until there is a VPN between the two.
+#
+# Secrets marked sync: false are typed into the Render dashboard when the Blueprint is
+# created; generateValue ones Render makes up.
+
+services:
+  - type: web
+    name: radius-manager-api
+    runtime: docker
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile
+    # The free plan sleeps after 15 idle minutes: the scheduler (expiry, renewals) stops and an
+    # M-Pesa callback can arrive while it is waking up. Use a paid plan for anything but a quick look.
+    plan: starter
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: TZ
+        value: Africa/Nairobi
+      # Supabase: Project Settings -> Database -> Connection string -> "Session pooler"
+      # (Render has no IPv6, and the direct connection is IPv6 only).
+      - key: DB_HOST
+        sync: false            # e.g. aws-0-eu-central-1.pooler.supabase.com
+      - key: DB_PORT
+        value: "5432"          # session mode; not 6543 (transaction mode drops session settings)
+      - key: DB_NAME
+        value: postgres
+      - key: DB_USER
+        sync: false            # postgres.<project-ref>
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_SSL_MODE
+        value: require
+      # The session pooler allows about 15 connections on the free tier, shared with
+      # FreeRADIUS (give it DB_POOL_MAX=5).
+      - key: DB_MAX_OPEN_CONNS
+        value: "6"
+      - key: DB_MAX_IDLE_CONNS
+        value: "3"
+      - key: JWT_SECRET
+        generateValue: true
+      # Must equal the RADIUS_SECRET FreeRADIUS uses (copy it from here after creation).
+      - key: RADIUS_SECRET
+        generateValue: true
+      - key: SETUP_TOKEN
+        generateValue: true
+      # Render's load balancer is on private addresses; trusting them makes the client's real
+      # address the one used for rate limits, lockouts and MPESA_ALLOWED_IPS.
+      - key: TRUSTED_PROXIES
+        value: 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+      # Dump only this system's schema, not Supabase's own (see backup.go).
+      - key: BACKUP_SCHEMA
+        value: public
+      - key: BACKUP_DIR
+        value: /tmp/backups    # Render's disk is wiped on deploy; download backups you want
+      - key: RUN_WORKERS
+        value: "true"
+      # M-Pesa sandbox. MPESA_CALLBACK_URL is this service's own address.
+      - key: MPESA_ENV
+        value: sandbox
+      - key: MPESA_CONSUMER_KEY
+        sync: false
+      - key: MPESA_CONSUMER_SECRET
+        sync: false
+      - key: MPESA_SHORTCODE
+        value: "174379"
+      - key: MPESA_PASSKEY
+        sync: false
+      - key: MPESA_C2B_SHORTCODE
+        sync: false            # the 600xxx paybill test code from the Daraja test credentials page
+      - key: MPESA_TYPE
+        value: paybill
+      - key: MPESA_CALLBACK_URL
+        sync: false            # https://radius-manager-api.onrender.com
+      - key: MPESA_CALLBACK_TOKEN
+        generateValue: true
+
+  - type: web
+    name: radius-manager-ui
+    runtime: static
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: ./frontend/dist
+    routes:
+      # The UI calls /api/v1 on its own address; Render forwards it to the API, so no CORS.
+      - type: rewrite
+        source: /api/*
+        destination: https://radius-manager-api.onrender.com/api/*
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin

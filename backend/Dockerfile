@@ -14,11 +14,12 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o radius-manager .
 
 # ---- Runtime Stage ----
-FROM alpine:3.19
+FROM alpine:3.21
 
-# postgresql16-client provides pg_dump for the backup_database task; a newer pg_dump can
-# dump the older postgres:15 server, not the other way round.
-RUN apk add --no-cache ca-certificates tzdata curl nmap nmap-scripts postgresql16-client
+# postgresql17-client provides pg_dump for the backup_database task. pg_dump refuses a server
+# newer than itself, so it must be at least the database's version: the bundled postgres:15
+# and managed databases such as Supabase (PostgreSQL 17 for new projects).
+RUN apk add --no-cache ca-certificates tzdata curl nmap nmap-scripts postgresql17-client
 
 WORKDIR /app
 

@@ -164,6 +164,9 @@ func main() {
 	}
 	defer db.Close()
 	settings.Init(db.DB)
+	if msg := db.ClockMismatch(); msg != "" {
+		log.Error("clock: " + msg)
+	}
 
 	// Maintenance commands (run once and exit), e.g.
 	//   docker exec radius_backend ./radius-manager access-report
@@ -196,6 +199,7 @@ func main() {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 20<<20)
 		c.Next()
 	})
+	router.Use(middleware.RejectUnstorableText())
 
 	// CORS is off by default: the UI is served by nginx on the same origin as /api. Set
 	// CORS_ORIGINS (comma-separated, e.g. https://admin.example.com) only if a different
@@ -235,6 +239,7 @@ func main() {
 		handlers.StartScheduler(db, log)
 		handlers.StartHoneypot(db, log)
 		handlers.StartCredStuffingDetector(db, log)
+		handlers.StartMpesaLoop(db, log)
 	} else {
 		log.Info("RUN_WORKERS=false: background workers not started in this process")
 	}
@@ -286,7 +291,16 @@ func main() {
 			portal.POST("/login", h.PortalLogin)
 			portal.POST("/logout", h.PortalLogout)
 			portal.GET("/dashboard", h.PortalAuthMiddleware(), h.PortalDashboard)
+			portal.POST("/pay", h.PortalAuthMiddleware(), h.PortalPay)
+			portal.GET("/pay/:id", h.PortalAuthMiddleware(), h.PortalPayStatus)
 		}
+
+		// ── M-Pesa callbacks from Safaricom (public; the :token is MPESA_CALLBACK_TOKEN) ──
+		// Daraja refuses URLs containing "mpesa", "safaricom", "query", "sql", "exe" or "cmd"
+		// in any case, hence /pay/.
+		v1.POST("/pay/result/:token", h.MpesaSTKCallback)
+		v1.POST("/pay/validate/:token", h.MpesaC2BValidation)
+		v1.POST("/pay/confirm/:token", h.MpesaC2BConfirmation)
 
 		// ── Captive Portal page (public HTML, no JWT) ────────────────────────
 		// The page's form posts to the router's hotspot login (captive_portals.login_url or
@@ -556,6 +570,17 @@ func main() {
 		}
 
 		// ── Tier 6 Pro: Payments ─────────────────────────────────────────────
+		mp := protected.Group("mpesa-admin")
+		{
+			mp.GET("/status", middleware.RequireRole("operator", "admin", "super_admin"), h.MpesaStatus)
+			mp.POST("/prompt", middleware.RequireRole("operator", "admin", "super_admin"), h.MpesaSendPrompt)
+			mp.GET("/prompt/:id", middleware.RequireRole("operator", "admin", "super_admin"), h.MpesaPromptStatus)
+			mp.GET("/prompts", middleware.RequireRole("operator", "admin", "super_admin"), h.MpesaListPrompts)
+			mp.GET("/c2b", middleware.RequireRole("operator", "admin", "super_admin"), h.MpesaListC2B)
+			mp.POST("/c2b/:id/allocate", middleware.RequireRole("admin", "super_admin"), h.MpesaAllocateC2B)
+			mp.POST("/register-c2b", middleware.RequireRole("super_admin"), h.MpesaRegisterC2B)
+		}
+
 		payments := protected.Group("payments")
 		{
 			payments.GET("", middleware.RequireRole("operator", "admin", "super_admin"), h.ListPayments)
@@ -636,6 +661,9 @@ func main() {
 	}
 
 	port := os.Getenv("WEB_PORT")
+	if port == "" {
+		port = os.Getenv("PORT") // set by hosting platforms such as Render
+	}
 	if port == "" {
 		port = "8080"
 	}

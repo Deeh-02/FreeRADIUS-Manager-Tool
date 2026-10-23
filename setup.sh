@@ -45,6 +45,7 @@ else
       -e "s|^JWT_SECRET=.*|JWT_SECRET=${jwt}|" \
       -e "s|^RADIUS_SECRET=.*|RADIUS_SECRET=${radius}|" \
       -e "s|^SETUP_TOKEN=.*|SETUP_TOKEN=${token}|" \
+      -e "s|^MPESA_CALLBACK_TOKEN=.*|MPESA_CALLBACK_TOKEN=$(openssl rand -hex 16)|" \
       -e "s|^TZ=.*|TZ=${tz:-UTC}|" \
       .env.example > .env
   chmod 600 .env

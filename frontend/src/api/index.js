@@ -462,6 +462,16 @@ export const paymentsAPI = {
   receipt: (id) => api.get(`/payments/${id}/receipt`, { responseType: 'text' }),
 }
 
+export const mpesaAPI = {
+  status: () => api.get('/mpesa-admin/status'),
+  prompt: (invoiceId, phone) => api.post('/mpesa-admin/prompt', { invoice_id: invoiceId, phone }),
+  promptStatus: (id) => api.get(`/mpesa-admin/prompt/${id}`),
+  prompts: (params) => api.get('/mpesa-admin/prompts', { params }),
+  c2b: (params) => api.get('/mpesa-admin/c2b', { params }),
+  allocate: (id, username, invoiceId) => api.post(`/mpesa-admin/c2b/${id}/allocate`, { username, invoice_id: invoiceId || null }),
+  registerC2B: () => api.post('/mpesa-admin/register-c2b'),
+}
+
 // openReceipt fetches a receipt with the auth header and shows it in a new tab (the
 // receipt page is self-contained HTML with a Print button).
 export async function openReceipt(id) {

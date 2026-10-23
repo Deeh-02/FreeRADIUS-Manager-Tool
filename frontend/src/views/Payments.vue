@@ -45,6 +45,8 @@
       </div>
     </div>
 
+    <MpesaUnmatched :can-allocate="authStore.isAdmin" @allocated="load" />
+
     <!-- Method breakdown -->
     <div v-if="summary?.by_method?.length" class="card">
       <h3 class="font-semibold text-gray-900 mb-3 text-sm">Revenue by payment method</h3>
@@ -148,6 +150,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
+import MpesaUnmatched from '@/components/billing/MpesaUnmatched.vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
 import { paymentsAPI, openReceipt } from '@/api'

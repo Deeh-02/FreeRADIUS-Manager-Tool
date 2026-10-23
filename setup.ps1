@@ -43,6 +43,7 @@ if (Test-Path ".env") {
     $text = Get-Content ".env.example" -Raw
     $text = $text -replace '(?m)^DB_PASSWORD=.*$', "DB_PASSWORD=$(New-Secret 40)"
     $text = $text -replace '(?m)^JWT_SECRET=.*$', "JWT_SECRET=$(New-Hex 32)"
+    $text = $text -replace '(?m)^MPESA_CALLBACK_TOKEN=.*$', "MPESA_CALLBACK_TOKEN=$(New-Hex 16)"
     $text = $text -replace '(?m)^RADIUS_SECRET=.*$', "RADIUS_SECRET=$(New-Secret 32)"
     $text = $text -replace '(?m)^SETUP_TOKEN=.*$', "SETUP_TOKEN=$(New-Secret 24)"
     # Containers want an IANA name (e.g. Africa/Nairobi); Windows ids differ, so UTC is

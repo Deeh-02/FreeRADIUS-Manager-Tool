@@ -44,6 +44,29 @@
       </div>
 
       <!-- Email -->
+      <!-- M-Pesa (configured in .env: these are secrets, not settings) -->
+      <div class="card space-y-3">
+        <h3 class="font-semibold text-gray-900">M-Pesa</h3>
+        <template v-if="mpesa?.enabled">
+          <p class="text-sm text-gray-600">
+            {{ mpesa.environment === 'production' ? 'Live' : 'Sandbox (test money)' }} ·
+            {{ mpesa.type === 'CustomerBuyGoodsOnline' ? 'Till' : 'Paybill' }} {{ mpesa.pay_to }}
+            <span v-if="!mpesa.allowed_ips" class="block text-xs text-amber-600 mt-1">
+              Callbacks are accepted from any address that knows the secret URL; set MPESA_ALLOWED_IPS to Safaricom's addresses for production.
+            </span>
+          </p>
+          <p class="text-xs text-gray-500 break-all">Payment results: {{ mpesa.stk_callback }}<br>Paybill confirmations: {{ mpesa.c2b_confirmation }}</p>
+          <button @click="registerC2B" class="btn-secondary text-sm" :disabled="registering">
+            Tell Safaricom where to send paybill payments
+          </button>
+        </template>
+        <p v-else class="text-sm text-gray-500">
+          Not set up{{ mpesa?.problem && mpesa.problem.indexOf('not configured') < 0 ? ': ' + mpesa.problem : '' }}.
+          Add the MPESA_* values from your Daraja app to <code>.env</code> and restart the backend
+          (see <code>.env.example</code>).
+        </p>
+      </div>
+
       <div class="card space-y-4">
         <h3 class="font-semibold text-gray-900 flex items-center gap-2">
           <EnvelopeIcon class="w-5 h-5 text-blue-600" />
@@ -141,7 +164,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useToast } from 'vue-toastification'
-import { settingsAPI, radiusAPI, alertsAPI, saveBlob } from '@/api'
+import { settingsAPI, radiusAPI, alertsAPI, saveBlob, mpesaAPI } from '@/api'
 import { apiError } from '@/utils/money'
 import {
   CheckIcon, LockClosedIcon, ShieldCheckIcon, EnvelopeIcon, BanknotesIcon, UsersIcon, BellAlertIcon,
@@ -311,6 +334,16 @@ async function runRadiusTest() {
   }
 }
 
-onMounted(() => { loadSettings(); loadBackups() })
+const mpesa = ref(null)
+const registering = ref(false)
+async function registerC2B() {
+  registering.value = true
+  try { toast.success((await mpesaAPI.registerC2B()).data.message) } catch (err) { toast.error(apiError(err, 'Safaricom refused')) } finally { registering.value = false }
+}
+
+onMounted(() => {
+  loadSettings(); loadBackups()
+  mpesaAPI.status().then(({ data }) => { mpesa.value = data }).catch(() => {})
+})
 onUnmounted(() => clearTimeout(backupPoll))
 </script>

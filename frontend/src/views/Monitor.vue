@@ -68,7 +68,15 @@
                 </td>
               </tr>
               <tr v-for="s in sessions.data" :key="s.session_id">
-                <td class="font-medium text-gray-900">{{ s.username }}</td>
+                <td class="font-medium text-gray-900">
+                  {{ s.username }}
+                  <span v-if="s.should_be_offline" class="badge badge-red ml-1"
+                    :title="s.should_be_offline === 'deleted'
+                      ? 'This customer was deleted but the router still reports the session: disconnect it on the router.'
+                      : 'Blocked (expired or suspended) but the router still reports the session: the disconnect was not confirmed. New logins are refused.'">
+                    {{ s.should_be_offline === 'deleted' ? 'deleted' : 'should be offline' }}
+                  </span>
+                </td>
                 <td class="text-gray-500 font-mono text-xs">{{ s.nas_ip }}</td>
                 <td class="font-mono text-xs text-blue-600">{{ s.framed_ip || '—' }}</td>
                 <td class="font-mono text-xs text-gray-500">{{ formatMAC(s.calling_station) }}</td>

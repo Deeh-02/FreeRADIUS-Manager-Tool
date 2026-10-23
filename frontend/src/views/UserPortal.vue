@@ -95,6 +95,40 @@
         </div>
       </div>
 
+      <!-- Pay with M-Pesa -->
+      <div v-if="data?.mpesa?.enabled && (openInvoices.length || data?.user?.plan_price > 0)" class="bg-white rounded-2xl shadow p-5">
+        <h3 class="font-semibold text-gray-900 mb-1">Pay with M-Pesa</h3>
+        <template v-if="!pay.id || pay.state === 'failed'">
+          <p class="text-sm text-gray-600 mb-3">
+            <span v-if="openInvoices.length">You owe {{ owedText }}.</span>
+            <span v-else>Renew {{ data.user.plan_name }} for {{ data.user.plan_currency }} {{ data.user.plan_price }}.</span>
+            We send a prompt to your phone; enter your M-Pesa PIN and you are online as soon as it goes through.
+          </p>
+          <form @submit.prevent="startPay" class="flex gap-2">
+            <input v-model.trim="pay.phone" type="tel" required placeholder="07XX XXX XXX"
+              class="flex-1 border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-green-500" />
+            <button type="submit" :disabled="pay.sending"
+              class="bg-green-600 hover:bg-green-700 text-white font-semibold rounded-xl px-5 text-sm">
+              {{ pay.sending ? 'Sending…' : 'Pay' }}
+            </button>
+          </form>
+          <p v-if="pay.error" class="text-red-600 text-sm mt-2">{{ pay.error }}</p>
+        </template>
+        <div v-else-if="pay.state === 'paid'" class="text-green-700 text-sm">
+          Paid, thank you. M-Pesa code <span class="font-mono">{{ pay.receipt || '(on your SMS)' }}</span>.
+          <span v-if="pay.expiry">You are paid up to {{ pay.expiry }}.</span>
+        </div>
+        <div v-else class="text-sm text-gray-700 flex items-center gap-2">
+          <span class="w-4 h-4 border-2 border-green-200 border-t-green-600 rounded-full animate-spin"></span>
+          Check your phone ({{ pay.sentTo }}) and enter your M-Pesa PIN to pay KES {{ pay.amount }}.
+        </div>
+        <p class="text-xs text-gray-500 mt-3">
+          Or pay from the M-Pesa menu:
+          <span v-if="data.mpesa.till">Buy Goods, till <b>{{ data.mpesa.pay_to }}</b>.</span>
+          <span v-else>Paybill <b>{{ data.mpesa.pay_to }}</b>, account <b>{{ data.mpesa.account }}</b>.</span>
+        </p>
+      </div>
+
       <!-- Invoices -->
       <div v-if="data?.invoices?.length" class="bg-white rounded-2xl shadow p-5">
         <h3 class="font-semibold text-gray-900 mb-1">Invoices</h3>
@@ -189,8 +223,8 @@ import { ArrowRightOnRectangleIcon } from '@heroicons/vue/24/outline'
 // The customer portal is separate from the admin app: it uses its own opaque token (sent as
 // X-Portal-Token, valid 24h on the server), kept under this localStorage key, and bypasses
 // the axios instance/interceptors in api/index.js. It is read-only: customers can see plan,
-// expiry, usage and invoices but cannot pay, renew or change anything from here (payments
-// are made to the provider, who records them).
+// expiry, usage and invoices, and pay by M-Pesa when the server has it set up (a prompt to
+// their phone; the result arrives from Safaricom, never from this page).
 const SESSION_KEY = 'portal_token'
 const API = `${API_BASE}/portal`
 
@@ -200,6 +234,48 @@ const logging = ref(false)
 const loginError = ref('')
 const creds = reactive({ username: '', password: '' })
 const openInvoices = computed(() => (data.value?.invoices || []).filter((i) => i.status === 'pending' || i.status === 'overdue'))
+const owedText = computed(() => {
+  const inv = openInvoices.value
+  if (!inv.length) return ''
+  const sum = inv.reduce((s, i) => s + i.amount - (i.amount_paid || 0), 0)
+  return `${inv[0].currency} ${sum.toFixed(2)}`
+})
+const pay = reactive({ phone: '', id: null, state: '', amount: 0, sentTo: '', receipt: '', expiry: '', error: '', sending: false })
+let payTimer = null
+
+async function startPay() {
+  pay.sending = true
+  pay.error = ''
+  try {
+    const { data: resp } = await axios.post(API + '/pay', { phone: pay.phone }, { headers: { 'X-Portal-Token': session.value } })
+    Object.assign(pay, { id: resp.id, state: 'pending', amount: resp.amount, sentTo: resp.phone })
+    pollPay()
+  } catch (err) {
+    pay.error = err.response?.data?.error || 'Could not send the payment prompt'
+  } finally { pay.sending = false }
+}
+
+// The result comes from Safaricom to the server; the page only asks the server, every 3
+// seconds for up to 3 minutes.
+function pollPay(tries = 0) {
+  clearTimeout(payTimer)
+  payTimer = setTimeout(async () => {
+    try {
+      const { data: s } = await axios.get(`${API}/pay/${pay.id}`, { headers: { 'X-Portal-Token': session.value } })
+      if (s.status === 'paid') {
+        Object.assign(pay, { state: 'paid', receipt: s.mpesa_receipt, expiry: s.account_expiry })
+        loadDashboard()
+        return
+      }
+      if (s.status === 'failed') {
+        Object.assign(pay, { state: 'failed', error: s.result_desc || 'The payment did not go through' })
+        return
+      }
+    } catch { /* keep trying */ }
+    if (tries < 60) pollPay(tries + 1)
+    else Object.assign(pay, { state: 'failed', error: 'No answer yet. If you paid, it will show here shortly.' })
+  }, 3000)
+}
 
 function formatMB(mb) {
   if (!mb) return '0 MB'
@@ -234,6 +310,7 @@ async function loadDashboard() {
       headers: { 'X-Portal-Token': session.value }
     })
     data.value = resp
+    if (!pay.phone && resp.user?.phone) pay.phone = resp.user.phone
   } catch (err) {
     if (err.response?.status === 401) {
       session.value = null

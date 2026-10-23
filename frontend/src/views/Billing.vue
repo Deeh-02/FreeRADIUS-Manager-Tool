@@ -89,6 +89,7 @@
               <td>
                 <div class="flex flex-wrap gap-1" v-if="authStore.isAdmin">
                   <button v-if="isOpen(inv)" @click="payFor(inv)" class="text-xs px-2 py-1 rounded bg-green-100 text-green-700 hover:bg-green-200">Record payment</button>
+                  <button v-if="isOpen(inv) && mpesaEnabled && inv.currency === 'KES'" @click="promptFor = inv" class="text-xs px-2 py-1 rounded bg-emerald-600 text-white hover:bg-emerald-700">M-Pesa prompt</button>
                   <button v-if="inv.status === 'pending'" @click="setStatus(inv, 'overdue')" class="text-xs px-2 py-1 rounded bg-orange-100 text-orange-700 hover:bg-orange-200">Overdue</button>
                   <button v-if="isOpen(inv) && inv.amount_paid === 0" @click="cancel(inv)" class="text-xs px-2 py-1 rounded bg-gray-100 text-gray-700 hover:bg-gray-200">Cancel</button>
                   <button v-if="inv.amount_paid === 0 && inv.status !== 'paid'" @click="remove(inv)" class="text-xs px-2 py-1 rounded bg-red-100 text-red-600 hover:bg-red-200">Delete</button>
@@ -171,6 +172,7 @@
     </div>
 
     <RecordPaymentModal v-if="payingInvoice" :invoice="payingInvoice" @close="payingInvoice = null" @saved="loadInvoices" />
+    <MpesaPromptModal v-if="promptFor" :invoice="promptFor" @close="promptFor = null" @saved="loadInvoices" />
   </div>
 </template>
 
@@ -178,10 +180,11 @@
 import { ref, reactive, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
-import { billingAPI, plansAPI } from '@/api'
+import { billingAPI, plansAPI, mpesaAPI } from '@/api'
 import { format, parseISO } from 'date-fns'
 import { PlusIcon, XMarkIcon } from '@heroicons/vue/24/outline'
 import RecordPaymentModal from '@/components/billing/RecordPaymentModal.vue'
+import MpesaPromptModal from '@/components/billing/MpesaPromptModal.vue'
 import { money, formatTotals, apiError } from '@/utils/money'
 
 const toast = useToast()
@@ -194,6 +197,9 @@ const plans = ref([])
 const total = ref(0)
 const page = ref(1)
 const payingInvoice = ref(null)
+const promptFor = ref(null)
+const mpesaEnabled = ref(false)
+mpesaAPI.status().then(({ data }) => { mpesaEnabled.value = !!data.enabled }).catch(() => {})
 let searchTimer
 
 const summary = reactive({ collected: [], outstanding: [], paid: 0, pending: 0, overdue: 0 })
