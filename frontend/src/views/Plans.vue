@@ -77,7 +77,7 @@
             </div>
             <div>
               <label class="form-label">Currency</label>
-              <input v-model="form.currency" type="text" class="form-input" maxlength="3" placeholder="USD" />
+              <input v-model="form.currency" type="text" class="form-input" maxlength="3" placeholder="KES" />
             </div>
             <div>
               <label class="form-label">Data Limit (MB)</label>
@@ -137,7 +137,7 @@ const plans = ref([])
 const bandwidthProfiles = ref([])
 
 const form = reactive({
-  name: '', description: '', price: 0, currency: 'USD',
+  name: '', description: '', price: 0, currency: 'KES',
   data_limit_mb: null, validity_days: 30, max_devices: 1,
   bandwidth_profile_id: null, is_active: true,
 })
@@ -158,7 +158,7 @@ async function load() {
 
 function openCreate() {
   editing.value = null
-  Object.assign(form, { name: '', description: '', price: 0, currency: 'USD', data_limit_mb: null, validity_days: 30, max_devices: 1, bandwidth_profile_id: null, is_active: true })
+  Object.assign(form, { name: '', description: '', price: 0, currency: 'KES', data_limit_mb: null, validity_days: 30, max_devices: 1, bandwidth_profile_id: null, is_active: true })
   showModal.value = true
 }
 

@@ -560,8 +560,8 @@ func main() {
 		{
 			payments.GET("", middleware.RequireRole("operator", "admin", "super_admin"), h.ListPayments)
 			payments.POST("", middleware.RequireRole("admin", "super_admin"), h.CreatePayment)
-			payments.POST("/:id/reverse", middleware.RequireRole("super_admin"), h.ReversePayment)
-			payments.DELETE("/:id", middleware.RequireRole("super_admin"), h.ReversePayment)
+			payments.POST("/:id/reverse", middleware.RequireRole("admin", "super_admin"), h.ReversePayment)
+			payments.DELETE("/:id", middleware.RequireRole("admin", "super_admin"), h.ReversePayment)
 			payments.GET("/:id/receipt", middleware.RequireRole("operator", "admin", "super_admin"), h.GetPaymentReceipt)
 			payments.GET("/summary", middleware.RequireRole("admin", "super_admin"), h.PaymentSummary)
 		}

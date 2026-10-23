@@ -35,7 +35,7 @@ func AccessReport(db *sql.DB, w io.Writer) (int, error) {
 		            ELSE 'paid-until date has passed' END
 		FROM radius_users
 		WHERE status IN ('suspended','expired')
-		   OR (account_expiry IS NOT NULL AND account_expiry + $1::int < CURRENT_DATE)
+		   OR (account_expiry IS NOT NULL AND account_expiry + COALESCE(grace_days, $1::int) < CURRENT_DATE)
 		ORDER BY account_expiry NULLS FIRST, username`, grace)
 	if err != nil {
 		return 0, err
@@ -84,7 +84,7 @@ func ResyncAllAccess(db *sql.DB, w io.Writer) (synced, failed int, err error) {
 	res, err := db.Exec(`
 		UPDATE radius_users SET status='expired', updated_at=NOW()
 		WHERE status='active' AND account_expiry IS NOT NULL
-		  AND account_expiry + $1::int < CURRENT_DATE`, graceDays())
+		  AND account_expiry + COALESCE(grace_days, $1::int) < CURRENT_DATE`, graceDays())
 	if err != nil {
 		return 0, 0, err
 	}

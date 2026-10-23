@@ -109,7 +109,7 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 					break
 				}
 				opErr = h.inTx(func(tx *sql.Tx) error {
-					res, err := assignPlanTx(tx, userID, username, planID, startNow, "", performedBy)
+					res, err := assignPlanTx(tx, userID, username, planID, startNow, "", performedBy, nil)
 					if err == nil {
 						msg = res.Message
 					}
@@ -128,7 +128,7 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 				}
 				opErr = h.inTx(func(tx *sql.Tx) error {
 					if _, err := tx.Exec(`UPDATE radius_users SET account_expiry=$1,
-						status = CASE WHEN status='expired' AND ($1::date IS NULL OR $1::date + $3::int >= CURRENT_DATE) THEN 'active' ELSE status END,
+						status = CASE WHEN status='expired' AND ($1::date IS NULL OR $1::date + COALESCE(grace_days, $3::int) >= CURRENT_DATE) THEN 'active' ELSE status END,
 						updated_at=NOW() WHERE id=$2`, d, userID, graceDays()); err != nil {
 						return err
 					}

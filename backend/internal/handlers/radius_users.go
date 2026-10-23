@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,7 +24,7 @@ import (
 const radiusUserColumns = `
 	ru.id, ru.username, COALESCE(ru.email,''), COALESCE(ru.full_name,''), COALESCE(ru.department,''),
 	COALESCE(ru.phone,''), COALESCE(ru.notes,''),
-	ru.status, ru.device_limit, ru.account_expiry, ru.password_expiry,
+	ru.status, ru.device_limit, ru.account_expiry, ru.grace_days, ru.password_expiry,
 	COALESCE(ru.force_password_change,false), ru.plan_id, up.name, up.price, up.currency,
 	(SELECT COUNT(*) FROM invoices i WHERE i.user_id = ru.id AND i.status IN ('pending','overdue')),
 	ru.created_by, au.username, ru.created_at, ru.updated_at,
@@ -32,7 +33,7 @@ const radiusUserColumns = `
 func scanRadiusUser(scan func(...interface{}) error, u *models.RadiusUser) error {
 	var createdBy sql.NullString
 	err := scan(&u.ID, &u.Username, &u.Email, &u.FullName, &u.Department, &u.Phone, &u.Notes,
-		&u.Status, &u.DeviceLimit, &u.AccountExpiry, &u.PasswordExpiry,
+		&u.Status, &u.DeviceLimit, &u.AccountExpiry, &u.GraceDays, &u.PasswordExpiry,
 		&u.ForcePasswordChange, &u.PlanID, &u.PlanName, &u.PlanPrice, &u.PlanCurrency, &u.OpenInvoices,
 		&u.CreatedBy, &createdBy, &u.CreatedAt, &u.UpdatedAt, &u.ActiveSessions)
 	u.CreatedByUsername = createdBy.String
@@ -191,12 +192,12 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 	var newID int
 	err = tx.QueryRow(`
 		INSERT INTO radius_users (username, password, email, full_name, department, phone, notes,
-		    device_limit, account_expiry, password_expiry, force_password_change, created_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		    device_limit, account_expiry, password_expiry, force_password_change, created_by, grace_days)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id`,
 		req.Username, hashedPw, nullableString(req.Email), nullableString(req.FullName),
 		nullableString(req.Department), nullableString(req.Phone), nullableString(req.Notes),
-		req.DeviceLimit, expiry, passwordExpiry, req.ForcePasswordChange, claims.UserID,
+		req.DeviceLimit, expiry, passwordExpiry, req.ForcePasswordChange, claims.UserID, req.GraceDays,
 	).Scan(&newID)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -224,7 +225,7 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 	msg := "RADIUS user created successfully"
 	var invoiceID int
 	if req.PlanID != nil {
-		res, err := assignPlanTx(tx, newID, req.Username, *req.PlanID, req.StartNow, req.PromoCode, &claims.UserID)
+		res, err := assignPlanTx(tx, newID, req.Username, *req.PlanID, req.StartNow, req.PromoCode, &claims.UserID, req.TrialDays)
 		if err != nil {
 			respondError(c, http.StatusBadRequest, "plan: "+err.Error())
 			return
@@ -319,10 +320,12 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 		    device_limit          = COALESCE($6, device_limit),
 		    account_expiry        = CASE WHEN $7 THEN NULL WHEN $8 THEN $9::date ELSE account_expiry END,
 		    force_password_change = COALESCE($10, force_password_change),
+		    grace_days            = CASE WHEN $12 THEN NULL WHEN $13::int IS NOT NULL THEN $13::int ELSE grace_days END,
 		    updated_at            = NOW()
 		WHERE id = $11`,
 		text(req.Email), text(req.FullName), text(req.Department), text(req.Phone), text(req.Notes),
 		req.DeviceLimit, clearExpiry, setExpiry, expiry, req.ForcePasswordChange, id,
+		req.ClearGraceDays, req.GraceDays,
 	)
 	if err != nil {
 		h.log.WithError(err).Error("update radius user")
@@ -330,13 +333,31 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 		return
 	}
 	// An expiry moved into the future (or cleared) lifts an automatic expiry block; a manual
-	// suspension stays until Activate is pressed.
-	if setExpiry || clearExpiry {
+	// suspension stays until Activate is pressed. Changing only the grace days does the same
+	// for a customer who has paid before (a never-paid customer is not let in by a longer
+	// grace), and a shorter grace blocks a customer who is now past it.
+	graceChanged := req.ClearGraceDays || req.GraceDays != nil
+	expiryEdited := setExpiry || clearExpiry
+	becameExpired := false
+	if expiryEdited || graceChanged {
 		if _, err := tx.Exec(`UPDATE radius_users SET status = 'active'
-			WHERE id = $1 AND status = 'expired' AND (account_expiry IS NULL OR account_expiry + $2::int >= CURRENT_DATE)`,
-			id, graceDays()); err != nil {
+			WHERE id = $1 AND status = 'expired'
+			  AND (account_expiry IS NULL OR account_expiry + COALESCE(grace_days, $2::int) >= CURRENT_DATE)
+			  AND ($3 OR trial_started IS NOT NULL OR EXISTS (SELECT 1 FROM invoices i WHERE i.user_id = radius_users.id AND i.service_applied)
+			         OR EXISTS (SELECT 1 FROM user_plans up WHERE up.id = radius_users.plan_id AND up.price <= 0))`,
+			id, graceDays(), expiryEdited); err != nil {
 			respondError(c, http.StatusInternalServerError, "failed to update status")
 			return
+		}
+		res, err := tx.Exec(`UPDATE radius_users SET status = 'expired'
+			WHERE id = $1 AND status = 'active' AND account_expiry IS NOT NULL
+			  AND account_expiry + COALESCE(grace_days, $2::int) < CURRENT_DATE`, id, graceDays())
+		if err != nil {
+			respondError(c, http.StatusInternalServerError, "failed to update status")
+			return
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			becameExpired = true
 		}
 	}
 	if err := syncAccess(tx, username); err != nil {
@@ -346,6 +367,9 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 	if err := tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to save user")
 		return
+	}
+	if becameExpired {
+		disconnectUserSessions(h.db, username, false)
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "user updated successfully"})
 }
@@ -378,6 +402,11 @@ func (h *Handler) DeleteRadiusUser(c *gin.Context) {
 	}
 	defer tx.Rollback()
 	if err := deleteRadiusUserTx(tx, id, username); err != nil {
+		var unsettled *unsettledInvoicesError
+		if errors.As(err, &unsettled) {
+			respondError(c, http.StatusConflict, unsettled.Error())
+			return
+		}
 		h.log.WithError(err).Error("delete radius user")
 		respondError(c, http.StatusInternalServerError, "failed to delete user")
 		return
@@ -519,7 +548,7 @@ func setUserStatus(db interface {
 	var username, newStatus string
 	err = tx.QueryRow(`
 		UPDATE radius_users SET status = CASE
-		    WHEN $1 = 'active' AND account_expiry IS NOT NULL AND account_expiry + $3::int < CURRENT_DATE THEN 'expired'
+		    WHEN $1 = 'active' AND account_expiry IS NOT NULL AND account_expiry + COALESCE(grace_days, $3::int) < CURRENT_DATE THEN 'expired'
 		    ELSE $1 END,
 		  updated_at = NOW()
 		WHERE id = $2 RETURNING username, status`, status, id, graceDays()).Scan(&username, &newStatus)

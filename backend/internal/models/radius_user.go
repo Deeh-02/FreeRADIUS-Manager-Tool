@@ -15,6 +15,7 @@ type RadiusUser struct {
 	Status              string     `json:"status"`
 	DeviceLimit         int        `json:"device_limit"`
 	AccountExpiry       *time.Time `json:"account_expiry"`
+	GraceDays           *int       `json:"grace_days"` // nil = system default
 	PasswordExpiry      *time.Time `json:"password_expiry"`
 	ForcePasswordChange bool       `json:"force_password_change"`
 	PlanID              *int       `json:"plan_id"`
@@ -42,23 +43,30 @@ type CreateRadiusUserRequest struct {
 	Notes               string  `json:"notes"`
 	DeviceLimit         int     `json:"device_limit" binding:"omitempty,min=1,max=500"`
 	AccountExpiry       *string `json:"account_expiry"`
+	GraceDays           *int    `json:"grace_days" binding:"omitempty,min=0,max=60"`
 	ForcePasswordChange bool    `json:"force_password_change"`
 	PlanID              *int    `json:"plan_id"`
 	StartNow            bool    `json:"start_now"`
 	PromoCode           string  `json:"promo_code"`
+	// TrialDays overrides the system free-trial length for this customer (0 = no trial).
+	TrialDays *int `json:"trial_days" binding:"omitempty,min=0,max=90"`
 }
 
 // UpdateRadiusUserRequest is the request body for updating a RADIUS user. Omitted fields are
 // unchanged; account_expiry "" clears the expiry (never expires).
 type UpdateRadiusUserRequest struct {
-	Email               *string `json:"email"`
-	FullName            *string `json:"full_name"`
-	Department          *string `json:"department"`
-	Phone               *string `json:"phone" binding:"omitempty,max=30"`
-	Notes               *string `json:"notes"`
-	DeviceLimit         *int    `json:"device_limit" binding:"omitempty,min=1,max=500"`
-	AccountExpiry       *string `json:"account_expiry"`
-	ForcePasswordChange *bool   `json:"force_password_change"`
+	Email         *string `json:"email"`
+	FullName      *string `json:"full_name"`
+	Department    *string `json:"department"`
+	Phone         *string `json:"phone" binding:"omitempty,max=30"`
+	Notes         *string `json:"notes"`
+	DeviceLimit   *int    `json:"device_limit" binding:"omitempty,min=1,max=500"`
+	AccountExpiry *string `json:"account_expiry"`
+	// GraceDays gives this customer their own grace period; ClearGraceDays returns them to the
+	// system default.
+	GraceDays           *int  `json:"grace_days" binding:"omitempty,min=0,max=60"`
+	ClearGraceDays      bool  `json:"clear_grace_days"`
+	ForcePasswordChange *bool `json:"force_password_change"`
 }
 
 // ResetPasswordRequest is used to reset a RADIUS user's password.

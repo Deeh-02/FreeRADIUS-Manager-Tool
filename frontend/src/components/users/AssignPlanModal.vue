@@ -35,6 +35,14 @@
             <label class="form-label">Promo code</label>
             <input v-model.trim="promo" type="text" class="form-input uppercase" />
           </div>
+          <div v-if="!startNow">
+            <label class="form-label">Free trial days (optional)</label>
+            <input v-model.number="trialDays" type="number" min="0" max="90" class="form-input" placeholder="Blank = default from Settings" />
+            <p class="text-xs text-gray-500 mt-1">
+              For a customer who has never paid: online this many days before the first payment (0 = none).
+              Each customer gets one trial.
+            </p>
+          </div>
         </template>
         <div class="flex justify-between gap-3 pt-2">
           <button v-if="user.plan_id" type="button" @click="unlink" class="text-sm text-red-600 hover:underline" :disabled="saving">Remove plan</button>
@@ -73,6 +81,7 @@ const plans = ref([])
 const planId = ref(props.user.plan_id ?? null)
 const startNow = ref(false)
 const promo = ref('')
+const trialDays = ref(null)
 const saving = ref(false)
 const result = ref(null)
 const plan = computed(() => plans.value.find((p) => p.id === planId.value))
@@ -85,7 +94,10 @@ onMounted(async () => {
 async function save() {
   saving.value = true
   try {
-    const { data } = await plansAPI.assignToUser(props.user.id, { plan_id: planId.value, start_now: startNow.value, promo_code: promo.value })
+    const { data } = await plansAPI.assignToUser(props.user.id, {
+      plan_id: planId.value, start_now: startNow.value, promo_code: promo.value,
+      ...(trialDays.value === null || trialDays.value === '' ? {} : { trial_days: trialDays.value }),
+    })
     result.value = data
     emit('saved')
   } catch (err) {

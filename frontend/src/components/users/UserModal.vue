@@ -74,6 +74,11 @@
                 <label class="form-label">Promo code</label>
                 <input v-model.trim="form.promo_code" type="text" class="form-input uppercase" />
               </div>
+              <div v-if="!form.start_now">
+                <label class="form-label">Free trial days (optional)</label>
+                <input v-model.number="form.trial_days" type="number" min="0" max="90" class="form-input" placeholder="Blank = default from Settings" />
+                <p class="text-xs text-gray-500 mt-1">Online this many days before the first payment (0 = none).</p>
+              </div>
             </template>
             <div v-if="!form.plan_id">
               <label class="form-label">Paid until (optional)</label>
@@ -87,6 +92,15 @@
             <input v-model="form.account_expiry" type="date" class="form-input" />
             <p class="text-xs text-amber-600 mt-1">
               Normally moved by payments. Changing it here gives or takes days without an invoice; empty = never expires.
+            </p>
+          </div>
+
+          <div>
+            <label class="form-label">Grace days (optional)</label>
+            <input v-model.number="form.grace_days" type="number" min="0" max="60" class="form-input" placeholder="Blank = system default" />
+            <p class="text-xs text-gray-500 mt-1">
+              Days this customer stays online after their paid-until date while waiting to pay. Give extra days
+              here when a customer asks; leave blank to use the default from Settings.
             </p>
           </div>
 
@@ -142,7 +156,7 @@ const selectedPlan = computed(() => plans.value.find((p) => p.id === form.value.
 
 const blank = () => ({
   username: '', password: '', full_name: '', email: '', phone: '', department: '', notes: '',
-  device_limit: 1, account_expiry: '', plan_id: null, start_now: false, promo_code: '',
+  device_limit: 1, account_expiry: '', grace_days: null, trial_days: null, plan_id: null, start_now: false, promo_code: '',
 })
 const form = ref(blank())
 
@@ -158,6 +172,7 @@ watch(() => props.user, (u) => {
       notes: u.notes || '',
       device_limit: u.device_limit || 1,
       account_expiry: u.account_expiry ? u.account_expiry.slice(0, 10) : '',
+      grace_days: u.grace_days ?? null,
     }
   }
 }, { immediate: true })
@@ -177,6 +192,7 @@ async function submit() {
         full_name: f.full_name, email: f.email, phone: f.phone, department: f.department, notes: f.notes,
         device_limit: f.device_limit,
         account_expiry: f.account_expiry || '', // "" clears the expiry
+        ...(f.grace_days === null || f.grace_days === '' ? { clear_grace_days: true } : { grace_days: f.grace_days }),
       })
       toast.success('User updated')
       emit('saved')
@@ -184,6 +200,8 @@ async function submit() {
       const payload = { ...f }
       if (payload.plan_id || !payload.account_expiry) delete payload.account_expiry
       if (!payload.plan_id) { delete payload.start_now; delete payload.promo_code }
+      if (payload.grace_days === null || payload.grace_days === '') delete payload.grace_days
+      if (payload.trial_days === null || payload.trial_days === '') delete payload.trial_days
       const { data } = await radiusUsersAPI.create(payload)
       toast.success(data.message || 'User created')
       emit('saved', data)

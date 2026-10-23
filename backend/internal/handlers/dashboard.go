@@ -793,7 +793,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	numeric := map[string][2]int{
 		"password_min_length": {8, 128}, "password_expiry_days": {1, 3650}, "session_timeout": {300, 604800},
 		"brute_force_attempts": {1, 100}, "brute_force_lockout": {1, 1440}, "max_device_limit": {1, 500},
-		"invoice_due_days": {0, 365}, "billing_grace_days": {0, 60}, "renewal_invoice_days": {0, 60},
+		"invoice_due_days": {0, 365}, "billing_grace_days": {0, 60}, "trial_days": {0, 90}, "renewal_invoice_days": {0, 60},
 		"reminder_days": {0, 60}, "portal_max_attempts": {1, 100}, "portal_lockout_minutes": {1, 1440},
 		"backup_retention_days": {0, 3650}, "cs_max_fails": {1, 10000}, "cs_window_secs": {10, 86400},
 		"cs_block_mins": {1, 100000},

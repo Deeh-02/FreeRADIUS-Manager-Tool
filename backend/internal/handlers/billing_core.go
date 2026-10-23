@@ -38,7 +38,7 @@ var (
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 
 func defaultCurrency() string {
-	return strings.ToUpper(settings.String("default_currency", "DEFAULT_CURRENCY", "USD"))
+	return strings.ToUpper(settings.String("default_currency", "DEFAULT_CURRENCY", "KES"))
 }
 
 // nextDocNumber returns PREFIX-YYYY-000001 from a Postgres sequence (no collisions, no
@@ -382,7 +382,7 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 	var username string
 	err = q.QueryRow(`UPDATE radius_users SET status = 'active', updated_at = NOW()
 		WHERE id = $1 AND status = 'expired' AND account_expiry IS NOT NULL
-		  AND account_expiry + $2::int >= CURRENT_DATE
+		  AND account_expiry + COALESCE(grace_days, $2::int) >= CURRENT_DATE
 		RETURNING username`, uid, graceDays()).Scan(&username)
 	if err == nil {
 		return out, syncAccess(q, username)
@@ -471,7 +471,7 @@ func lockUser(q dbtx, userID int) error {
 // assignPlanTx links a plan to a customer, applies its limits and handles billing:
 // free plans start at once; paid plans get an invoice (unless one is already open for
 // the same plan) and start when paid, or at once with startNow.
-func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool, promoCode string, by *int) (*assignResult, error) {
+func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool, promoCode string, by *int, trialDays *int) (*assignResult, error) {
 	if err := lockUser(q, userID); err == sql.ErrNoRows {
 		return nil, errors.New("user not found")
 	} else if err != nil {
@@ -516,9 +516,18 @@ func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool
 	// Prepaid: a customer with no current paid period gets no access until the invoice is
 	// paid (paid-until is set to yesterday, so FreeRADIUS rejects them). Someone switching
 	// plans mid-period keeps the time they already paid for.
+	var trialEnd *time.Time
 	if !startNow {
-		if err := blockUntilPaid(q, userID); err != nil {
+		// A brand-new customer gets the team's free trial (trial_days) instead of being
+		// blocked at once; everyone else with no paid time left is blocked until they pay.
+		var err error
+		if trialEnd, err = startTrial(q, userID, trialDays); err != nil {
 			return nil, err
+		}
+		if trialEnd == nil {
+			if err := blockUntilPaid(q, userID); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -539,6 +548,7 @@ func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool
 	in := newInvoice{
 		UserID: &userID, Username: username, PlanID: &p.ID, PlanName: &p.Name,
 		Amount: p.Price, Currency: p.Currency, PromoCode: promoCode, CreatedBy: by, PlanDays: &p.ValidityDays,
+		DueDate: trialEnd, // the first invoice falls due when the free trial ends
 	}
 	if startNow {
 		exp, days, err := grantPlanPeriod(q, userID, p)
@@ -573,8 +583,14 @@ func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool
 		res.Message = fmt.Sprintf("plan '%s' started for %s (paid until %s); invoice %s raised for %s %.2f",
 			p.Name, username, res.Expiry.Format("2006-01-02"), inv.Number, p.Currency, inv.Amount)
 	} else {
-		res.Message = fmt.Sprintf("plan '%s' assigned to %s; invoice %s raised for %s %.2f — service starts when it is paid",
-			p.Name, username, inv.Number, p.Currency, inv.Amount)
+		if trialEnd != nil {
+			res.Expiry = trialEnd
+			res.Message = fmt.Sprintf("plan '%s' assigned to %s; free trial until %s, invoice %s raised for %s %.2f — pay it to keep the service after the trial",
+				p.Name, username, trialEnd.Format("2006-01-02"), inv.Number, p.Currency, inv.Amount)
+		} else {
+			res.Message = fmt.Sprintf("plan '%s' assigned to %s; invoice %s raised for %s %.2f — service starts when it is paid",
+				p.Name, username, inv.Number, p.Currency, inv.Amount)
+		}
 	}
 	return res, nil
 }

@@ -272,7 +272,7 @@ func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int)
 			UPDATE radius_users SET status='expired', updated_at=NOW()
 			WHERE status='active'
 			  AND account_expiry IS NOT NULL
-			  AND account_expiry + $1::int < CURRENT_DATE
+			  AND account_expiry + COALESCE(grace_days, $1::int) < CURRENT_DATE
 			RETURNING id, username`, graceDays())
 		if err != nil {
 			return "expire_accounts failed: " + err.Error(), 0
@@ -306,7 +306,7 @@ func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int)
 			WHERE ru.status='active' AND EXISTS (
 			    SELECT 1 FROM invoices i
 			    WHERE i.user_id = ru.id AND i.status='overdue' AND i.service_applied
-			      AND i.due_date + $1::int < CURRENT_DATE)
+			      AND i.due_date + COALESCE(ru.grace_days, $1::int) < CURRENT_DATE)
 			RETURNING ru.id, ru.username`, graceDays())
 		if err != nil {
 			return "suspend overdue failed: " + err.Error(), int(n)

@@ -121,7 +121,7 @@
                   <button @click="viewReceipt(p)" class="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600" title="View receipt">
                     <ReceiptPercentIcon class="w-4 h-4" />
                   </button>
-                  <button v-if="authStore.isSuperAdmin && p.status === 'confirmed'" @click="reverse(p)"
+                  <button v-if="authStore.isAdmin && p.status === 'confirmed'" @click="reverse(p)"
                     class="p-1.5 rounded hover:bg-red-50 text-gray-400 hover:text-red-500" title="Reverse payment">
                     <ArrowUturnLeftIcon class="w-4 h-4" />
                   </button>

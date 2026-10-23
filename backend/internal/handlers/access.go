@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/freeradius-manager/backend/internal/settings"
@@ -49,8 +50,18 @@ func radiusExpiration(lastPaidDay time.Time, graceDays int) string {
 	return d.AddDate(0, 0, 1+graceDays).Format(radiusDateLayout)
 }
 
+// graceDays is the system-wide default: days of service after the paid-until date.
 func graceDays() int {
 	return settings.Int("billing_grace_days", "", 0)
+}
+
+// effectiveGrace is a customer's own grace days if staff set them, else the system default.
+// SQL that compares dates writes the same rule as COALESCE(grace_days, $default).
+func effectiveGrace(own sql.NullInt64) int {
+	if own.Valid {
+		return int(own.Int64)
+	}
+	return graceDays()
 }
 
 // setCheck upserts one radcheck row (radcheck has a unique index on username+attribute).
@@ -97,8 +108,9 @@ func syncAccess(q dbtx, username string) error {
 	var status string
 	var expiry sql.NullTime
 	var deviceLimit int
-	err := q.QueryRow(`SELECT status, account_expiry, device_limit FROM radius_users WHERE username = $1`, username).
-		Scan(&status, &expiry, &deviceLimit)
+	var ownGrace sql.NullInt64
+	err := q.QueryRow(`SELECT status, account_expiry, device_limit, grace_days FROM radius_users WHERE username = $1`, username).
+		Scan(&status, &expiry, &deviceLimit, &ownGrace)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -116,7 +128,7 @@ func syncAccess(q dbtx, username string) error {
 	}
 
 	if expiry.Valid {
-		err = setCheck(q, username, "Expiration", ":=", radiusExpiration(expiry.Time, graceDays()))
+		err = setCheck(q, username, "Expiration", ":=", radiusExpiration(expiry.Time, effectiveGrace(ownGrace)))
 	} else {
 		err = deleteCheck(q, username, "Expiration")
 	}
@@ -225,9 +237,9 @@ func grantPlanPeriod(q dbtx, userID int, p *planRow) (time.Time, int, error) {
 func blockUntilPaid(q dbtx, userID int) error {
 	var username string
 	err := q.QueryRow(`
-		UPDATE radius_users SET account_expiry = CURRENT_DATE - 1 - $2::int,
+		UPDATE radius_users SET account_expiry = CURRENT_DATE - 1 - COALESCE(grace_days, $2::int),
 		       status = CASE WHEN status = 'active' THEN 'expired' ELSE status END, updated_at = NOW()
-		WHERE id = $1 AND (account_expiry IS NULL OR account_expiry + $2::int < CURRENT_DATE)
+		WHERE id = $1 AND (account_expiry IS NULL OR account_expiry + COALESCE(grace_days, $2::int) < CURRENT_DATE)
 		RETURNING username`, userID, graceDays()).Scan(&username)
 	if err == sql.ErrNoRows {
 		return nil
@@ -238,6 +250,38 @@ func blockUntilPaid(q dbtx, userID int) error {
 	return syncAccess(q, username)
 }
 
+// startTrial gives a brand-new customer their one free trial: the trial_days setting, or the
+// length staff chose for this customer when assigning the plan (override; 0 means none): the
+// paid-until date becomes today + trial_days, so FreeRADIUS lets them on until then. It does
+// nothing, and returns nil, when there is no trial configured, the customer already had a
+// trial, has ever been given a period, or still has paid time left. The first invoice is due
+// when the trial ends.
+func startTrial(q dbtx, userID int, override *int) (*time.Time, error) {
+	days := settings.Int("trial_days", "", 0)
+	if override != nil { // staff chose the length for this customer (0 = no trial)
+		days = *override
+	}
+	if days <= 0 {
+		return nil, nil
+	}
+	var username string
+	var end time.Time
+	err := q.QueryRow(`
+		UPDATE radius_users SET account_expiry = CURRENT_DATE + $2::int, trial_started = CURRENT_DATE,
+		       status = CASE WHEN status = 'expired' THEN 'active' ELSE status END, updated_at = NOW()
+		WHERE id = $1 AND trial_started IS NULL
+		  AND NOT EXISTS (SELECT 1 FROM invoices i WHERE i.user_id = radius_users.id AND i.service_applied)
+		  AND (account_expiry IS NULL OR account_expiry + COALESCE(grace_days, $3::int) < CURRENT_DATE)
+		RETURNING username, account_expiry`, userID, days, graceDays()).Scan(&username, &end)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &end, syncAccess(q, username)
+}
+
 // revokePlanPeriod takes back days granted by an invoice whose payment was reversed, and
 // marks the account expired if that leaves it past its paid-until date.
 func revokePlanPeriod(q dbtx, userID, days int) error {
@@ -245,7 +289,7 @@ func revokePlanPeriod(q dbtx, userID, days int) error {
 	err := q.QueryRow(`
 		UPDATE radius_users SET
 		    account_expiry = account_expiry - $1::int,
-		    status = CASE WHEN status = 'active' AND account_expiry - $1::int + $3::int < CURRENT_DATE
+		    status = CASE WHEN status = 'active' AND account_expiry - $1::int + COALESCE(grace_days, $3::int) < CURRENT_DATE
 		                  THEN 'expired' ELSE status END,
 		    updated_at = NOW()
 		WHERE id = $2 AND account_expiry IS NOT NULL
@@ -285,8 +329,61 @@ func applyBandwidthProfileTx(q dbtx, userID int, username string, profileID int)
 	return setReply(q, username, "WISPr-Bandwidth-Max-Down", "=", strconv.Itoa(down*1000))
 }
 
+// unsettledInvoicesError is returned when a customer cannot be deleted because money is still
+// unresolved on one of their invoices.
+type unsettledInvoicesError struct{ msg string }
+
+func (e *unsettledInvoicesError) Error() string { return e.msg }
+
+// checkSettled refuses to delete a customer while an open invoice has money on it (payments
+// received but not applied to service) or had service started on credit (money owed). Staff
+// must deal with those on purpose: reverse the payment to refund it, collect the rest, or
+// cancel a credit invoice to write it off. Unpaid prepaid invoices are not a problem; they are
+// cancelled with the customer.
+func checkSettled(q dbtx, userID int, username string) error {
+	rows, err := q.Query(`
+		SELECT i.invoice_number, i.currency, i.amount, i.service_applied,
+		       COALESCE((SELECT SUM(p.amount) FROM payments p WHERE p.invoice_id = i.id AND p.status = 'confirmed'), 0)
+		FROM invoices i
+		WHERE i.user_id = $1 AND i.status IN ('pending','overdue')
+		  AND (i.service_applied OR EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = i.id AND p.status = 'confirmed'))
+		ORDER BY i.id`, userID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var problems []string
+	for rows.Next() {
+		var num, cur string
+		var amount, paid float64
+		var credit bool
+		if err := rows.Scan(&num, &cur, &amount, &credit, &paid); err != nil {
+			return err
+		}
+		switch {
+		case credit && paid > 0:
+			problems = append(problems, fmt.Sprintf("%s: service was started on credit and only %s %.2f of %.2f was received; collect the rest, or reverse the payment and cancel the invoice", num, cur, paid, amount))
+		case credit:
+			problems = append(problems, fmt.Sprintf("%s: service was started on credit and %s %.2f is unpaid; collect it, or cancel the invoice to write it off", num, cur, amount))
+		default:
+			problems = append(problems, fmt.Sprintf("%s: %s %.2f of %.2f received and not applied to service; refund it (reverse the payment) or collect the rest", num, cur, paid, amount))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return &unsettledInvoicesError{msg: fmt.Sprintf("cannot delete %s until money on these invoices is settled (you can suspend the customer instead): %s",
+		username, strings.Join(problems, "; "))}
+}
+
 // deleteRadiusUserTx removes a customer and everything FreeRADIUS knows about them.
 func deleteRadiusUserTx(q dbtx, userID int, username string) error {
+	if err := lockUser(q, userID); err != nil {
+		return err
+	}
+	if err := checkSettled(q, userID, username); err != nil {
+		return err
+	}
 	for _, stmt := range []string{
 		`DELETE FROM radcheck WHERE username = $1`,
 		`DELETE FROM radreply WHERE username = $1`,
@@ -297,6 +394,15 @@ func deleteRadiusUserTx(q dbtx, userID int, username string) error {
 		if _, err := q.Exec(stmt, username); err != nil {
 			return err
 		}
+	}
+	// Prepaid invoices nobody has paid anything on are withdrawn with the customer. Invoices
+	// with money on them, or whose service was started on credit, stay open and unlinked for
+	// staff to settle (refund by reversing the payment, or collect the debt).
+	if _, err := q.Exec(`UPDATE invoices SET status = 'cancelled', updated_at = NOW(),
+			notes = COALESCE(notes || E'\n', '') || 'Cancelled automatically: customer deleted'
+		WHERE user_id = $1 AND status IN ('pending','overdue') AND NOT service_applied
+		  AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.invoice_id = invoices.id AND p.status = 'confirmed')`, userID); err != nil {
+		return err
 	}
 	_, err := q.Exec(`DELETE FROM radius_users WHERE id = $1`, userID)
 	return err

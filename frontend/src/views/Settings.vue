@@ -171,6 +171,7 @@ const sections = [
       { key: 'invoice_due_days', label: 'Invoice due after (days)', type: 'number', min: 0, max: 365 },
       { key: 'renewal_invoice_days', label: 'Raise renewal invoice (days before paid-until)', type: 'number', min: 0, max: 60, help: 'The "Raise Renewal Invoices" task bills customers this many days before they run out.' },
       { key: 'billing_grace_days', label: 'Grace days after paid-until', type: 'number', min: 0, max: 60, help: 'Customers stay online this many days after their paid-until date.' },
+      { key: 'trial_days', label: 'Free trial for new customers (days)', type: 'number', min: 0, max: 90, help: 'A brand-new customer on a paid plan can use the service this many days before their first payment. 0 = no trial. Each customer gets one trial; change it any time, it applies to customers added from then on.' },
       { key: 'suspend_overdue', label: 'Block customers with overdue postpaid invoices', type: 'bool', help: 'For invoices whose period was started before payment ("start now").' },
       { key: 'report_email', label: 'Daily report email', type: 'email', help: 'Empty = not emailed.' },
       { key: 'reminder_days', label: 'Expiry reminder (days before)', type: 'number', min: 0, max: 60, help: '0 = no reminders. Sent by SMS (phone) or email.' },

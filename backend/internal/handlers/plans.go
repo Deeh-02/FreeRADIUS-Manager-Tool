@@ -207,6 +207,8 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 		PlanID    *int   `json:"plan_id"`
 		StartNow  bool   `json:"start_now"`
 		PromoCode string `json:"promo_code"`
+		// TrialDays overrides the system free-trial length for this customer (0 = no trial).
+		TrialDays *int `json:"trial_days" binding:"omitempty,min=0,max=90"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
@@ -236,7 +238,7 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	res, err := assignPlanTx(tx, userID, username, *body.PlanID, body.StartNow, body.PromoCode, &claims.UserID)
+	res, err := assignPlanTx(tx, userID, username, *body.PlanID, body.StartNow, body.PromoCode, &claims.UserID, body.TrialDays)
 	if err != nil {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
