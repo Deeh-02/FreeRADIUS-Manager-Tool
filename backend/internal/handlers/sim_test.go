@@ -504,6 +504,20 @@ func (s *simulation) checkDay() {
 	for _, p := range checkEnforcement(s.db) {
 		bad = append(bad, label(p))
 	}
+	// With a real FreeRADIUS running (scripts/test-radius.sh), ask it about every customer,
+	// deleted ones included, every SIM_RADIUS_EVERY days.
+	if r := optionalRadius(); r != nil && s.day%simEnv("SIM_RADIUS_EVERY", 1) == 0 {
+		pw := map[string]string{}
+		for _, c := range s.custs {
+			pw[c.name] = "x"
+		}
+		var real []string
+		s.timed("real FreeRADIUS checks", func() { real = checkRealRadius(r, s.db, pw) })
+		for _, p := range real {
+			bad = append(bad, label(p))
+		}
+		s.stats["real FreeRADIUS logins checked"] += len(pw)
+	}
 
 	// Paid-until equals the starting point plus the days of every invoice that holds a period.
 	rows, err := s.db.Query(`SELECT ru.id, COALESCE(ru.account_expiry - CURRENT_DATE, 0),

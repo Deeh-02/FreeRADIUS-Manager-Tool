@@ -32,8 +32,10 @@ func openTestDB(t testing.TB) *database.DB {
 	if url == "" {
 		t.Skip("TEST_DATABASE_URL not set; skipping database integration test")
 	}
-	if !strings.Contains(url, "_test") {
-		t.Fatalf("TEST_DATABASE_URL must point at a database whose name ends in _test (tests delete data)")
+	// A cloud test database (Supabase's is always called "postgres") can be used by saying so
+	// explicitly: TEST_DATABASE_WIPE_OK=yes. Never point this at a database with real data.
+	if !strings.Contains(url, "_test") && os.Getenv("TEST_DATABASE_WIPE_OK") != "yes" {
+		t.Fatalf("TEST_DATABASE_URL must point at a database whose name ends in _test (tests delete data), or set TEST_DATABASE_WIPE_OK=yes for a throwaway cloud database")
 	}
 	testDBOnce.Do(func() {
 		var raw *sql.DB
@@ -57,7 +59,7 @@ func resetTestDB(t testing.TB) *database.DB {
 	t.Helper()
 	db := openTestDB(t)
 	_, err := db.Exec(`TRUNCATE payments, invoices, promotions, user_plans, radius_users, radcheck,
-		radreply, radusergroup, radacct, webhooks, system_settings, app_users, scheduled_tasks
+		radreply, radusergroup, radacct, webhooks, system_settings, app_users, scheduled_tasks, mpesa_stk, mpesa_c2b
 		RESTART IDENTITY CASCADE`)
 	if err != nil {
 		t.Fatalf("reset: %v", err)

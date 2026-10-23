@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -118,11 +119,19 @@ func radiusDecision(today time.Time, hasRows, reject bool, expiration *string) (
 	return true, ""
 }
 
-// checkEnforcement compares what FreeRADIUS would do with what the books say should happen,
-// for every customer: a customer paid up to today (counting grace days) and not suspended
-// must get online; anyone else must not.
-func checkEnforcement(db *database.DB) []string {
-	var bad []string
+// accessFact is what the books say about one customer, next to what radcheck holds.
+type accessFact struct {
+	status                      string
+	noExpiry, paidUp, neverPaid bool
+	want                        bool // the books say: let them online
+	allowed                     bool // radcheck alone (radiusDecision) says
+	why                         string
+}
+
+// expectedAccess works out, for every customer, whether the books say they may get online:
+// a customer paid up to today (counting grace days) and not suspended must get online; anyone
+// else must not.
+func expectedAccess(db *database.DB) (map[string]*accessFact, error) {
 	var today time.Time
 	db.QueryRow(`SELECT CURRENT_DATE`).Scan(&today)
 	rows, err := db.Query(`SELECT ru.username, ru.status, ru.account_expiry IS NULL,
@@ -137,33 +146,49 @@ func checkEnforcement(db *database.DB) []string {
 		  AND NOT EXISTS (SELECT 1 FROM user_plans up WHERE up.id = ru.plan_id AND up.price <= 0)
 		FROM radius_users ru`, graceDays())
 	if err != nil {
-		return []string{"query users: " + err.Error()}
+		return nil, err
 	}
 	defer rows.Close()
+	out := map[string]*accessFact{}
 	for rows.Next() {
-		var name, status string
-		var noExpiry, paidUp, hasRows, reject, neverPaid bool
+		var name string
+		var f accessFact
+		var hasRows, reject bool
 		var expiration *string
-		if err := rows.Scan(&name, &status, &noExpiry, &paidUp, &hasRows, &reject, &expiration, &neverPaid); err != nil {
-			return []string{"scan: " + err.Error()}
+		if err := rows.Scan(&name, &f.status, &f.noExpiry, &f.paidUp, &hasRows, &reject, &expiration, &f.neverPaid); err != nil {
+			return nil, err
 		}
-		allowed, why := radiusDecision(today, hasRows, reject, expiration)
-		var want bool
+		f.allowed, f.why = radiusDecision(today, hasRows, reject, expiration)
 		switch {
-		case status == "suspended":
-			want = false
-		case noExpiry:
-			want = status == "active"
-		case neverPaid && status == "expired":
-			want = false
+		case f.status == "suspended":
+			f.want = false
+		case f.noExpiry:
+			f.want = f.status == "active"
+		case f.neverPaid && f.status == "expired":
+			f.want = false
 		default:
-			want = paidUp
+			f.want = f.paidUp
 		}
-		if allowed != want {
+		out[name] = &f
+	}
+	return out, rows.Err()
+}
+
+// checkEnforcement compares what FreeRADIUS would do (judged from radcheck) with what the
+// books say should happen, for every customer.
+func checkEnforcement(db *database.DB) []string {
+	facts, err := expectedAccess(db)
+	if err != nil {
+		return []string{"expected access: " + err.Error()}
+	}
+	var bad []string
+	for name, f := range facts {
+		if f.allowed != f.want {
 			bad = append(bad, fmt.Sprintf("E1 %s: status=%s paid_up=%v no_expiry=%v but RADIUS allows=%v (%s)",
-				name, status, paidUp, noExpiry, allowed, why))
+				name, f.status, f.paidUp, f.noExpiry, f.allowed, f.why))
 		}
 	}
+	sort.Strings(bad)
 	return bad
 }
 
