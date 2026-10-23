@@ -52,7 +52,7 @@ type fakePush struct {
 
 func newFakeDaraja(t *testing.T) *fakeDaraja {
 	f := &fakeDaraja{t: t, key: "test-consumer-key", secret: "test-consumer-secret", short: "174379",
-		pass:   "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919",
+		pass:   "test-passkey-not-a-real-one",
 		tokens: map[string]bool{}, query: map[string]string{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth/v1/generate", f.oauth)
