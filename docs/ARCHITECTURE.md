@@ -282,7 +282,7 @@ voucher, other):
   `invoices.applied_days`.
 - **Receipts:** each payment gets a receipt number from a sequence (`RCP-2026-000001`). The
   receipt is an escaped HTML page, fetched by the UI with the auth header.
-- **Reversal** (`reversePaymentTx`, super admin): the payment is kept and marked `reversed`
+- **Reversal** (`reversePaymentTx`, admin or super admin; operators cannot): the payment is kept and marked `reversed`
   with a reason. Its invoice re-opens and `applied_days` are taken back off paid-until.
   Payments are never deleted.
 - **Webhooks:** `payment.received`, `invoice.paid` and `payment.reversed` fire.
@@ -320,7 +320,7 @@ managed on the **Scheduler** page. "Daily" means 24 hours after the last run.
 
 | Task | Default | What it does |
 |---|---|---|
-| `expire_accounts` | daily | Active customers past paid-until + `billing_grace_days` → `expired`, access rows rewritten, sessions disconnected, `user.expired` webhook |
+| `expire_accounts` | daily | Active customers past paid-until + their grace days (own, else `billing_grace_days`) → `expired`, access rows rewritten, sessions disconnected, `user.expired` webhook |
 | `mark_overdue_invoices` | daily | `pending` past due → `overdue`; if `suspend_overdue`, blocks customers whose overdue invoice was for a period already given (`service_applied`) |
 | `renew_plans` ("Raise Renewal Invoices") | daily | For paid plans: an invoice due on the paid-until date, `renewal_invoice_days` ahead (never a free extension). Free plans are extended. |
 | `expiry_reminders` | daily | SMS (phone) or email `reminder_days` before paid-until, once per period |
@@ -429,8 +429,8 @@ tied to `radcheck`, `radreply` and `radacct` by **username text**.
 | Role | Can do (route table in `main.go`) |
 |---|---|
 | `operator` | View customers, sessions, NAS, plans, invoices, payments, reports, vouchers, zones; reset a customer's password; tickets; validate promo codes; acknowledge alerts. |
-| `admin` | Plus: create/edit/delete customers, NAS, plans, invoices, payments, vouchers, profiles, pools, templates, promotions, zones, portals; suspend/activate/disconnect; bulk operations; scanner; simulator; IP blocks and GeoIP rules. |
-| `super_admin` | Plus: staff accounts, settings, backups, API keys, alert rules, webhooks, organisations, scheduler changes, **reversing payments**. |
+| `admin` | Plus: create/edit/delete customers, NAS, plans, invoices, record and **reverse payments**, vouchers, profiles, pools, templates, promotions, zones, portals; suspend/activate/disconnect; bulk operations; scanner; simulator; IP blocks and GeoIP rules. |
+| `super_admin` | Plus: staff accounts, settings, backups, API keys, alert rules, webhooks, organisations, scheduler changes. |
 
 The UI hides pages by role; the **API enforces roles per route**, reading the role from the
 database on every request (a demoted or disabled account loses access immediately).
@@ -696,7 +696,9 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 | B17 | Medium | Editing a plan changed what its open invoices bought (shortening a plan to 7 days after an invoice for 30 days was raised). | **Fixed.** The invoice remembers its days (`plan_days`, migration 011). |
 | B18 | Medium | Switching plans left the old plan's unpaid invoice open beside the new one. | **Fixed.** Unpaid, no-payment invoices for the old plan are cancelled automatically; invoices with money on them, or started on credit, are left for staff. |
 | B19 | Low | With grace days, a brand-new unpaid customer's paid-until date was set to "yesterday", which grace then made look current. | **Fixed.** `blockUntilPaid` also subtracts the grace days. |
-| B20 | Open | **Deleting a customer who still owes** keeps the invoice (history survives) but leaves it open and unlinked: it still counts as outstanding revenue and can still be paid, with no effect on access. | **Open: your decision.** Cancel such invoices on delete, or keep them as bad debt. Tested that nothing breaks either way. |
+| B20 | Medium | Deleting a customer left their unpaid invoices open and unlinked, still counted as outstanding revenue; money on a part-paid invoice could be orphaned. | **Fixed.** Deleting cancels invoices nobody has paid on (the normal prepaid case). If an open invoice has money on it, or service was started on credit (*Start now*), the delete is **refused** (HTTP 409, with the invoice numbers) until staff settle it on purpose: reverse the payment to refund, collect the rest, or cancel a credit invoice to write it off. Suspend is the alternative. Tested. |
+| B22 | Feature | Free trial for brand-new customers. | **Built.** Settings → *Free trial for new customers (days)*, default 0 (off). A new customer on a paid plan is online until today + N days. Staff can override N per customer in the New customer and Assign Plan dialogs (*Free trial days*: blank = the Settings default, a number = that many days, 0 = none), so a trial can be given or refused case by case; the first invoice falls due then; each customer gets one trial (`trial_started`), changing plan does not restart it, and an existing paying customer never gets one. Paying during the trial keeps the unused trial days on top; reversing the payment takes back only the paid period. Migration 013. Tested, and exercised by the simulation. |
+| B21 | Medium | Grace days were one system-wide number. | **Fixed.** Each customer can have their own (customer dialog → *Grace days*, blank = system default), so staff can extend one customer on request. Raising it lets a lapsed customer who has paid before back in at once; lowering it blocks them; it never lets in a customer who has not paid yet. Migration 012. Tested, and exercised by the simulation. |
 | S11 | Low | Audit redaction shallow; GeoIP free plan non-commercial over HTTP. | **Partly.** Recursive redaction. **Open:** default GeoIP service is ip-api.com (non-commercial, HTTP) — set `GEOIP_API_URL`. |
 
 ### 10.5 Quality and operations

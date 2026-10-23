@@ -64,18 +64,27 @@ The full list is at the end of [ARCHITECTURE.md § 10.5](ARCHITECTURE.md#105-qua
 
 These were defaulted in code; all are changeable on the **Settings** page.
 
-- [ ] **Prepaid or postpaid?** Default: prepaid — no payment, no access. Postpaid per customer:
+- [x] **Prepaid or postpaid?** **Decided: prepaid** — no payment, no access. Postpaid per customer:
       tick *Start now* when assigning the plan.
-- [ ] **Grace period** after the paid-until date. Default: 0 days (`billing_grace_days`).
+- [x] **Grace period** after the paid-until date. **Decided:** a system default (`billing_grace_days`,
+      Settings) plus a per-customer value that staff set or extend on the customer dialog when a
+      customer asks. *Still to choose:* the default number of days for new customers.
+- [x] **Free trial for new customers:** **built and flexible.** The team sets the default in
+      Settings → *Free trial for new customers (days)* (0 = off), and staff can give a different
+      number, or none, for any one customer in the New customer / Assign Plan dialogs.
+      *Still to choose:* the starting default (a week? 5 days?).
 - [ ] **Renewal invoices:** how many days before paid-until. Default: 3 (`renewal_invoice_days`).
 - [ ] **Overdue postpaid invoices block service?** Default: no (`suspend_overdue`).
 - [ ] **Reminders:** days before expiry and the message. Default: 3 days, SMS/email.
 - [ ] **How customers pay:** staff-recorded (works now), or a gateway such as M-Pesa (Phase C).
-- [ ] **Currency and tax:** set `DEFAULT_CURRENCY`; decide whether invoices need VAT (Phase C).
-- [ ] **Deleting a customer who still owes** [B20]: cancel their open invoices on delete, or keep
-      them as bad debt? Today they stay open, unlinked, and count as outstanding revenue.
-- [ ] **Who may reverse payments and delete customers?** Today any admin can. Decide whether
-      that should be limited to a super admin.
+- [x] **Currency:** **KES** (new installs and new rows default to KES; existing plans keep their
+      currency, so check Plans after upgrading).
+- [ ] **Tax:** decide whether invoices need VAT (Phase C).
+- [x] **Deleting a customer** [B20]: **decided and built.** Prepaid means nothing is owed, so
+      unpaid invoices are cancelled with the customer. If an invoice has money on it or service
+      was started on credit, the delete is refused until staff refund, collect or write it off.
+- [x] **Who may reverse payments and delete customers?** **Decided:** admin and super admin
+      (operators cannot). Reversal was super-admin only before; it now allows admin too.
 
 **Done when** the Settings page reflects these choices.
 
