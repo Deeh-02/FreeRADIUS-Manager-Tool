@@ -41,6 +41,10 @@ func RequireAuth(db *database.DB) gin.HandlerFunc {
 
 		if strings.EqualFold(parts[0], "ApiKey") {
 			claims, readOnly, err := apiKeyClaims(db, strings.TrimSpace(parts[1]))
+			if err == errKeyLookup {
+				abortUnavailable(c)
+				return
+			}
 			if err != nil {
 				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 				return
@@ -75,7 +79,14 @@ func RequireAuth(db *database.DB) gin.HandlerFunc {
 		// logout, idle timeout, disabling an account and changing its role take effect
 		// immediately instead of when the access token expires.
 		st, err := auth.ValidateSession(db.DB, claims.UserID, claims.SessionID)
-		if err != nil || !st.Active {
+		if err != nil {
+			// The database could not be asked (restarting, network blip). That is not a
+			// sign-out: answering 401 SESSION_REVOKED here made the UI log every member of
+			// staff out at once.
+			abortUnavailable(c)
+			return
+		}
+		if !st.Active {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": "session expired or signed out",
 				"code":  "SESSION_REVOKED",
@@ -140,6 +151,16 @@ func apiKeyClaims(db *database.DB, rawKey string) (*auth.Claims, bool, error) {
 		}
 	}
 	return &auth.Claims{UserID: userID, Username: username + " (API key: " + name + ")", Role: role}, readOnly, nil
+}
+
+// abortUnavailable answers 503 when the session or key cannot be checked because the
+// database is unreachable, so clients retry instead of signing the user out.
+func abortUnavailable(c *gin.Context) {
+	c.Header("Retry-After", "5")
+	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+		"error": "the database is not reachable right now; try again in a moment",
+		"code":  "DB_UNAVAILABLE",
+	})
 }
 
 type authError string

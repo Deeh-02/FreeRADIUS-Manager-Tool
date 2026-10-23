@@ -368,10 +368,11 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "failed to save user")
 		return
 	}
+	msg := "user updated successfully"
 	if becameExpired {
-		disconnectUserSessions(h.db, username, false)
+		msg += disconnectUserSessions(h.db, username, false).stillOnlineNote()
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "user updated successfully"})
+	c.JSON(http.StatusOK, gin.H{"message": msg})
 }
 
 // DeleteRadiusUser removes a RADIUS user and all associated RADIUS attributes. Invoices and
@@ -392,9 +393,6 @@ func (h *Handler) DeleteRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "database error")
 		return
 	}
-	// Kick any live session first; otherwise the router keeps the user online.
-	disconnectUserSessions(h.db, username, true)
-
 	tx, err := h.db.Begin()
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "transaction failed")
@@ -415,7 +413,11 @@ func (h *Handler) DeleteRadiusUser(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "failed to delete user")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "user deleted successfully"})
+	// Kick any live session only now that the delete has happened (a refused delete must leave
+	// the customer online); otherwise the router keeps the user online. The rows are closed
+	// either way: the customer no longer exists.
+	kick := disconnectUserSessions(h.db, username, true)
+	c.JSON(http.StatusOK, gin.H{"message": "user deleted successfully" + kick.stillOnlineNote()})
 }
 
 // ResetRadiusUserPassword resets a RADIUS user's password.
@@ -524,10 +526,11 @@ func (h *Handler) setRadiusUserStatus(c *gin.Context, status string) {
 	}
 	msg := fmt.Sprintf("user %s", newStatus)
 	if status == "suspended" {
-		closed, _ := disconnectUserSessions(h.db, username, false)
-		if closed > 0 {
-			msg += fmt.Sprintf("; %d session(s) disconnected", closed)
+		kick := disconnectUserSessions(h.db, username, false)
+		if kick.Closed > 0 {
+			msg += fmt.Sprintf("; %d session(s) disconnected", kick.Closed)
 		}
+		msg += kick.stillOnlineNote()
 		go h.dispatchWebhook("user.suspended", gin.H{"id": id, "username": username})
 	} else if newStatus == "expired" {
 		msg = "suspension lifted, but the customer's paid-until date has passed: they stay blocked until they pay"
@@ -577,11 +580,12 @@ func (h *Handler) DisconnectRadiusUser(c *gin.Context) {
 		return
 	}
 	force := c.Query("force") == "true"
-	closed, msgs := disconnectUserSessions(h.db, username, force)
+	kick := disconnectUserSessions(h.db, username, force)
 	c.JSON(http.StatusOK, gin.H{
-		"message":      fmt.Sprintf("%d session(s) closed", closed),
-		"disconnected": closed,
-		"details":      msgs,
+		"message":      fmt.Sprintf("%d session(s) closed", kick.Closed) + kick.stillOnlineNote(),
+		"disconnected": kick.Closed,
+		"unconfirmed":  kick.Unconfirmed,
+		"details":      kick.Msgs,
 	})
 }
 

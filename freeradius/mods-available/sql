@@ -27,7 +27,11 @@ sql {
         max          = 32
         spare        = 10
         uses         = 0
-        retry_delay  = 30
+        # Seconds to wait after a failed attempt to open a connection. It was 30: after any
+        # database restart FreeRADIUS kept refusing paying customers for ~25s more
+        # (TestStackDatabaseOutage). Connecting to a database that is down fails at once, so
+        # trying again every second costs nothing.
+        retry_delay  = 1
         lifetime     = 0
         idle_timeout = 60
     }

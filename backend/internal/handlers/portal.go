@@ -251,7 +251,22 @@ func (h *Handler) PortalDashboard(c *gin.Context) {
 		"assigned_ip":     assignedIP,
 		"invoices":        invoices,
 		"provider":        gin.H{"name": org, "email": orgEmail},
+		"mpesa":           portalMpesaInfo(username),
 	})
+}
+
+// portalMpesaInfo tells the portal whether it can offer "Pay with M-Pesa" and how to pay the
+// paybill/till by hand.
+func portalMpesaInfo(username string) gin.H {
+	cl, err := mpesaClient()
+	if err != nil {
+		return gin.H{"enabled": false}
+	}
+	info := gin.H{"enabled": true, "pay_to": cl.cfg.PartyB, "till": cl.cfg.TxType == "CustomerBuyGoodsOnline"}
+	if cl.cfg.TxType == "CustomerPayBillOnline" {
+		info["account"] = username
+	}
+	return info
 }
 
 // PortalLogout invalidates the portal session token.

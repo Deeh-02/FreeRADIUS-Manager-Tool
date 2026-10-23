@@ -155,6 +155,10 @@ func (h *Handler) UpdatePromotion(c *gin.Context) {
 		WHERE id = $11`,
 		req.Description, req.DiscountType, req.DiscountValue, req.ClearPlan, req.PlanID, req.MaxUses,
 		req.ClearDates, req.ValidFrom, req.ValidUntil, req.IsActive, id)
+	if isBadValue(err) {
+		respondError(c, http.StatusBadRequest, "invalid value (unknown plan_id, or a number out of range)")
+		return
+	}
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to update promotion")
 		return

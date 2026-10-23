@@ -225,3 +225,11 @@ func isUniqueViolation(err error) bool {
 	var pqErr *pq.Error
 	return errors.As(err, &pqErr) && pqErr.Code == "23505"
 }
+
+// isBadValue reports an error caused by the values sent, not by the server: a PostgreSQL
+// data exception (class 22: number out of range, text too long, bad date...), a reference to
+// a row that does not exist (23503) or a failed check (23514).
+func isBadValue(err error) bool {
+	var pqErr *pq.Error
+	return errors.As(err, &pqErr) && (pqErr.Code.Class() == "22" || pqErr.Code == "23503" || pqErr.Code == "23514")
+}

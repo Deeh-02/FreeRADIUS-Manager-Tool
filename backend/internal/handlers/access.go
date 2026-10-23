@@ -194,7 +194,11 @@ func applyPlanLimits(q dbtx, userID int, username string, p *planRow) error {
 // grantPlanPeriod adds one plan period to the customer's paid-until date and re-activates
 // an expired account. The period extends from the current paid-until date when that is
 // still in the future (paying early loses nothing), otherwise from today. The data-cap
-// counter restarts from today. Returns the new paid-until date and the number of days the
+// counter restarts now: only sessions recorded after this moment count (period_acct_floor is
+// the newest radacct row at the time; row numbers, unlike router timestamps, cannot be off),
+// so a customer who ran out of data and pays again gets online straight away. A session that
+// was already open keeps going uncounted until it ends, which Session-Timeout makes happen by
+// the old paid-until midnight at the latest. Returns the new paid-until date and the number of days the
 // date actually moved (what revokePlanPeriod takes back if the payment is reversed).
 func grantPlanPeriod(q dbtx, userID int, p *planRow) (time.Time, int, error) {
 	days := p.ValidityDays
@@ -220,6 +224,7 @@ func grantPlanPeriod(q dbtx, userID int, p *planRow) (time.Time, int, error) {
 		UPDATE radius_users SET
 		    account_expiry = GREATEST(COALESCE(account_expiry, CURRENT_DATE), CURRENT_DATE) + $1::int,
 		    period_start   = CURRENT_DATE,
+		    period_acct_floor = (SELECT COALESCE(MAX(radacctid), 0) FROM radacct),
 		    status         = CASE WHEN status = 'expired' THEN 'active' ELSE status END,
 		    updated_at     = NOW()
 		WHERE id = $2

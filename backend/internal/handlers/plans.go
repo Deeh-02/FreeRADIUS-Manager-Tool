@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"time"
 
@@ -81,8 +82,8 @@ func (h *Handler) CreatePlan(c *gin.Context) {
 	if req.Currency == "" {
 		req.Currency = defaultCurrency()
 	}
-	if req.Price < 0 {
-		respondError(c, http.StatusBadRequest, "price cannot be negative")
+	if msg := planNumbersProblem(req.Price, req.ValidityDays, req.MaxDevices, req.DataLimitMB); msg != "" {
+		respondError(c, http.StatusBadRequest, msg)
 		return
 	}
 	isActive := true
@@ -102,10 +103,33 @@ func (h *Handler) CreatePlan(c *gin.Context) {
 			respondError(c, http.StatusConflict, "plan name already exists")
 			return
 		}
+		if isBadValue(err) {
+			respondError(c, http.StatusBadRequest, "invalid value (currency over 10 letters, or an unknown bandwidth_profile_id)")
+			return
+		}
 		respondError(c, http.StatusInternalServerError, "failed to create plan")
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"id": id, "message": "plan created"})
+}
+
+// planNumbersProblem checks a plan's numbers against sense and the columns (price is
+// NUMERIC(12,2)). A negative validity used to be accepted on create, which would give paying
+// customers an expiry in the past.
+func planNumbersProblem(price float64, validityDays, maxDevices int, dataLimitMB *int64) string {
+	switch {
+	case price < 0:
+		return "price cannot be negative"
+	case price >= 1e10 || math.IsNaN(price):
+		return "price is too large"
+	case validityDays < 1 || validityDays > 3660:
+		return "validity_days must be between 1 and 3660"
+	case maxDevices < 1 || maxDevices > 1000:
+		return "max_devices must be between 1 and 1000"
+	case dataLimitMB != nil && (*dataLimitMB < 0 || *dataLimitMB > 1<<40):
+		return "data_limit_mb must be 0 (no cap) or a positive number of MB"
+	}
+	return ""
 }
 
 // UpdatePlan updates a plan's details.
@@ -140,8 +164,8 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 	if req.MaxDevices <= 0 {
 		req.MaxDevices = 1
 	}
-	if req.Price < 0 {
-		respondError(c, http.StatusBadRequest, "price cannot be negative")
+	if msg := planNumbersProblem(req.Price, req.ValidityDays, req.MaxDevices, req.DataLimitMB); msg != "" {
+		respondError(c, http.StatusBadRequest, msg)
 		return
 	}
 	if req.Currency == "" {
@@ -158,6 +182,10 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 	if err != nil {
 		if isUniqueViolation(err) {
 			respondError(c, http.StatusConflict, "plan name already exists")
+			return
+		}
+		if isBadValue(err) {
+			respondError(c, http.StatusBadRequest, "invalid value (currency over 10 letters, or an unknown bandwidth_profile_id)")
 			return
 		}
 		respondError(c, http.StatusInternalServerError, "failed to update plan")

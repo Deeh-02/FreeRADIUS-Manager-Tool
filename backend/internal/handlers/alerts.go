@@ -297,7 +297,7 @@ func checkAlerts(db *database.DB, log *logrus.Logger) {
 			WHERE rc.attribute = 'Max-Octets' AND rc.value ~ '^[0-9]+$'
 			  AND (SELECT COALESCE(SUM(acctinputoctets + acctoutputoctets), 0) FROM radacct ra
 			       WHERE ra.username = rc.username
-			         AND ra.acctstarttime >= COALESCE(ru.period_start, DATE '1970-01-01'))
+			         AND ra.radacctid > COALESCE(ru.period_acct_floor, 0))
 			      >= rc.value::numeric * $1 / 100
 			ORDER BY rc.username LIMIT 100`, pct)
 	}

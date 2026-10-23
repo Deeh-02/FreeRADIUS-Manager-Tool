@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -289,16 +292,79 @@ func disconnectSession(db dbtx, nasIP, username, acctSessionID, framedIP string)
 	return disconnectResult{Message: fmt.Sprintf("unexpected reply code %d from NAS %s", reply[0], nasIP)}
 }
 
+// kickResult is what happened to a user's open sessions.
+type kickResult struct {
+	Closed      int      // sessions marked ended in radacct
+	Unconfirmed int      // sessions the router did not confirm ending: the user may still be online
+	Msgs        []string // one line per session, for staff
+}
+
+// stillOnlineNote is appended to a staff message when the router did not confirm.
+func (k kickResult) stillOnlineNote() string {
+	if k.Unconfirmed == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; the router did not confirm the disconnect of %d session(s), so the customer may still be online "+
+		"until that session ends (new logins are already refused). Check the router's /radius incoming (port 3799) and secret",
+		k.Unconfirmed)
+}
+
+// disconnectMany disconnects several users at once (a router that does not answer costs the
+// timeout per session, so doing them one by one held the expiry task for minutes) and returns
+// the users with sessions the router did not confirm ending.
+func disconnectMany(db dbtx, usernames []string) (stillOnline []string) {
+	var mu sync.Mutex
+	work := make(chan string)
+	var wg sync.WaitGroup
+	for w := 0; w < 32 && w < len(usernames); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for u := range work {
+				if r := disconnectUserSessions(db, u, false); r.Unconfirmed > 0 {
+					mu.Lock()
+					stillOnline = append(stillOnline, u)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	for _, u := range usernames {
+		work <- u
+	}
+	close(work)
+	wg.Wait()
+	sort.Strings(stillOnline)
+	return stillOnline
+}
+
+// stillOnlineSummary describes disconnectMany's result for a task's result line.
+func stillOnlineSummary(users []string) string {
+	if len(users) == 0 {
+		return ""
+	}
+	list := users
+	if len(list) > 10 {
+		list = list[:10]
+	}
+	more := ""
+	if len(users) > len(list) {
+		more = fmt.Sprintf(" and %d more", len(users)-len(list))
+	}
+	return fmt.Sprintf("; %d may still be online (router did not confirm the disconnect): %s%s",
+		len(users), strings.Join(list, ", "), more)
+}
+
 // disconnectUserSessions sends a Disconnect-Request for each open session of a user. When
 // the router acknowledges, the accounting row is closed (the router will usually also send
 // its own Stop). force closes rows the router did not acknowledge, for sessions that are
-// really gone but never got a Stop.
-func disconnectUserSessions(db dbtx, username string, force bool) (int, []string) {
+// really gone but never got a Stop; they still count as Unconfirmed.
+func disconnectUserSessions(db dbtx, username string, force bool) kickResult {
 	rows, err := db.Query(`
 		SELECT radacctid, acctsessionid, host(nasipaddress), COALESCE(host(framedipaddress), '')
 		FROM radacct WHERE username = $1 AND acctstoptime IS NULL`, username)
 	if err != nil {
-		return 0, []string{err.Error()}
+		return kickResult{Msgs: []string{err.Error()}}
 	}
 	type sess struct {
 		id                    int64
@@ -313,11 +379,13 @@ func disconnectUserSessions(db dbtx, username string, force bool) (int, []string
 	}
 	rows.Close()
 
-	closed := 0
-	var msgs []string
+	var res kickResult
 	for _, s := range list {
 		r := disconnectSession(db, s.nasIP, username, s.sid, s.framedIP)
-		msgs = append(msgs, r.Message)
+		res.Msgs = append(res.Msgs, r.Message)
+		if !r.Acked {
+			res.Unconfirmed++
+		}
 		if r.Acked || force {
 			cause := "Admin-Reset"
 			if !r.Acked {
@@ -325,8 +393,8 @@ func disconnectUserSessions(db dbtx, username string, force bool) (int, []string
 			}
 			db.Exec(`UPDATE radacct SET acctstoptime = NOW(), acctterminatecause = $1
 				WHERE radacctid = $2 AND acctstoptime IS NULL`, cause, s.id)
-			closed++
+			res.Closed++
 		}
 	}
-	return closed, msgs
+	return res
 }

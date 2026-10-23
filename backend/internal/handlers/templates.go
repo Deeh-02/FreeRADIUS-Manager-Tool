@@ -271,6 +271,18 @@ func (h *Handler) CloneTemplate(c *gin.Context) {
 	err = h.db.QueryRow(`INSERT INTO radius_templates (name,description,attributes,is_active)
 		SELECT $1, description, attributes, is_active FROM radius_templates WHERE id=$2
 		RETURNING id`, req.Name, id).Scan(&newID)
+	if err == sql.ErrNoRows {
+		respondError(c, http.StatusNotFound, "template not found")
+		return
+	}
+	if isUniqueViolation(err) {
+		respondError(c, http.StatusConflict, "a template with this name already exists")
+		return
+	}
+	if isBadValue(err) {
+		respondError(c, http.StatusBadRequest, "invalid name")
+		return
+	}
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to clone template")
 		return

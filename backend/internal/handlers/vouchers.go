@@ -320,8 +320,8 @@ func (h *Handler) DisableVoucher(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "failed to disable voucher")
 		return
 	}
-	disconnectUserSessions(h.db, code, false)
-	c.JSON(http.StatusOK, gin.H{"message": "voucher disabled"})
+	note := disconnectUserSessions(h.db, code, false).stillOnlineNote()
+	c.JSON(http.StatusOK, gin.H{"message": "voucher disabled" + note})
 }
 
 // DeleteVoucher removes a voucher and its RADIUS entries.
@@ -336,7 +336,6 @@ func (h *Handler) DeleteVoucher(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "voucher not found")
 		return
 	}
-	disconnectUserSessions(h.db, code, true)
 	if err := h.inTx(func(tx *sql.Tx) error {
 		for _, q := range []string{`DELETE FROM radcheck WHERE username = $1`, `DELETE FROM radreply WHERE username = $1`} {
 			if _, err := tx.Exec(q, code); err != nil {
@@ -349,7 +348,8 @@ func (h *Handler) DeleteVoucher(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "failed to delete voucher")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "voucher deleted"})
+	note := disconnectUserSessions(h.db, code, true).stillOnlineNote()
+	c.JSON(http.StatusOK, gin.H{"message": "voucher deleted" + note})
 }
 
 // ExportVouchers exports vouchers as CSV.

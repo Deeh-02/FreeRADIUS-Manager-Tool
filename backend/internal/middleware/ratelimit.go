@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +64,14 @@ func NewRateLimiter() *RateLimiter {
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
+
+		// Safaricom sends every M-Pesa confirmation from a handful of addresses; limiting them
+		// per IP would refuse real payments on a busy day. These paths are guarded by the
+		// long secret in the URL instead (handlers.callbackAllowed).
+		if strings.HasPrefix(c.Request.URL.Path, "/api/v1/pay/") {
+			c.Next()
+			return
+		}
 
 		if rl.isLimited(ip) {
 			c.Header("X-RateLimit-Limit", strconv.Itoa(rl.limit))

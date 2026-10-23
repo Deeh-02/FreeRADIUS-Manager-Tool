@@ -556,12 +556,19 @@ func (h *Handler) ActiveSessions(c *gin.Context) {
 	offset, limit := paginationParams(c)
 
 	rows, err := h.db.Query(`
-		SELECT acctsessionid, username, nasipaddress::text, nasportid,
-		       framedipaddress::text, callingstationid, calledstationid,
-		       acctstarttime, acctsessiontime, acctinputoctets, acctoutputoctets
-		FROM radacct
-		WHERE acctstoptime IS NULL
-		ORDER BY acctstarttime DESC
+		SELECT * FROM (
+		  SELECT acctsessionid, username, nasipaddress::text, nasportid,
+		         framedipaddress::text, callingstationid, calledstationid,
+		         acctstarttime, acctsessiontime, acctinputoctets, acctoutputoctets,
+		         -- Sessions that should have ended: the customer is refused at login (blocked or
+		         -- deleted) but the router never confirmed the disconnect.
+		         CASE WHEN NOT EXISTS (SELECT 1 FROM radcheck rc WHERE rc.username = radacct.username) THEN 'deleted'
+		              WHEN EXISTS (SELECT 1 FROM radcheck rc WHERE rc.username = radacct.username
+		                           AND rc.attribute = 'Auth-Type' AND rc.value = 'Reject') THEN 'blocked'
+		         END AS should_be_offline
+		  FROM radacct
+		  WHERE acctstoptime IS NULL) s
+		ORDER BY should_be_offline IS NULL, acctstarttime DESC -- the ones staff must act on first
 		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to fetch sessions")
@@ -581,6 +588,9 @@ func (h *Handler) ActiveSessions(c *gin.Context) {
 		Duration       int64      `json:"duration_seconds"`
 		InputBytes     int64      `json:"input_bytes"`
 		OutputBytes    int64      `json:"output_bytes"`
+		// ShouldBeOffline is "blocked" or "deleted" when new logins are refused but this
+		// session is still open: the router did not confirm the disconnect.
+		ShouldBeOffline *string `json:"should_be_offline"`
 	}
 
 	sessions := []ActiveSession{}
@@ -588,7 +598,7 @@ func (h *Handler) ActiveSessions(c *gin.Context) {
 		var s ActiveSession
 		rows.Scan(&s.SessionID, &s.Username, &s.NASIPAddress, &s.NASPortID,
 			&s.FramedIP, &s.CallingStation, &s.CalledStation,
-			&s.StartTime, &s.Duration, &s.InputBytes, &s.OutputBytes)
+			&s.StartTime, &s.Duration, &s.InputBytes, &s.OutputBytes, &s.ShouldBeOffline)
 		sessions = append(sessions, s)
 	}
 

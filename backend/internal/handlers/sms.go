@@ -98,6 +98,10 @@ func (h *Handler) NotifyUserExpiry(c *gin.Context) {
 	if req.Days == 0 {
 		req.Days = 3
 	}
+	if req.Days < 0 || req.Days > 366 {
+		respondError(c, http.StatusBadRequest, "days must be between 1 and 366")
+		return
+	}
 	if req.Message == "" {
 		req.Message = "Dear {username}, your account expires on {expiry}. Please renew to continue service."
 	}

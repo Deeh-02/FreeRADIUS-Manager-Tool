@@ -65,6 +65,9 @@ func AuditLogger(db *database.DB, log *logrus.Logger) gin.HandlerFunc {
 		sanitized := sanitizeBody(bodyBytes)
 
 		action := method + " " + c.FullPath()
+		if len(action) > 150 { // audit_log.action is VARCHAR(150); a lost row is worse than a cut one
+			action = action[:150]
+		}
 		ipStr := c.ClientIP()
 
 		details, _ := json.Marshal(map[string]interface{}{

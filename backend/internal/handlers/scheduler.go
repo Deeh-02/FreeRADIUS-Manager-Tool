@@ -41,6 +41,7 @@ var taskDescriptions = map[string]string{
 	"voucher_housekeeping":  "Marks vouchers used after their first session and expired after their expiry date.",
 	"enforce_quota":         "Sends a Disconnect-Request for online sessions of customers who have used up their data cap (the cap is otherwise checked only at login).",
 	"backup_database":       "Writes a pg_dump to BACKUP_DIR and deletes dumps older than backup_retention_days.",
+	"mpesa_reconcile":       "Asks Safaricom for the result of M-Pesa payment prompts whose answer never arrived (also runs every minute on its own when M-Pesa is set up).",
 	"purge_logs":            "Deletes login logs (radpostauth) older than 180 days, honeypot logs older than 30 days, and expired portal sessions.",
 }
 
@@ -278,14 +279,19 @@ func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int)
 			return "expire_accounts failed: " + err.Error(), 0
 		}
 		users := collectUsers(rows)
+		names := make([]string, 0, len(users))
 		for _, u := range users {
 			if err := syncAccess(db, u.name); err != nil {
 				log.WithError(err).Warnf("expire: sync %s", u.name)
 			}
-			disconnectUserSessions(db, u.name, false)
+			names = append(names, u.name)
 			go dispatchWebhookDB(db, "user.expired", gin.H{"id": u.id, "username": u.name})
 		}
-		return "accounts expired and blocked", len(users)
+		online := disconnectMany(db, names)
+		if len(online) > 0 {
+			log.Warnf("expire_accounts: %d customer(s) may still be online, router did not confirm the disconnect: %v", len(online), online)
+		}
+		return fmt.Sprintf("%d account(s) expired and blocked", len(users)) + stillOnlineSummary(online), len(users)
 
 	case "mark_overdue_invoices":
 		res, err := db.Exec(`
@@ -312,11 +318,15 @@ func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int)
 			return "suspend overdue failed: " + err.Error(), int(n)
 		}
 		users := collectUsers(rows)
+		names := make([]string, 0, len(users))
 		for _, u := range users {
-			syncAccess(db, u.name)
-			disconnectUserSessions(db, u.name, false)
+			if err := syncAccess(db, u.name); err != nil {
+				log.WithError(err).Warnf("suspend overdue: sync %s", u.name)
+			}
+			names = append(names, u.name)
 		}
-		return fmt.Sprintf("invoices marked overdue; %d customer(s) blocked for non-payment", len(users)), int(n)
+		online := disconnectMany(db, names)
+		return fmt.Sprintf("invoices marked overdue; %d customer(s) blocked for non-payment", len(users)) + stillOnlineSummary(online), int(n)
 
 	case "cleanup_sessions":
 		res, err := db.Exec(`
@@ -396,7 +406,7 @@ func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int)
 			  AND EXISTS (SELECT 1 FROM radacct o WHERE o.username = rc.username AND o.acctstoptime IS NULL)
 			  AND (SELECT COALESCE(SUM(acctinputoctets + acctoutputoctets), 0) FROM radacct ra
 			       WHERE ra.username = rc.username
-			         AND ra.acctstarttime >= COALESCE(ru.period_start, DATE '1970-01-01')) >= rc.value::numeric`)
+			         AND ra.radacctid > COALESCE(ru.period_acct_floor, 0)) >= rc.value::numeric`)
 		if err != nil {
 			return "enforce_quota failed: " + err.Error(), 0
 		}
@@ -409,11 +419,18 @@ func runTask(db *database.DB, log *logrus.Logger, taskType string) (string, int)
 		}
 		rows.Close()
 		closed := 0
+		var online []string
 		for _, u := range names {
-			n, _ := disconnectUserSessions(db, u, false)
-			closed += n
+			k := disconnectUserSessions(db, u, false)
+			closed += k.Closed
+			if k.Unconfirmed > 0 {
+				online = append(online, u)
+			}
 		}
-		return fmt.Sprintf("%d over-quota user(s), %d session(s) disconnected", len(names), closed), closed
+		return fmt.Sprintf("%d over-quota user(s), %d session(s) disconnected", len(names), closed) + stillOnlineSummary(online), closed
+
+	case "mpesa_reconcile":
+		return reconcileMpesa(db, log)
 
 	case "backup_database":
 		name, err := runBackup()

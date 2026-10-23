@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -88,16 +90,31 @@ func dumpDatabase() (string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "pg_dump", "--no-owner", "--no-privileges", "--clean", "--if-exists")
+	args := []string{"--no-owner", "--no-privileges", "--clean", "--if-exists"}
+	// BACKUP_SCHEMA=public on a managed database (Supabase, RDS): dump only this system's
+	// schema, not the provider's own (auth, storage, ...), which could not be restored.
+	schema := strings.TrimSpace(os.Getenv("BACKUP_SCHEMA"))
+	if schema != "" {
+		args = append(args, "--schema="+schema)
+	}
+	cmd := exec.CommandContext(ctx, "pg_dump", args...)
 	cmd.Env = append(os.Environ(),
 		"PGHOST="+envOr("DB_HOST", "localhost"), "PGPORT="+envOr("DB_PORT", "5432"),
 		"PGUSER="+envOr("DB_USER", "radius_user"), "PGPASSWORD="+os.Getenv("DB_PASSWORD"),
 		"PGDATABASE="+envOr("DB_NAME", "radius"), "PGSSLMODE="+envOr("DB_SSL_MODE", "disable"))
 	cmd.Stdout = gz
+	var filter *schemaFilter
+	if schema != "" {
+		filter = &schemaFilter{w: gz, schema: schema}
+		cmd.Stdout = filter
+	}
 	var stderr limitedBuffer
 	cmd.Stderr = &stderr
 
 	runErr := cmd.Run()
+	if filter != nil && len(filter.buf) > 0 {
+		gz.Write(filter.buf) // a last line without a newline
+	}
 	closeErr := gz.Close()
 	if err := f.Close(); err != nil && closeErr == nil {
 		closeErr = err
@@ -247,3 +264,35 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 func (l *limitedBuffer) String() string { return string(l.b) }
+
+// schemaFilter removes the statements a single-schema dump makes about the schema itself, so
+// the file restores as a user who does not own the schema (managed databases): the schema is
+// kept, not dropped and recreated, and its comment is left alone. Everything else passes.
+type schemaFilter struct {
+	w      io.Writer
+	schema string
+	buf    []byte
+}
+
+func (f *schemaFilter) Write(p []byte) (int, error) {
+	f.buf = append(f.buf, p...)
+	for {
+		i := bytes.IndexByte(f.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := f.buf[:i+1]
+		// Even CREATE SCHEMA IF NOT EXISTS needs the right to create schemas, which such a
+		// user lacks; the schema always exists there, so the three statements are dropped.
+		switch strings.TrimSpace(string(line)) {
+		case "DROP SCHEMA IF EXISTS " + f.schema + ";", "CREATE SCHEMA " + f.schema + ";",
+			"COMMENT ON SCHEMA " + f.schema + " IS 'standard public schema';":
+			line = []byte("\n")
+		}
+		if _, err := f.w.Write(line); err != nil {
+			return 0, err
+		}
+		f.buf = f.buf[i+1:]
+	}
+	return len(p), nil
+}

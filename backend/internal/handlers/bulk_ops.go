@@ -93,13 +93,20 @@ func (h *Handler) BulkOperation(c *gin.Context) {
 				_, st, opErr = setUserStatus(h.db, userID, target)
 				msg = st
 				if opErr == nil && target == "suspended" {
-					disconnectUserSessions(h.db, username, false)
+					if k := disconnectUserSessions(h.db, username, false); k.Unconfirmed > 0 {
+						msg += " (may still be online: router did not confirm the disconnect)"
+					}
 				}
 
 			case "delete":
-				disconnectUserSessions(h.db, username, true)
 				opErr = h.inTx(func(tx *sql.Tx) error { return deleteRadiusUserTx(tx, userID, username) })
 				msg = "deleted"
+				// Only after the delete succeeded: a refused one leaves the customer online.
+				if opErr == nil {
+					if k := disconnectUserSessions(h.db, username, true); k.Unconfirmed > 0 {
+						msg += " (may still be online: router did not confirm the disconnect)"
+					}
+				}
 
 			case "change_plan":
 				planID := intParam("plan_id")
