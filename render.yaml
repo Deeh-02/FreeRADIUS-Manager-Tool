@@ -17,8 +17,9 @@ services:
     dockerContext: ./backend
     dockerfilePath: ./backend/Dockerfile
     # The free plan sleeps after 15 idle minutes: the scheduler (expiry, renewals) stops and an
-    # M-Pesa callback can arrive while it is waking up. Use a paid plan for anything but a quick look.
-    plan: starter
+    # M-Pesa callback can arrive while it is waking up. Fine for a test; change to `starter` (paid)
+    # before real customers.
+    plan: free
     region: frankfurt
     healthCheckPath: /health
     envVars:

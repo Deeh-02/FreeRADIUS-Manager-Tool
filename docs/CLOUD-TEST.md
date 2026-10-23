@@ -20,8 +20,9 @@ test money and a throwaway database. **Do not put real customers on it.**
   offline" on *Online now*. A real deployment puts the API next to the routers, or adds a VPN.
 - **Free plans sleep.** Render's free web service stops after 15 idle minutes, and then
   scheduled tasks don't run and an M-Pesa callback can arrive while it wakes. Supabase's free
-  project pauses after a week without use. The blueprint uses Render's *Starter* plan for the
-  API; the UI is free.
+  project pauses after a week without use. The blueprint uses Render's *free* plan for the
+  API and the UI, which is enough for a test: open the API's /health page to wake it before
+  you start, and set `plan: starter` in render.yaml (about $7 a month) before real customers.
 
 ## 1. Accounts and keys (about 20 minutes)
 
