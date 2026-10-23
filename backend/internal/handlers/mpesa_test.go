@@ -572,6 +572,32 @@ func TestMpesaConfigChecks(t *testing.T) {
 	}
 }
 
+// Render generates the callback secret as base64, which has "/", "+" and "=" in it. Put in a
+// URL as it is, "/" splits the address, no route matches and Safaricom only ever sees a 404
+// (found on the first cloud deployment, October 2026).
+func TestMpesaTokenWithUrlUnsafeCharacters(t *testing.T) {
+	newMpesaRig(t)
+	t.Setenv("MPESA_CALLBACK_URL", "https://isp.example.com")
+	t.Setenv("MPESA_BASE_URL", "")
+	t.Setenv("MPESA_CALLBACK_TOKEN", "pYWLbTOoimUqW/KU5c/JsUIG746zz+Zjvwp3iPBkXqg=")
+	c, err := loadMpesaConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := c.callbackURL("confirm")
+	if rest := strings.TrimPrefix(u, "https://isp.example.com/api/v1/pay/confirm/"); rest == u || strings.ContainsAny(rest, "/+=?#% ") || len(rest) < 24 {
+		t.Errorf("callback address %q is not safe to use in a path", u)
+	}
+	c2, _ := loadMpesaConfig()
+	if c2.callbackURL("confirm") != u {
+		t.Error("the same secret gave a different address the second time")
+	}
+	t.Setenv("MPESA_CALLBACK_TOKEN", mpesaToken)
+	if c3, _ := loadMpesaConfig(); c3.Token != mpesaToken {
+		t.Errorf("a URL-safe secret was changed to %q", c3.Token)
+	}
+}
+
 // Customers paying the paybill themselves, with every kind of account number.
 func TestMpesaPaybill(t *testing.T) {
 	m := newMpesaRig(t)

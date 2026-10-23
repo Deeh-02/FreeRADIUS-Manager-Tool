@@ -3,9 +3,11 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -133,6 +135,7 @@ func loadMpesaConfig() (*mpesaConfig, error) {
 	if len(c.Token) < 24 {
 		return nil, errors.New("MPESA_CALLBACK_TOKEN must be at least 24 random characters (openssl rand -hex 16)")
 	}
+	c.Token = urlSafeToken(c.Token)
 	if w := darajaForbiddenWord(c.CallbackBase); w != "" {
 		return nil, fmt.Errorf("MPESA_CALLBACK_URL contains %q, which Safaricom refuses in callback addresses; use another host name", w)
 	}
@@ -174,6 +177,21 @@ func darajaForbiddenWord(s string) string {
 		}
 	}
 	return ""
+}
+
+// urlSafeToken returns the secret as it appears in the callback addresses. A secret made of URL
+// characters is used as it is. Anything else (Render's generated values are base64 and contain
+// "/", "+" and "=") would split or change the address, so no route would match and Safaricom
+// would only ever see a 404; those become a hex hash of the secret.
+func urlSafeToken(secret string) string {
+	for _, r := range secret {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == '~'
+		if !ok {
+			sum := sha256.Sum256([]byte(secret))
+			return hex.EncodeToString(sum[:])
+		}
+	}
+	return secret
 }
 
 func (c *mpesaConfig) callbackURL(kind string) string {
