@@ -36,6 +36,7 @@ services:
       - ./migrations/011_billing_integrity.sql:/docker-entrypoint-initdb.d/04-billing-integrity.sql:ro
       - ./migrations/012_kes_and_customer_grace.sql:/docker-entrypoint-initdb.d/05-kes-and-grace.sql:ro
       - ./migrations/013_trial_days.sql:/docker-entrypoint-initdb.d/06-trial-days.sql:ro
+      - ./migrations/014_default_trial_5_days.sql:/docker-entrypoint-initdb.d/07-default-trial.sql:ro
     networks:
       - radius-network
     healthcheck:

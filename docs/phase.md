@@ -68,11 +68,12 @@ These were defaulted in code; all are changeable on the **Settings** page.
       tick *Start now* when assigning the plan.
 - [x] **Grace period** after the paid-until date. **Decided:** a system default (`billing_grace_days`,
       Settings) plus a per-customer value that staff set or extend on the customer dialog when a
-      customer asks. *Still to choose:* the default number of days for new customers.
+      customer asks. **Default for new customers: none** (`billing_grace_days` = 0); only staff give
+      grace days, one customer at a time.
 - [x] **Free trial for new customers:** **built and flexible.** The team sets the default in
       Settings → *Free trial for new customers (days)* (0 = off), and staff can give a different
       number, or none, for any one customer in the New customer / Assign Plan dialogs.
-      *Still to choose:* the starting default (a week? 5 days?).
+      **Default: 5 days** (migration 014); the team can change it any time.
 - [ ] **Renewal invoices:** how many days before paid-until. Default: 3 (`renewal_invoice_days`).
 - [ ] **Overdue postpaid invoices block service?** Default: no (`suspend_overdue`).
 - [ ] **Reminders:** days before expiry and the message. Default: 3 days, SMS/email.

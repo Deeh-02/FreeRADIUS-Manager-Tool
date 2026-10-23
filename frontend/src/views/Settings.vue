@@ -170,7 +170,7 @@ const sections = [
       { key: 'default_currency', label: 'Default currency', maxlength: 3, upper: true, help: 'ISO code, e.g. KES. Used when a plan or invoice does not name one.' },
       { key: 'invoice_due_days', label: 'Invoice due after (days)', type: 'number', min: 0, max: 365 },
       { key: 'renewal_invoice_days', label: 'Raise renewal invoice (days before paid-until)', type: 'number', min: 0, max: 60, help: 'The "Raise Renewal Invoices" task bills customers this many days before they run out.' },
-      { key: 'billing_grace_days', label: 'Grace days after paid-until', type: 'number', min: 0, max: 60, help: 'Customers stay online this many days after their paid-until date.' },
+      { key: 'billing_grace_days', label: 'Grace days after paid-until', type: 'number', min: 0, max: 60, help: 'Applies to customers with no grace of their own. Keep it at 0 so only staff-given grace counts (customer dialog → Grace days).' },
       { key: 'trial_days', label: 'Free trial for new customers (days)', type: 'number', min: 0, max: 90, help: 'A brand-new customer on a paid plan can use the service this many days before their first payment. 0 = no trial. Each customer gets one trial; change it any time, it applies to customers added from then on.' },
       { key: 'suspend_overdue', label: 'Block customers with overdue postpaid invoices', type: 'bool', help: 'For invoices whose period was started before payment ("start now").' },
       { key: 'report_email', label: 'Daily report email', type: 'email', help: 'Empty = not emailed.' },
