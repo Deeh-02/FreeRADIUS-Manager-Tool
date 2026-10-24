@@ -102,10 +102,12 @@ func redeemPromotion(q dbtx, code string, planID *int, amount float64) (float64,
 func promoRejectReason(q dbtx, code string, planID *int) error {
 	var active bool
 	var maxUses, uses int
-	var from, until sql.NullTime
+	var from sql.NullTime
+	var notYet, ended bool // by the database's clock, as redeemPromotion decides
 	var promoPlan sql.NullInt64
-	err := q.QueryRow(`SELECT is_active, max_uses, uses_count, valid_from, valid_until, plan_id
-		FROM promotions WHERE code = $1`, code).Scan(&active, &maxUses, &uses, &from, &until, &promoPlan)
+	err := q.QueryRow(`SELECT is_active, max_uses, uses_count, valid_from,
+		COALESCE(valid_from > NOW(), FALSE), COALESCE(valid_until < NOW(), FALSE), plan_id
+		FROM promotions WHERE code = $1`, code).Scan(&active, &maxUses, &uses, &from, &notYet, &ended, &promoPlan)
 	switch {
 	case err != nil:
 		return errors.New("invalid or unknown promo code")
@@ -113,9 +115,9 @@ func promoRejectReason(q dbtx, code string, planID *int) error {
 		return errors.New("promotion is no longer active")
 	case maxUses > 0 && uses >= maxUses:
 		return errors.New("promotion usage limit reached")
-	case from.Valid && time.Now().Before(from.Time):
+	case notYet:
 		return fmt.Errorf("promotion starts on %s", from.Time.Format("Jan 2, 2006"))
-	case until.Valid && time.Now().After(until.Time):
+	case ended:
 		return errors.New("promotion has expired")
 	case promoPlan.Valid && (planID == nil || int64(*planID) != promoPlan.Int64):
 		return errors.New("promotion does not apply to this plan")
@@ -252,10 +254,10 @@ func replayPayment(q dbtx, in paymentInput) (out *paymentOutcome, found bool, er
 // recordPaymentTx records money received. With an invoice it validates the invoice, and
 // when the invoice becomes fully paid it marks it paid and adds the plan period (once).
 func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
+	in.Amount = round2(in.Amount) // before the check: 0.004 would otherwise be stored as 0.00
 	if in.Amount <= 0 {
-		return nil, errors.New("amount must be greater than zero")
+		return nil, errors.New("amount must be at least 0.01")
 	}
-	in.Amount = round2(in.Amount)
 	in.Currency = strings.ToUpper(strings.TrimSpace(in.Currency))
 	if in.PaymentMethod == "" {
 		in.PaymentMethod = "cash"

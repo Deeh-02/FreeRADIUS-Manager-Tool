@@ -273,9 +273,9 @@ func CheckCredStuffing(h *Handler, ip, username string) bool {
 	blockMins := settings.Int("cs_block_mins", "", 60)
 
 	// Check if already DB-blocked
-	var blockedUntil *time.Time
-	h.db.QueryRow(`SELECT blocked_until FROM cred_stuffing_blocks WHERE ip_address=$1`, ip).Scan(&blockedUntil)
-	if blockedUntil != nil && blockedUntil.After(time.Now()) {
+	var blocked bool // by the database's clock: blocked_until has no zone
+	h.db.QueryRow(`SELECT blocked_until > NOW() FROM cred_stuffing_blocks WHERE ip_address=$1`, ip).Scan(&blocked)
+	if blocked {
 		return true
 	}
 
@@ -299,10 +299,10 @@ func CheckCredStuffing(h *Handler, ip, username string) bool {
 	if len(valid) >= maxFails {
 		blockedUntilTime := now.Add(time.Duration(blockMins) * time.Minute)
 		h.db.Exec(`INSERT INTO cred_stuffing_blocks (ip_address,fail_count,blocked_until,reason)
-			VALUES ($1,$2,$3,'sliding-window rate limit')
+			VALUES ($1,$2,NOW() + make_interval(mins => $3::int),'sliding-window rate limit')
 			ON CONFLICT (ip_address) DO UPDATE SET
-			fail_count=cred_stuffing_blocks.fail_count+1, blocked_until=$3, updated_at=NOW()`,
-			ip, len(valid), blockedUntilTime)
+			fail_count=cred_stuffing_blocks.fail_count+1, blocked_until=EXCLUDED.blocked_until, updated_at=NOW()`,
+			ip, len(valid), blockMins)
 		details, _ := json.Marshal(map[string]interface{}{"fail_count": len(valid), "window_secs": windowSecs,
 			"blocked_until": blockedUntilTime.Format(time.RFC3339)})
 		h.db.Exec(`INSERT INTO security_alerts (alert_type,severity,ip_address,username,details)

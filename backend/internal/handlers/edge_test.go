@@ -348,3 +348,16 @@ func TestPaymentUsernameMustMatchInvoice(t *testing.T) {
 	}
 	failIf(t, checkMoney(db))
 }
+
+// An amount that rounds to nothing is refused, not stored as a 0.00 payment.
+func TestPaymentBelowOneCentRefused(t *testing.T) {
+	db := resetTestDB(t)
+	h := newTestHandler(t)
+	seedUser(t, db, "tiny", nil)
+	if code, resp := callHandler(h.CreatePayment, nil, nil, map[string]interface{}{"username": "tiny", "amount": 0.004}); code != 400 {
+		t.Errorf("payment of 0.004: %d %v, want 400", code, resp)
+	}
+	if n := scanInt(t, db, `SELECT COUNT(*) FROM payments`); n != 0 {
+		t.Errorf("%d payment(s) recorded", n)
+	}
+}

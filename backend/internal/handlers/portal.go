@@ -32,31 +32,34 @@ func (h *Handler) PortalLogin(c *gin.Context) {
 
 	var userID, failed int
 	var storedHash, status string
-	var lockedUntil *time.Time
+	var hadLock, locked bool // decided by the database's clock (see lockAppUserSQL)
 	err := h.db.QueryRow(`
-		SELECT id, password, status, portal_failed_attempts, portal_locked_until
+		SELECT id, password, status, portal_failed_attempts, portal_locked_until IS NOT NULL,
+		       COALESCE(portal_locked_until > NOW(), FALSE)
 		FROM radius_users WHERE username=$1`, req.Username).
-		Scan(&userID, &storedHash, &status, &failed, &lockedUntil)
+		Scan(&userID, &storedHash, &status, &failed, &hadLock, &locked)
 	if err != nil {
 		bcrypt.CompareHashAndPassword([]byte(dummyHash), []byte(req.Password))
 		CheckCredStuffing(h, c.ClientIP(), req.Username)
 		respondError(c, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
-	if lockedUntil != nil && time.Now().Before(*lockedUntil) {
+	if locked {
 		respondError(c, http.StatusTooManyRequests, "too many failed attempts; try again later")
 		return
 	}
-	if lockedUntil != nil {
+	if hadLock {
 		failed = 0
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password)); err != nil {
 		failed++
-		var lock interface{}
+		lockMins := 0
 		if failed >= settings.Int("portal_max_attempts", "", 5) {
-			lock = time.Now().Add(time.Duration(settings.Int("portal_lockout_minutes", "", 15)) * time.Minute)
+			lockMins = settings.Int("portal_lockout_minutes", "", 15)
 		}
-		h.db.Exec(`UPDATE radius_users SET portal_failed_attempts=$1, portal_locked_until=$2 WHERE id=$3`, failed, lock, userID)
+		h.db.Exec(`UPDATE radius_users SET portal_failed_attempts=$1,
+			portal_locked_until = CASE WHEN $2::int > 0 THEN NOW() + make_interval(mins => $2::int) ELSE NULL END
+			WHERE id=$3`, failed, lockMins, userID)
 		CheckCredStuffing(h, c.ClientIP(), req.Username)
 		respondError(c, http.StatusUnauthorized, "invalid username or password")
 		return
@@ -77,7 +80,7 @@ func (h *Handler) PortalLogin(c *gin.Context) {
 
 	if _, err := h.db.Exec(`
 		INSERT INTO portal_sessions (token, username, expires_at)
-		VALUES ($1,$2,$3)`, token, req.Username, expiresAt); err != nil {
+		VALUES ($1,$2,NOW() + INTERVAL '24 hours')`, token, req.Username); err != nil {
 		h.log.WithError(err).Error("portal session")
 		respondError(c, http.StatusInternalServerError, "failed to create session")
 		return
@@ -288,11 +291,10 @@ func (h *Handler) PortalAuthMiddleware() gin.HandlerFunc {
 			return
 		}
 		var username string
-		var expiresAt time.Time
 		err := h.db.QueryRow(`
-			SELECT username, expires_at FROM portal_sessions
-			WHERE token=$1`, token).Scan(&username, &expiresAt)
-		if err != nil || expiresAt.Before(time.Now()) {
+			SELECT username FROM portal_sessions
+			WHERE token=$1 AND expires_at > NOW()`, token).Scan(&username)
+		if err != nil {
 			h.db.Exec(`DELETE FROM portal_sessions WHERE token=$1`, token)
 			respondError(c, http.StatusUnauthorized, "portal session expired or invalid")
 			c.Abort()

@@ -502,6 +502,8 @@ func (h *Handler) ResetRadiusUserPassword(c *gin.Context) {
 		{`UPDATE radius_users SET password = $1, password_expiry = CURRENT_DATE + $2::int, updated_at = NOW() WHERE id = $3`,
 			[]interface{}{newHash, days, id}},
 		{`INSERT INTO radius_user_password_history (user_id, password_hash) VALUES ($1, $2)`, []interface{}{id, oldHash}},
+		// Whoever had the old password is signed out of the customer portal.
+		{`DELETE FROM portal_sessions WHERE username = $1`, []interface{}{username}},
 	} {
 		if _, err := tx.Exec(step.q, step.args...); err != nil {
 			respondError(c, http.StatusInternalServerError, "failed to reset password")
@@ -582,6 +584,11 @@ func setUserStatus(db interface {
 	}
 	if err := syncAccess(tx, username); err != nil {
 		return "", "", err
+	}
+	if newStatus == "suspended" { // the portal refuses suspended customers; end open sessions too
+		if _, err := tx.Exec(`DELETE FROM portal_sessions WHERE username = $1`, username); err != nil {
+			return "", "", err
+		}
 	}
 	return username, newStatus, tx.Commit()
 }

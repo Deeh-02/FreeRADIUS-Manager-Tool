@@ -19,6 +19,12 @@ import (
 // per-IP credential-stuffing window (CheckCredStuffing). A disabled account is only reported
 // after the correct password, so the response does not reveal which usernames exist. Each
 // login opens a new session; several devices can be signed in at once.
+// lockAppUserSQL records a failed sign-in ($2 = minutes to lock, 0 = no lock). The lock is
+// set by the database's clock so it is compared with the same clock.
+const lockAppUserSQL = `UPDATE app_users SET failed_attempts = $1,
+	locked_until = CASE WHEN $2::int > 0 THEN NOW() + make_interval(mins => $2::int) ELSE NULL END
+	WHERE id = $3`
+
 func (h *Handler) Login(c *gin.Context) {
 	var req models.LoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -31,16 +37,20 @@ func (h *Handler) Login(c *gin.Context) {
 
 	// Fetch user
 	var user models.AppUser
+	// locked is decided by the database: locked_until is wall-clock time in its zone, which Go
+	// would read as UTC (3 hours late in Kenya).
+	var locked bool
 	err := h.db.QueryRow(`
 		SELECT id, username, password_hash, email,
 		       COALESCE(full_name, ''), role,
-		       mfa_enabled, COALESCE(mfa_secret, ''), is_active, failed_attempts, locked_until
+		       mfa_enabled, COALESCE(mfa_secret, ''), is_active, failed_attempts, locked_until,
+		       COALESCE(locked_until > NOW(), FALSE)
 		FROM app_users WHERE username = $1`,
 		req.Username,
 	).Scan(
 		&user.ID, &user.Username, &user.PasswordHash, &user.Email,
 		&user.FullName, &user.Role, &user.MFAEnabled, &user.MFASecret,
-		&user.IsActive, &user.FailedAttempts, &user.LockedUntil,
+		&user.IsActive, &user.FailedAttempts, &user.LockedUntil, &locked,
 	)
 
 	if err == sql.ErrNoRows {
@@ -58,7 +68,7 @@ func (h *Handler) Login(c *gin.Context) {
 
 	// Check lockout
 	maxAttempts := getBruteForceAttempts()
-	if user.LockedUntil != nil && time.Now().Before(*user.LockedUntil) {
+	if locked {
 		respondError(c, http.StatusTooManyRequests, "account temporarily locked due to too many failed attempts")
 		return
 	}
@@ -70,19 +80,11 @@ func (h *Handler) Login(c *gin.Context) {
 	// Verify password
 	if !auth.CheckPassword(user.PasswordHash, req.Password) {
 		newAttempts := user.FailedAttempts + 1
-		var lockUntil interface{} = nil
-
+		lockMins := 0
 		if newAttempts >= maxAttempts {
-			lockDuration := time.Duration(getBruteForceLockout()) * time.Minute
-			lockTime := time.Now().Add(lockDuration)
-			lockUntil = lockTime
+			lockMins = getBruteForceLockout()
 		}
-
-		h.db.Exec(`
-			UPDATE app_users SET failed_attempts = $1, locked_until = $2
-			WHERE id = $3`,
-			newAttempts, lockUntil, user.ID,
-		)
+		h.db.Exec(lockAppUserSQL, newAttempts, lockMins, user.ID)
 		CheckCredStuffing(h, c.ClientIP(), req.Username)
 
 		respondError(c, http.StatusUnauthorized, "invalid credentials")
@@ -103,12 +105,11 @@ func (h *Handler) Login(c *gin.Context) {
 		if !totp.Validate(req.MFACode, user.MFASecret) {
 			// A wrong code counts like a wrong password, so the 6 digits cannot be brute-forced.
 			newAttempts := user.FailedAttempts + 1
-			var lockUntil interface{}
+			lockMins := 0
 			if newAttempts >= maxAttempts {
-				lockUntil = time.Now().Add(time.Duration(getBruteForceLockout()) * time.Minute)
+				lockMins = getBruteForceLockout()
 			}
-			h.db.Exec(`UPDATE app_users SET failed_attempts = $1, locked_until = $2 WHERE id = $3`,
-				newAttempts, lockUntil, user.ID)
+			h.db.Exec(lockAppUserSQL, newAttempts, lockMins, user.ID)
 			CheckCredStuffing(h, c.ClientIP(), req.Username)
 			respondError(c, http.StatusUnauthorized, "invalid MFA code")
 			return

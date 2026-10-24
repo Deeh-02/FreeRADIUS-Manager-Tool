@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/freeradius-manager/backend/internal/auth"
 	"github.com/freeradius-manager/backend/internal/database"
@@ -123,30 +122,35 @@ func apiKeyClaims(db *database.DB, rawKey string) (*auth.Claims, bool, error) {
 	var keyID, userID int
 	var name, username string
 	var perms []string
-	var expiresAt *time.Time
-	var lastUsed *time.Time
+	// Compared by the database's clock: the columns have no zone, and Go would read them as
+	// UTC (3 hours late in Kenya).
+	var expired, stale bool
+	var creatorRole string
 	err := db.QueryRow(`
-		SELECT ak.id, ak.name, ak.permissions, ak.expires_at, ak.last_used, au.id, au.username
+		SELECT ak.id, ak.name, ak.permissions, COALESCE(ak.expires_at <= NOW(), FALSE),
+		       COALESCE(ak.last_used < NOW() - INTERVAL '1 minute', TRUE), au.id, au.username, au.role
 		FROM api_keys ak
 		JOIN app_users au ON au.id = ak.created_by AND au.is_active = TRUE
 		WHERE ak.key_hash = $1 AND ak.is_active = TRUE`, keyHash).
-		Scan(&keyID, &name, pq.Array(&perms), &expiresAt, &lastUsed, &userID, &username)
+		Scan(&keyID, &name, pq.Array(&perms), &expired, &stale, &userID, &username, &creatorRole)
 	if err == sql.ErrNoRows {
 		return nil, false, errInvalidKey
 	}
 	if err != nil {
 		return nil, false, errKeyLookup
 	}
-	if expiresAt != nil && expiresAt.Before(time.Now()) {
+	if expired {
 		return nil, false, errKeyExpired
 	}
-	if lastUsed == nil || time.Since(*lastUsed) > time.Minute {
+	if stale {
 		db.Exec(`UPDATE api_keys SET last_used = NOW() WHERE id = $1`, keyID)
 	}
 
 	role, readOnly := auth.RoleOperator, true
 	for _, p := range perms {
-		if p == "write" || p == "admin" {
+		// A key never does more than its creator may now: one made by a super admin who was
+		// later made an operator is read-only.
+		if (p == "write" || p == "admin") && creatorRole != auth.RoleOperator {
 			role, readOnly = auth.RoleAdmin, false
 		}
 	}
