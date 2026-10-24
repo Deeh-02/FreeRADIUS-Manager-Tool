@@ -188,11 +188,16 @@ async function submit() {
   try {
     const f = form.value
     if (isEditing.value) {
+      // Expiry and grace are sent only when changed: the user row may be stale, and sending it
+      // back would undo a payment made since the list was loaded.
+      const was = props.user.account_expiry ? props.user.account_expiry.slice(0, 10) : ''
+      const graceWas = props.user.grace_days ?? null
+      const grace = f.grace_days === '' ? null : f.grace_days
       await radiusUsersAPI.update(props.user.id, {
         full_name: f.full_name, email: f.email, phone: f.phone, department: f.department, notes: f.notes,
         device_limit: f.device_limit,
-        account_expiry: f.account_expiry || '', // "" clears the expiry
-        ...(f.grace_days === null || f.grace_days === '' ? { clear_grace_days: true } : { grace_days: f.grace_days }),
+        ...((f.account_expiry || '') !== was ? { account_expiry: f.account_expiry || '', account_expiry_was: was } : {}), // "" clears the expiry
+        ...(grace === graceWas ? {} : grace === null ? { clear_grace_days: true } : { grace_days: grace }),
       })
       toast.success('User updated')
       emit('saved')

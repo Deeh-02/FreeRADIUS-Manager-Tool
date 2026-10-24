@@ -451,7 +451,7 @@ async function exportUsers() {
 }
 
 function isPast(d) {
-  return !!d && d.slice(0, 10) < new Date().toISOString().slice(0, 10)
+  return !!d && d.slice(0, 10) < format(new Date(), 'yyyy-MM-dd') // today here, not in UTC
 }
 
 function onSaved(created) {

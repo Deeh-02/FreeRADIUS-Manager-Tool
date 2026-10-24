@@ -304,6 +304,28 @@ func (h *Handler) UpdateRadiusUser(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
+	// Same lock payments take, so the expiry compared here is the one the update replaces.
+	if err := lockUser(tx, id); err != nil {
+		respondError(c, http.StatusInternalServerError, "database error")
+		return
+	}
+	if (setExpiry || clearExpiry) && req.AccountExpiryWas != nil {
+		var current string
+		if err := tx.QueryRow(`SELECT COALESCE(TO_CHAR(account_expiry, 'YYYY-MM-DD'), '') FROM radius_users WHERE id = $1`, id).Scan(&current); err != nil {
+			respondError(c, http.StatusInternalServerError, "database error")
+			return
+		}
+		if current != strs.TrimSpace(*req.AccountExpiryWas) {
+			shown := current
+			if shown == "" {
+				shown = "none"
+			}
+			respondError(c, http.StatusConflict, fmt.Sprintf(
+				"the paid-until date changed to %s since this form was opened (a payment?); reopen the customer and try again", shown))
+			return
+		}
+	}
+
 	text := func(p *string) interface{} {
 		if p == nil {
 			return nil

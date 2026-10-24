@@ -62,6 +62,9 @@ type UpdateRadiusUserRequest struct {
 	Notes         *string `json:"notes"`
 	DeviceLimit   *int    `json:"device_limit" binding:"omitempty,min=1,max=500"`
 	AccountExpiry *string `json:"account_expiry"`
+	// AccountExpiryWas is the expiry the client saw ("" = none). If given, a changed expiry is
+	// refused when the stored one is no longer that (a payment moved it meanwhile).
+	AccountExpiryWas *string `json:"account_expiry_was"`
 	// GraceDays gives this customer their own grace period; ClearGraceDays returns them to the
 	// system default.
 	GraceDays           *int  `json:"grace_days" binding:"omitempty,min=0,max=60"`

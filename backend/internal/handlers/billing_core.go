@@ -301,6 +301,9 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 		}
 		if in.Username == "" {
 			in.Username = inv.username
+		} else if in.Username != inv.username {
+			// The payment would be filed under someone else than the invoice it pays.
+			return nil, fmt.Errorf("invoice is %s's, not %s's", inv.username, in.Username)
 		}
 		if err := q.QueryRow(`SELECT COALESCE(SUM(amount), 0) FROM payments
 			WHERE invoice_id = $1 AND status = 'confirmed'`, *in.InvoiceID).Scan(&inv.paid); err != nil {

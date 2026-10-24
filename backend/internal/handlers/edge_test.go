@@ -269,3 +269,82 @@ func radiusDecisionFor(t *testing.T, db *database.DB, username string) (bool, st
 		(SELECT value FROM radcheck WHERE username=$1 AND attribute='Expiration')`, username).Scan(&hasRows, &reject, &exp)
 	return radiusDecision(today, hasRows, reject, exp)
 }
+
+// Staff edit a customer from a list loaded before the customer paid. Saving other fields must
+// not put back the old paid-until date, and changing the date from a stale form is refused.
+func TestEditFromStaleFormKeepsPayment(t *testing.T) {
+	db := resetTestDB(t)
+	h := newTestHandler(t)
+	plan := seedPlan(t, db, "Monthly", 100, 30)
+	uid := seedUser(t, db, "stale-form", nil)
+	res, _ := assignTx(db, uid, "stale-form", plan.ID, false, "")
+	mustExec(t, db, `UPDATE radius_users SET account_expiry = CURRENT_DATE + 2 WHERE id=$1`, uid)
+	var seen string // what the edit form loaded
+	db.QueryRow(`SELECT TO_CHAR(account_expiry, 'YYYY-MM-DD') FROM radius_users WHERE id=$1`, uid).Scan(&seen)
+
+	// The customer pays while the form is open: paid-until moves 30 days on.
+	if _, err := payTx(db, paymentInput{InvoiceID: &res.InvoiceID, Amount: 100}); err != nil {
+		t.Fatal(err)
+	}
+	paidUntil := scanInt(t, db, `SELECT account_expiry - CURRENT_DATE FROM radius_users WHERE id=$1`, uid)
+	id := gin.Params{{Key: "id", Value: fmt.Sprint(uid)}}
+
+	// Phone changed only: the form leaves the expiry out.
+	if code, resp := callHandler(h.UpdateRadiusUser, id, nil, map[string]interface{}{"phone": "0700000001"}); code != 200 {
+		t.Fatalf("update: %d %v", code, resp)
+	}
+	if d := scanInt(t, db, `SELECT account_expiry - CURRENT_DATE FROM radius_users WHERE id=$1`, uid); d != paidUntil {
+		t.Errorf("paid-until today%+d after a phone change, want today%+d", d, paidUntil)
+	}
+
+	// The date changed from the stale form: refused, nothing written.
+	code, resp := callHandler(h.UpdateRadiusUser, id, nil, map[string]interface{}{
+		"account_expiry": seen[:8] + "01", "account_expiry_was": seen, "phone": "0700000002"})
+	if code != 409 {
+		t.Errorf("stale expiry change: %d %v, want 409", code, resp)
+	}
+	if d := scanInt(t, db, `SELECT account_expiry - CURRENT_DATE FROM radius_users WHERE id=$1`, uid); d != paidUntil {
+		t.Errorf("paid-until today%+d after a refused change, want today%+d", d, paidUntil)
+	}
+	var phone string
+	db.QueryRow(`SELECT phone FROM radius_users WHERE id=$1`, uid).Scan(&phone)
+	if phone != "0700000001" {
+		t.Errorf("phone %q written by a refused update", phone)
+	}
+
+	// From a fresh form it goes through, and clearing works the same way.
+	var now string
+	db.QueryRow(`SELECT TO_CHAR(account_expiry, 'YYYY-MM-DD') FROM radius_users WHERE id=$1`, uid).Scan(&now)
+	if code, resp := callHandler(h.UpdateRadiusUser, id, nil, map[string]interface{}{"account_expiry": "", "account_expiry_was": now}); code != 200 {
+		t.Fatalf("clear from a fresh form: %d %v", code, resp)
+	}
+	if n := scanInt(t, db, `SELECT COUNT(*) FROM radius_users WHERE id=$1 AND account_expiry IS NULL`, uid); n != 1 {
+		t.Error("expiry not cleared")
+	}
+	if code, _ := callHandler(h.UpdateRadiusUser, id, nil, map[string]interface{}{"account_expiry": now, "account_expiry_was": ""}); code != 200 {
+		t.Errorf("set from no expiry: %d", code)
+	}
+	failIf(t, checkEnforcement(db))
+}
+
+// A payment on an invoice must be filed under the invoice's customer.
+func TestPaymentUsernameMustMatchInvoice(t *testing.T) {
+	db := resetTestDB(t)
+	h := newTestHandler(t)
+	plan := seedPlan(t, db, "Monthly", 100, 30)
+	uid := seedUser(t, db, "owner", nil)
+	seedUser(t, db, "someone-else", nil)
+	inv := seedInvoice(t, db, uid, "owner", plan, 100)
+
+	code, resp := callHandler(h.CreatePayment, nil, nil, map[string]interface{}{"invoice_id": inv, "username": "someone-else", "amount": 100})
+	if code != 400 {
+		t.Errorf("payment under another customer: %d %v, want 400", code, resp)
+	}
+	if n := scanInt(t, db, `SELECT COUNT(*) FROM payments`); n != 0 {
+		t.Errorf("%d payment(s) recorded", n)
+	}
+	if code, resp := callHandler(h.CreatePayment, nil, nil, map[string]interface{}{"invoice_id": inv, "username": "owner", "amount": 100}); code != 201 {
+		t.Errorf("payment by the owner: %d %v", code, resp)
+	}
+	failIf(t, checkMoney(db))
+}
