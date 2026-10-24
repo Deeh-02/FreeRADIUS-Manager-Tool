@@ -181,7 +181,8 @@ import { ref, reactive, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
 import { billingAPI, plansAPI, mpesaAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, XMarkIcon } from '@heroicons/vue/24/outline'
 import RecordPaymentModal from '@/components/billing/RecordPaymentModal.vue'
 import MpesaPromptModal from '@/components/billing/MpesaPromptModal.vue'
@@ -214,7 +215,7 @@ const isOpen = (inv) => inv.status === 'pending' || inv.status === 'overdue'
 
 function formatDate(d) {
   if (!d) return '—'
-  try { return format(parseISO(d), 'MMM d, yyyy') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, yyyy') } catch { return d }
 }
 
 async function loadInvoices() {

@@ -151,7 +151,8 @@ import { ref, reactive, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
 import { webhooksAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, XMarkIcon, TrashIcon, LinkIcon, BoltIcon, InformationCircleIcon } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -170,7 +171,7 @@ const form = reactive({ name: '', url: '', secret: '', events: [], is_active: tr
 const availableEvents = ref(['user.created', 'user.suspended', 'user.expired', 'invoice.created', 'invoice.paid', 'payment.received', 'payment.reversed', 'ticket.created', 'nas.down', 'nas.up', 'test'])
 
 function formatDate(d) {
-  try { return format(parseISO(d), 'MMM d HH:mm') } catch { return d }
+  try { return format(serverDate(d), 'MMM d HH:mm') } catch { return d }
 }
 
 function toggleEvent(e) {

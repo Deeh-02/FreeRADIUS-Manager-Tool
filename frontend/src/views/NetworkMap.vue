@@ -132,7 +132,8 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { nasStatusAPI, liveStatsAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { ServerIcon, UsersIcon, SignalIcon, ArrowPathIcon } from '@heroicons/vue/24/outline'
 
 const loading = ref(false)
@@ -158,7 +159,7 @@ function statusIcon(s) {
 }
 function formatDate(d) {
   if (!d) return 'never'
-  try { return format(parseISO(d), 'HH:mm:ss') } catch { return d }
+  try { return format(serverDate(d), 'HH:mm:ss') } catch { return d }
 }
 
 async function load() {

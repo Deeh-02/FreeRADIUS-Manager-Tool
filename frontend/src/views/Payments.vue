@@ -154,7 +154,8 @@ import MpesaUnmatched from '@/components/billing/MpesaUnmatched.vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
 import { paymentsAPI, openReceipt } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, CurrencyDollarIcon, BanknotesIcon, ReceiptPercentIcon, ArrowUturnLeftIcon } from '@heroicons/vue/24/outline'
 import RecordPaymentModal from '@/components/billing/RecordPaymentModal.vue'
 import { money, formatTotals, apiError } from '@/utils/money'
@@ -173,7 +174,7 @@ const filterMethod = ref('')
 const filterStatus = ref('')
 let debounceTimer
 
-function formatDate(d) { try { return format(parseISO(d), 'MMM d, yyyy HH:mm') } catch { return d } }
+function formatDate(d) { try { return format(serverDate(d), 'MMM d, yyyy HH:mm') } catch { return d } }
 const countOf = (list) => (list || []).reduce((n, t) => n + (t.count || 0), 0)
 
 async function load() {

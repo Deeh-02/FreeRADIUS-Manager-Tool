@@ -109,6 +109,7 @@ import { ref, onMounted } from 'vue'
 import { BugAntIcon, ArrowPathIcon, TrashIcon } from '@heroicons/vue/24/outline'
 import { useToast } from 'vue-toastification'
 import { securityAPI } from '../api'
+import { serverDate } from '../utils/time'
 
 const toast = useToast()
 const loading = ref(false)
@@ -148,7 +149,7 @@ async function clearLogs() {
 }
 
 function formatDate(d) {
-  return new Date(d).toLocaleString()
+  return serverDate(d).toLocaleString()
 }
 
 function formatAttrs(a) {

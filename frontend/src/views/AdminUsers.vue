@@ -103,7 +103,8 @@ import { ref, computed, onMounted } from 'vue'
 import { useAuthStore } from '@/store/auth'
 import { useToast } from 'vue-toastification'
 import { adminAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, PencilIcon, TrashIcon } from '@heroicons/vue/24/outline'
 import AdminUserModal from '@/components/users/AdminUserModal.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
@@ -147,7 +148,7 @@ function roleBadge(role) {
 }
 
 function formatDate(dateStr) {
-  try { return format(parseISO(dateStr), 'MMM d, yyyy HH:mm') } catch { return dateStr }
+  try { return format(serverDate(dateStr), 'MMM d, yyyy HH:mm') } catch { return dateStr }
 }
 
 onMounted(loadUsers)

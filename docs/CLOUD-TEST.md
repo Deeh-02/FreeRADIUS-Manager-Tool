@@ -19,7 +19,10 @@ test money and a throwaway database. **Do not put real customers on it.**
   them from Render. Billing still blocks new logins. Staff see such sessions as "should be
   offline" on *Online now*. A real deployment puts the API next to the routers, or adds a VPN.
 - **Free plans sleep.** Render's free web service stops after 15 idle minutes, and then
-  scheduled tasks don't run and an M-Pesa callback can arrive while it wakes. Supabase's free
+  scheduled tasks don't run and an M-Pesa callback can arrive while it wakes. A lost phone
+  prompt (STK) is caught later by the reconcile loop, but a lost paybill confirmation is not:
+  nothing can ask Safaricom for it afterwards, so staff would credit it by hand. Not tested
+  here; the real server must stay on. Supabase's free
   project pauses after a week without use. The blueprint uses Render's *free* plan for the
   API and the UI, which is enough for a test: open the API's /health page to wake it before
   you start, and set `plan: starter` in render.yaml (about $7 a month) before real customers.
@@ -213,6 +216,8 @@ enter the PIN.
 | Real prompt to your phone: paid, payment recorded once, customer online | 23 Oct 2026, tunnel: the prompt arrived and the PIN was entered, but the sandbox never completed it (no SMS, no callback, status "being processed"); stayed pending, nothing recorded. Prove on the live paybill. |
 | Prompt cancelled on the phone: shows "failed", nothing recorded | Unanswered twice: callback 1037 "No response from user" after ~26 s through the tunnel; failed, nothing recorded. |
 | Simulated paybill payment: applied to the customer; unknown account waits on *Payments* | Shortcode 600000: applied within 3 s; unknown account kept as unmatched. The sandbox dropped a second simulation sent within a second of the first. |
+| Render (free) + Supabase (free) deployed, setup wizard and login, RADIUS user and invoice created | 23 Oct 2026: worked after loading the schema with `scripts/db-setup.sh` (an empty database looks like "setup done" and shows the login page). |
+| Paybill registered with Safaricom from Render; simulated KES 1 payment applied to the customer | 23 Oct 2026: applied within seconds. Nothing arrived at first: Render's generated callback secret contained `/`, so the addresses 404ed (B29, fixed; register again after upgrading). |
 | Login latency, FreeRADIUS here → Supabase | |
 | A backup from *Settings → Backups* restores with `psql` (see `TestBackupManagedDatabase`) | |
 

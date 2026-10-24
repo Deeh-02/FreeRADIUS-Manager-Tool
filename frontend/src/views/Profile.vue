@@ -149,6 +149,7 @@ import {
   UserCircleIcon, LockClosedIcon, CheckIcon, KeyIcon, ShieldCheckIcon,
 } from '@heroicons/vue/24/outline'
 import { authAPI } from '@/api'
+import { serverDate } from '@/utils/time'
 import { useAuthStore } from '@/store/auth'
 
 const toast = useToast()
@@ -192,7 +193,7 @@ function ruleClass(ok) {
 
 function formatDate(d) {
   if (!d) return '—'
-  return new Date(d).toLocaleString()
+  return serverDate(d).toLocaleString()
 }
 
 async function loadProfile() {

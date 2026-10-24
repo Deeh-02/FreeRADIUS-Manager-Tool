@@ -134,7 +134,8 @@
 import { ref, reactive, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { apiKeysAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, XMarkIcon, InformationCircleIcon, ClipboardDocumentIcon } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -148,7 +149,7 @@ const availablePerms = ['read', 'write', 'admin']
 const createForm = reactive({ name: '', permissions: ['read'], expires_at: '' })
 
 function formatDate(d) {
-  try { return format(parseISO(d), 'MMM d, yyyy') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, yyyy') } catch { return d }
 }
 
 async function load() {

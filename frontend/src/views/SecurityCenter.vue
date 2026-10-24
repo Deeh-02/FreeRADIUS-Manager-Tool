@@ -274,6 +274,7 @@ import { ref, computed, onMounted } from 'vue'
 import { ShieldExclamationIcon, ArrowPathIcon, PlusIcon } from '@heroicons/vue/24/outline'
 import { useToast } from 'vue-toastification'
 import { securityAPI } from '../api'
+import { serverDate } from '../utils/time'
 
 const toast = useToast()
 const loading = ref(false)
@@ -444,7 +445,7 @@ function textClass(color) {
 }
 
 function formatDate(d) {
-  return new Date(d).toLocaleString()
+  return serverDate(d).toLocaleString()
 }
 
 function formatDetails(d) {

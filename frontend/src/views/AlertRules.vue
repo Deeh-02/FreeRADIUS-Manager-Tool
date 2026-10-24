@@ -155,7 +155,8 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { alertsAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, XMarkIcon, BellIcon, EnvelopeIcon, CheckCircleIcon, ExclamationTriangleIcon } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -199,7 +200,7 @@ function eventColor(t) {
 
 function formatDate(d) {
   if (!d) return '—'
-  try { return format(parseISO(d), 'MMM d, HH:mm') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, HH:mm') } catch { return d }
 }
 
 async function load() {

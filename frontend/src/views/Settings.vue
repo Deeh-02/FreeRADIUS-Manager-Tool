@@ -110,7 +110,7 @@
           <div v-for="b in backups.backups" :key="b.name" class="flex items-center justify-between px-3 py-2 text-sm">
             <div>
               <p class="font-mono text-xs">{{ b.name }}</p>
-              <p class="text-xs text-gray-400">{{ new Date(b.created_at).toLocaleString() }} · {{ size(b.size_bytes) }}</p>
+              <p class="text-xs text-gray-400">{{ serverDate(b.created_at).toLocaleString() }} · {{ size(b.size_bytes) }}</p>
             </div>
             <div class="flex gap-1">
               <button @click="download(b)" class="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600" title="Download">
@@ -166,6 +166,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { settingsAPI, radiusAPI, alertsAPI, saveBlob, mpesaAPI } from '@/api'
 import { apiError } from '@/utils/money'
+import { serverDate } from '@/utils/time'
 import {
   CheckIcon, LockClosedIcon, ShieldCheckIcon, EnvelopeIcon, BanknotesIcon, UsersIcon, BellAlertIcon,
   ArchiveBoxIcon, SignalIcon, ArrowDownTrayIcon, PaperAirplaneIcon, TrashIcon, ArrowPathIcon,

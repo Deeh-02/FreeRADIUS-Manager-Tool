@@ -193,7 +193,8 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { dashboardAPI, radiusUsersAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { ArrowPathIcon, MagnifyingGlassIcon } from '@heroicons/vue/24/outline'
 import { useToast } from 'vue-toastification'
 
@@ -266,7 +267,7 @@ async function disconnectSession(session) {
 
 function formatDate(dateStr) {
   if (!dateStr) return '—'
-  try { return format(parseISO(dateStr), 'MMM d, HH:mm:ss') } catch { return dateStr }
+  try { return format(serverDate(dateStr), 'MMM d, HH:mm:ss') } catch { return dateStr }
 }
 
 function formatDuration(seconds) {

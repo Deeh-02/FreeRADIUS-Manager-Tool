@@ -194,7 +194,8 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { useAuthStore } from '@/store/auth'
 import { ipPoolsAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, XMarkIcon, TrashIcon, ArrowPathIcon, MagnifyingGlassIcon, CircleStackIcon } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -223,7 +224,7 @@ function usagePct(pool) {
 }
 
 function formatDate(d) {
-  try { return format(parseISO(d), 'MMM d, HH:mm') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, HH:mm') } catch { return d }
 }
 
 async function load() {

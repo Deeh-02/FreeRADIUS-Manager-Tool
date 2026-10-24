@@ -215,7 +215,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { networkScannerAPI } from '@/api'
 import { ArrowPathIcon, MagnifyingGlassCircleIcon } from '@heroicons/vue/24/outline'
 import { useToast } from 'vue-toastification'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 
 const toast = useToast()
 
@@ -410,7 +411,7 @@ async function importAsNAS(host) {
 
 function formatDate(d) {
   if (!d) return '—'
-  try { return format(parseISO(d), 'MMM d, HH:mm') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, HH:mm') } catch { return d }
 }
 
 function statusBadge(s) {

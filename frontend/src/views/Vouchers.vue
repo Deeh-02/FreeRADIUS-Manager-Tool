@@ -195,7 +195,8 @@
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { voucherAPI, plansAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { PlusIcon, ArrowDownTrayIcon, PrinterIcon, XMarkIcon } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -249,7 +250,7 @@ function statusClass(status) {
 
 function formatDate(d) {
   if (!d) return '—'
-  try { return format(parseISO(d), 'MMM d, yyyy') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, yyyy') } catch { return d }
 }
 
 async function loadVouchers() {

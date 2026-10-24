@@ -303,7 +303,8 @@ import { useAuthStore } from '@/store/auth'
 import { useToast } from 'vue-toastification'
 import { radiusUsersAPI, importAPI, saveBlob } from '@/api'
 import { apiError } from '@/utils/money'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import {
   PlusIcon, PencilIcon, TrashIcon, KeyIcon, PauseIcon, PlayIcon,
   ArrowUpTrayIcon, ArrowDownTrayIcon, SignalSlashIcon, XMarkIcon, CreditCardIcon,
@@ -473,7 +474,7 @@ function statusBadge(status) {
 
 function formatDate(dateStr) {
   if (!dateStr) return ''
-  try { return format(parseISO(dateStr), 'MMM d, yyyy') } catch { return dateStr }
+  try { return format(serverDate(dateStr), 'MMM d, yyyy') } catch { return dateStr }
 }
 
 // ── Bulk Import ──────────────────────────────────────────────────────────────

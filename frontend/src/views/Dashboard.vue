@@ -364,7 +364,8 @@ import EmptyChart from '@/components/dashboard/EmptyChart.vue'
 import HealthBanner from '@/components/dashboard/HealthBanner.vue'
 import LivePulseBar from '@/components/dashboard/LivePulseBar.vue'
 import QuickActions from '@/components/dashboard/QuickActions.vue'
-import { formatDistanceToNow, parseISO, format } from 'date-fns'
+import { formatDistanceToNow, format } from 'date-fns'
+import { serverDate } from '../utils/time'
 
 ChartJS.register(
   CategoryScale, LinearScale, BarElement, LineElement,
@@ -459,7 +460,7 @@ const authDailyChart = computed(() => {
   const data = stats.value.auth_daily_7d || []
   return {
     labels: data.map(d => {
-      try { return format(parseISO(d.day), 'EEE d') } catch { return d.day }
+      try { return format(serverDate(d.day), 'EEE d') } catch { return d.day }
     }),
     datasets: [
       {
@@ -628,7 +629,7 @@ async function loadStats(manual = false) {
 
 function formatDate(dateStr) {
   if (!dateStr) return '—'
-  try { return format(parseISO(dateStr), 'MMM d, HH:mm:ss') } catch { return dateStr }
+  try { return format(serverDate(dateStr), 'MMM d, HH:mm:ss') } catch { return dateStr }
 }
 
 function formatMAC(mac) {
@@ -656,7 +657,7 @@ function formatDuration(seconds) {
 
 function formatRelative(dateStr) {
   if (!dateStr) return '—'
-  try { return formatDistanceToNow(parseISO(dateStr), { addSuffix: true }) } catch { return dateStr }
+  try { return formatDistanceToNow(serverDate(dateStr), { addSuffix: true }) } catch { return dateStr }
 }
 
 function nasDot(status) {

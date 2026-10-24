@@ -131,7 +131,8 @@
 import { ref, reactive, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { smsAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import { DevicePhoneMobileIcon, ArrowPathIcon } from '@heroicons/vue/24/outline'
 
 const toast = useToast()
@@ -153,7 +154,7 @@ const loadingLogs = ref(false)
 
 function formatDate(d) {
   if (!d) return ''
-  try { return format(parseISO(d), 'MMM d, HH:mm') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, HH:mm') } catch { return d }
 }
 
 async function loadConfig() {

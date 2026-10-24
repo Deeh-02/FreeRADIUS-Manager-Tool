@@ -85,7 +85,8 @@
 import { ref, onMounted } from 'vue'
 import { useToast } from 'vue-toastification'
 import { schedulerAPI } from '@/api'
-import { format, parseISO } from 'date-fns'
+import { format } from 'date-fns'
+import { serverDate } from '../utils/time'
 import {
   PlayIcon, CheckCircleIcon, ExclamationCircleIcon,
   UserMinusIcon, DocumentCurrencyDollarIcon, ServerStackIcon,
@@ -101,7 +102,7 @@ const tasks = ref([])
 const runLog = ref([])
 
 function formatDate(d) {
-  try { return format(parseISO(d), 'MMM d, HH:mm') } catch { return d }
+  try { return format(serverDate(d), 'MMM d, HH:mm') } catch { return d }
 }
 
 function taskColor(type) {
