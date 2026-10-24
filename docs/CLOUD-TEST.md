@@ -218,6 +218,7 @@ enter the PIN.
 | Simulated paybill payment: applied to the customer; unknown account waits on *Payments* | Shortcode 600000: applied within 3 s; unknown account kept as unmatched. The sandbox dropped a second simulation sent within a second of the first. |
 | Render (free) + Supabase (free) deployed, setup wizard and login, RADIUS user and invoice created | 23 Oct 2026: worked after loading the schema with `scripts/db-setup.sh` (an empty database looks like "setup done" and shows the login page). |
 | Paybill registered with Safaricom from Render; simulated KES 1 payment applied to the customer | 23 Oct 2026: applied within seconds. Nothing arrived at first: Render's generated callback secret contained `/`, so the addresses 404ed (B29, fixed; register again after upgrading). |
+| Unknown account from Render waits for staff | 24 Oct 2026: `WRONGACCT3` arrived within seconds as unmatched. Before that, three simulations accepted by Safaricom (09:25, 20:35, 20:38) never arrived until *Tell Safaricom where to send paybill payments* was pressed again: the sandbox shortcode 600000 is shared by all Daraja developers, so another app's registration replaces yours. Register again just before each sandbox test. A matched payment sent 25 s after the unknown one was not delivered either (sandbox). |
 | Login latency, FreeRADIUS here → Supabase | |
 | A backup from *Settings → Backups* restores with `psql` (see `TestBackupManagedDatabase`) | |
 
