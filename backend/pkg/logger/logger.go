@@ -41,6 +41,17 @@ func GinLogger(log *logrus.Logger) gin.HandlerFunc {
 
 		c.Next()
 
+		// Secrets in the path (the M-Pesa callback addresses end in one) are masked too:
+		// anyone who reads the log could otherwise post fake payment confirmations.
+		for _, p := range c.Params {
+			switch p.Key {
+			case "token", "secret", "key":
+				if p.Value != "" {
+					path = strings.Replace(path, "/"+p.Value, "/REDACTED", 1)
+				}
+			}
+		}
+
 		latency := time.Since(start)
 		statusCode := c.Writer.Status()
 		clientIP := c.ClientIP()

@@ -179,7 +179,10 @@ func (h *Handler) DeleteIPPool(c *gin.Context) {
 		}
 		rows.Close()
 	}
-	h.db.Exec(`DELETE FROM ip_pools WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM ip_pools WHERE id=$1`, id)
+	if !writeOK(c, res, err, "pool") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "pool deleted"})
 }
 
@@ -234,6 +237,10 @@ func (h *Handler) AssignIP(c *gin.Context) {
 
 	var ip string
 	err := h.inTx(func(tx *sql.Tx) error {
+		// One assignment at a time per customer: two at once could each keep an address.
+		if err := lockUser(tx, userID); err != nil {
+			return err
+		}
 		if req.IPAddress != nil && *req.IPAddress != "" {
 			// The address must belong to the pool and be free (or already this user's).
 			var owner sql.NullString

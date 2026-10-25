@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -11,16 +12,16 @@ import (
 
 // BandwidthProfile holds speed plan data.
 type BandwidthProfile struct {
-	ID                int        `json:"id"`
-	Name              string     `json:"name"`
-	Description       *string    `json:"description"`
-	UploadKbps        int        `json:"upload_kbps"`
-	DownloadKbps      int        `json:"download_kbps"`
-	BurstUploadKbps   int        `json:"burst_upload_kbps"`
-	BurstDownloadKbps int        `json:"burst_download_kbps"`
-	MikrotikRateLimit *string    `json:"mikrotik_rate_limit"`
-	IsActive          bool       `json:"is_active"`
-	CreatedAt         time.Time  `json:"created_at"`
+	ID                int       `json:"id"`
+	Name              string    `json:"name"`
+	Description       *string   `json:"description"`
+	UploadKbps        int       `json:"upload_kbps"`
+	DownloadKbps      int       `json:"download_kbps"`
+	BurstUploadKbps   int       `json:"burst_upload_kbps"`
+	BurstDownloadKbps int       `json:"burst_download_kbps"`
+	MikrotikRateLimit *string   `json:"mikrotik_rate_limit"`
+	IsActive          bool      `json:"is_active"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 // BandwidthProfileRequest is the create/update payload.
@@ -158,12 +159,67 @@ func (h *Handler) DeleteBandwidthProfile(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE radius_users SET bandwidth_profile_id = NULL WHERE bandwidth_profile_id = $1`, id)
-	h.db.Exec(`DELETE FROM bandwidth_profiles WHERE id = $1`, id)
+	// The customers on it lose its speed attributes too, or the router would keep applying
+	// a profile that no longer exists anywhere in the app.
+	err = h.inTx(func(tx *sql.Tx) error {
+		users, err := usersWithProfile(tx, id)
+		if err != nil {
+			return err
+		}
+		for _, u := range users {
+			if err := clearBandwidthTx(tx, u.id, u.name); err != nil {
+				return err
+			}
+		}
+		res, err := tx.Exec(`DELETE FROM bandwidth_profiles WHERE id = $1`, id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
+	if err == sql.ErrNoRows {
+		respondError(c, http.StatusNotFound, "profile not found")
+		return
+	}
+	if err != nil {
+		h.log.WithError(err).Error("delete bandwidth profile")
+		respondError(c, http.StatusInternalServerError, "failed to delete profile")
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "profile deleted"})
 }
 
+type profileUser struct {
+	id   int
+	name string
+}
+
+// usersWithProfile lists (and locks) the customers a speed profile is applied to.
+func usersWithProfile(tx *sql.Tx, profileID int) ([]profileUser, error) {
+	rows, err := tx.Query(`SELECT id, username FROM radius_users WHERE bandwidth_profile_id = $1 FOR UPDATE`, profileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []profileUser
+	for rows.Next() {
+		var u profileUser
+		if err := rows.Scan(&u.id, &u.name); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+var errProfileNotFound = errors.New("bandwidth profile not found")
+
 // ApplyBandwidthProfile assigns a speed plan to a RADIUS user and sets radreply attributes.
+// The profile is checked before anything is removed, and all of it happens in one
+// transaction: a wrong profile ID used to strip the customer's working limits and then say 404.
 func (h *Handler) ApplyBandwidthProfile(c *gin.Context) {
 	userID, err := mustInt(c, "id")
 	if err != nil {
@@ -177,71 +233,66 @@ func (h *Handler) ApplyBandwidthProfile(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	var username string
-	if err := h.db.QueryRow(`SELECT username FROM radius_users WHERE id = $1`, userID).Scan(&username); err != nil {
+	var msg string
+	err = h.inTx(func(tx *sql.Tx) error {
+		var username string
+		if err := tx.QueryRow(`SELECT username FROM radius_users WHERE id = $1 FOR UPDATE`, userID).Scan(&username); err != nil {
+			return err
+		}
+		if body.ProfileID == nil {
+			msg = "bandwidth profile removed from user"
+			return clearBandwidthTx(tx, userID, username)
+		}
+		var name string
+		if err := tx.QueryRow(`SELECT name FROM bandwidth_profiles WHERE id = $1`, *body.ProfileID).Scan(&name); err == sql.ErrNoRows {
+			return errProfileNotFound
+		} else if err != nil {
+			return err
+		}
+		msg = fmt.Sprintf("applied '%s' to user %s", name, username)
+		return applyBandwidthProfileTx(tx, userID, username, *body.ProfileID)
+	})
+	switch {
+	case err == sql.ErrNoRows:
 		respondError(c, http.StatusNotFound, "user not found")
-		return
+	case err == errProfileNotFound:
+		respondError(c, http.StatusNotFound, err.Error())
+	case err != nil:
+		h.log.WithError(err).Error("apply bandwidth profile")
+		respondError(c, http.StatusInternalServerError, "failed to apply profile")
+	default:
+		c.JSON(http.StatusOK, gin.H{"message": msg})
 	}
-
-	// Clear existing rate-limit reply attributes
-	h.db.Exec(`DELETE FROM radreply WHERE username = $1
-		AND attribute IN ('Mikrotik-Rate-Limit','WISPr-Bandwidth-Max-Up','WISPr-Bandwidth-Max-Down')`, username)
-	h.db.Exec(`UPDATE radius_users SET bandwidth_profile_id = $1, updated_at = NOW() WHERE id = $2`, body.ProfileID, userID)
-
-	if body.ProfileID == nil {
-		c.JSON(http.StatusOK, gin.H{"message": "bandwidth profile removed from user"})
-		return
-	}
-
-	var p BandwidthProfile
-	err = h.db.QueryRow(`
-		SELECT id, name, upload_kbps, download_kbps, mikrotik_rate_limit
-		FROM bandwidth_profiles WHERE id = $1`, *body.ProfileID).
-		Scan(&p.ID, &p.Name, &p.UploadKbps, &p.DownloadKbps, &p.MikrotikRateLimit)
-	if err == sql.ErrNoRows {
-		respondError(c, http.StatusNotFound, "bandwidth profile not found")
-		return
-	}
-
-	rateLimit := kbpsToMikrotik(p.UploadKbps, p.DownloadKbps)
-	if p.MikrotikRateLimit != nil && *p.MikrotikRateLimit != "" {
-		rateLimit = *p.MikrotikRateLimit
-	}
-
-	h.db.Exec(`INSERT INTO radreply (username, attribute, op, value) VALUES ($1, 'Mikrotik-Rate-Limit', '=', $2)`, username, rateLimit)
-	h.db.Exec(`INSERT INTO radreply (username, attribute, op, value) VALUES ($1, 'WISPr-Bandwidth-Max-Up', '=', $2)`, username, fmt.Sprintf("%d", p.UploadKbps*1000))
-	h.db.Exec(`INSERT INTO radreply (username, attribute, op, value) VALUES ($1, 'WISPr-Bandwidth-Max-Down', '=', $2)`, username, fmt.Sprintf("%d", p.DownloadKbps*1000))
-
-	c.JSON(http.StatusOK, gin.H{"message": fmt.Sprintf("applied '%s' to user %s", p.Name, username)})
 }
 
-// reapplyBandwidthProfile re-syncs radreply for every user assigned to a profile.
+// reapplyBandwidthProfile re-syncs radreply for every user assigned to a profile (after it
+// changed). Each customer is locked and re-checked, so one moved to another profile in the
+// meantime keeps the new one.
 func (h *Handler) reapplyBandwidthProfile(profileID int) {
-	var p BandwidthProfile
-	if err := h.db.QueryRow(`
-		SELECT id, upload_kbps, download_kbps, mikrotik_rate_limit
-		FROM bandwidth_profiles WHERE id = $1`, profileID).
-		Scan(&p.ID, &p.UploadKbps, &p.DownloadKbps, &p.MikrotikRateLimit); err != nil {
-		return
-	}
-
-	rows, err := h.db.Query(`SELECT username FROM radius_users WHERE bandwidth_profile_id = $1`, profileID)
+	rows, err := h.db.Query(`SELECT id, username FROM radius_users WHERE bandwidth_profile_id = $1`, profileID)
 	if err != nil {
+		h.log.WithError(err).Warnf("re-apply bandwidth profile %d", profileID)
 		return
 	}
-	defer rows.Close()
-
-	rateLimit := kbpsToMikrotik(p.UploadKbps, p.DownloadKbps)
-	if p.MikrotikRateLimit != nil && *p.MikrotikRateLimit != "" {
-		rateLimit = *p.MikrotikRateLimit
-	}
-
+	var users []profileUser
 	for rows.Next() {
-		var username string
-		rows.Scan(&username)
-		h.db.Exec(`DELETE FROM radreply WHERE username = $1 AND attribute IN ('Mikrotik-Rate-Limit','WISPr-Bandwidth-Max-Up','WISPr-Bandwidth-Max-Down')`, username)
-		h.db.Exec(`INSERT INTO radreply (username, attribute, op, value) VALUES ($1, 'Mikrotik-Rate-Limit', '=', $2)`, username, rateLimit)
-		h.db.Exec(`INSERT INTO radreply (username, attribute, op, value) VALUES ($1, 'WISPr-Bandwidth-Max-Up', '=', $2)`, username, fmt.Sprintf("%d", p.UploadKbps*1000))
-		h.db.Exec(`INSERT INTO radreply (username, attribute, op, value) VALUES ($1, 'WISPr-Bandwidth-Max-Down', '=', $2)`, username, fmt.Sprintf("%d", p.DownloadKbps*1000))
+		var u profileUser
+		if rows.Scan(&u.id, &u.name) == nil {
+			users = append(users, u)
+		}
+	}
+	rows.Close()
+	for _, u := range users {
+		err := h.inTx(func(tx *sql.Tx) error {
+			var still bool
+			if err := tx.QueryRow(`SELECT COALESCE(bandwidth_profile_id = $2, FALSE) FROM radius_users WHERE id = $1 FOR UPDATE`,
+				u.id, profileID).Scan(&still); err != nil || !still {
+				return nil // deleted or moved meanwhile
+			}
+			return applyBandwidthProfileTx(tx, u.id, u.name, profileID)
+		})
+		if err != nil {
+			h.log.WithError(err).Warnf("re-apply bandwidth profile %d to %s", profileID, u.name)
+		}
 	}
 }

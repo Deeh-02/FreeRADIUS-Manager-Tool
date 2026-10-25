@@ -172,6 +172,19 @@ func loadPlan(q dbtx, planID int) (*planRow, error) {
 // data cap (Max-Octets, enforced by the datacounter module) and speed profile (radreply).
 // It does not change the paid-until date; see grantPlanPeriod.
 func applyPlanLimits(q dbtx, userID int, username string, p *planRow) error {
+	// The speed profile of the plan the customer is leaving (see writePlanLimits).
+	var prev sql.NullInt64
+	if err := q.QueryRow(`SELECT up.bandwidth_profile_id FROM radius_users ru
+		JOIN user_plans up ON up.id = ru.plan_id WHERE ru.id = $1`, userID).Scan(&prev); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	return writePlanLimits(q, userID, username, p, prev)
+}
+
+// writePlanLimits is applyPlanLimits with the speed profile the customer got from their
+// previous plan (or from this plan before it was edited). When the plan sets no speed, that
+// profile is taken away; a profile staff gave the customer by hand is left alone.
+func writePlanLimits(q dbtx, userID int, username string, p *planRow, prevPlanProfile sql.NullInt64) error {
 	if _, err := q.Exec(`UPDATE radius_users SET plan_id = $1, device_limit = $2, updated_at = NOW() WHERE id = $3`,
 		p.ID, p.MaxDevices, userID); err != nil {
 		return err
@@ -187,8 +200,28 @@ func applyPlanLimits(q dbtx, userID int, username string, p *planRow) error {
 		if err := applyBandwidthProfileTx(q, userID, username, *p.BandwidthProfileID); err != nil {
 			return err
 		}
+	} else if prevPlanProfile.Valid {
+		var fromPlan bool
+		if err := q.QueryRow(`SELECT COALESCE(bandwidth_profile_id = $2, FALSE) FROM radius_users WHERE id = $1`,
+			userID, prevPlanProfile.Int64).Scan(&fromPlan); err != nil {
+			return err
+		}
+		if fromPlan {
+			if err := clearBandwidthTx(q, userID, username); err != nil {
+				return err
+			}
+		}
 	}
 	return syncAccess(q, username)
+}
+
+// clearBandwidthTx removes a customer's speed limit: the link and the attributes that
+// applyBandwidthProfileTx writes.
+func clearBandwidthTx(q dbtx, userID int, username string) error {
+	if _, err := q.Exec(`UPDATE radius_users SET bandwidth_profile_id = NULL WHERE id = $1`, userID); err != nil {
+		return err
+	}
+	return deleteReply(q, username, "Mikrotik-Rate-Limit", "WISPr-Bandwidth-Max-Up", "WISPr-Bandwidth-Max-Down")
 }
 
 // grantPlanPeriod adds one plan period to the customer's paid-until date and re-activates

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/gin-gonic/gin"
 )
 
@@ -13,7 +14,9 @@ import (
 // Pushes a fresh snapshot every 5s (about 6 queries each). The UI reads the stream with
 // fetch() so the token travels in the Authorization header, not the URL. The server-wide
 // 30s write timeout is lifted for this response; the stream ends when the browser
-// disconnects. X-Accel-Buffering stops nginx buffering events.
+// disconnects, or when the caller is no longer allowed in (checked before each snapshot:
+// token expired, signed out, account disabled, key revoked); the UI then reconnects with
+// its current token. X-Accel-Buffering stops nginx buffering events.
 func (h *Handler) LiveStats(c *gin.Context) {
 	http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{})
 	c.Header("Content-Type", "text/event-stream")
@@ -33,6 +36,9 @@ func (h *Handler) LiveStats(c *gin.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if !middleware.StillAuthorized(h.db, c.GetHeader("Authorization")) {
+				return
+			}
 			sendStats(c, h)
 		}
 	}

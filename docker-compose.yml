@@ -28,18 +28,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Files in docker-entrypoint-initdb.d run only when the data volume is EMPTY (first
-      # start). On an existing database, deploy-update.sh applies new migrations instead.
-      # 008_network_scanner.sql is not mounted: init-db.sql already contains it.
+      # start): the base schema, then every migration, each recorded in schema_migrations so
+      # deploy-update.sh does not apply them again. On an existing database, deploy-update.sh
+      # applies new migrations instead.
       - ./init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./migrations/009_billing.sql:/docker-entrypoint-initdb.d/02-billing.sql:ro
-      - ./migrations/010_missing_schema.sql:/docker-entrypoint-initdb.d/03-missing-schema.sql:ro
-      - ./migrations/011_billing_integrity.sql:/docker-entrypoint-initdb.d/04-billing-integrity.sql:ro
-      - ./migrations/012_kes_and_customer_grace.sql:/docker-entrypoint-initdb.d/05-kes-and-grace.sql:ro
-      - ./migrations/013_trial_days.sql:/docker-entrypoint-initdb.d/06-trial-days.sql:ro
-      - ./migrations/014_default_trial_5_days.sql:/docker-entrypoint-initdb.d/07-default-trial.sql:ro
-      - ./migrations/015_data_cap_period_floor.sql:/docker-entrypoint-initdb.d/08-data-cap-floor.sql:ro
-      - ./migrations/016_mpesa.sql:/docker-entrypoint-initdb.d/09-mpesa.sql:ro
-      - ./migrations/017_audit_action_length.sql:/docker-entrypoint-initdb.d/10-audit-action-length.sql:ro
+      - ./scripts/initdb-migrations.sh:/docker-entrypoint-initdb.d/02-migrations.sh:ro
+      - ./migrations:/migrations:ro
     networks:
       - radius-network
     healthcheck:

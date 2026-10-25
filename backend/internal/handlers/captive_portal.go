@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -216,10 +218,12 @@ func (h *Handler) ServeCaptivePortal(c *gin.Context) {
 	}
 
 	// MikroTik "external login page" setups redirect here with the router's own login URL in
-	// ?link-login-only=...; it is used when the portal has no fixed login_url.
+	// ?link-login-only=...; it is used when the portal has no fixed login_url, and only if it
+	// points at a router (see routerLoginHost). Any address used to be taken, so a crafted link
+	// showed this genuine page with the form sending the customer's password elsewhere.
 	if p.LoginURL == "" {
 		if l := c.Query("link-login-only"); l != "" {
-			if u, err := url.Parse(l); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+			if u, err := url.Parse(l); err == nil && (u.Scheme == "http" || u.Scheme == "https") && routerLoginHost(h.db, u.Hostname()) {
 				p.LoginURL = l
 			}
 		}
@@ -368,3 +372,33 @@ func safeColor(c, def string) string {
 	}
 	return def
 }
+
+// routerLoginHost reports whether a link-login-only host can be the hotspot router itself: a
+// private, CGNAT or link-local address, a local name (no dot, .local, .lan, .home.arpa,
+// .internal), or a registered NAS. A hotspot whose login page has a public-looking DNS name
+// needs the portal's fixed login URL set instead.
+func routerLoginHost(q dbtx, host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || cgnat.Contains(ip) {
+			return true
+		}
+	} else {
+		if !strings.Contains(host, ".") {
+			return true
+		}
+		for _, suffix := range []string{".local", ".lan", ".home.arpa", ".internal"} {
+			if strings.HasSuffix(host, suffix) {
+				return true
+			}
+		}
+	}
+	var known bool
+	q.QueryRow(`SELECT EXISTS (SELECT 1 FROM nas WHERE LOWER(nasname) = $1)`, host).Scan(&known)
+	return known
+}
+
+var cgnat = func() *net.IPNet { _, n, _ := net.ParseCIDR("100.64.0.0/10"); return n }()

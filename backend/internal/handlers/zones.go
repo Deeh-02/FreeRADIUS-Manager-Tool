@@ -106,13 +106,16 @@ func (h *Handler) UpdateZone(c *gin.Context) {
 	if req.IsActive != nil {
 		isActive = *req.IsActive
 	}
-	h.db.Exec(`UPDATE hotspot_zones SET
+	res, err := h.db.Exec(`UPDATE hotspot_zones SET
 		name=COALESCE(NULLIF($1,''),name),
 		description=COALESCE(NULLIF($2,''),description),
 		location=COALESCE(NULLIF($3,''),location),
 		max_clients=CASE WHEN $4>0 THEN $4 ELSE max_clients END,
 		is_active=$5
 		WHERE id=$6`, req.Name, req.Description, req.Location, req.MaxClients, isActive, id)
+	if !writeOK(c, res, err, "zone") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "zone updated"})
 }
 
@@ -124,7 +127,10 @@ func (h *Handler) DeleteZone(c *gin.Context) {
 		return
 	}
 	h.db.Exec(`UPDATE nas SET zone_id=NULL WHERE zone_id=$1`, id)
-	h.db.Exec(`DELETE FROM hotspot_zones WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM hotspot_zones WHERE id=$1`, id)
+	if !writeOK(c, res, err, "zone") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "zone deleted"})
 }
 
@@ -138,7 +144,10 @@ func (h *Handler) AssignNASToZone(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.db.Exec(`UPDATE nas SET zone_id=$1 WHERE id=$2`, req.ZoneID, req.NASID)
+	res, err := h.db.Exec(`UPDATE nas SET zone_id=$1 WHERE id=$2`, req.ZoneID, req.NASID)
+	if !writeOK(c, res, err, "NAS device") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "NAS zone updated"})
 }
 

@@ -191,7 +191,7 @@ func (h *Handler) UpdateCustomer(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	h.db.Exec(`UPDATE customers SET
+	res, err := h.db.Exec(`UPDATE customers SET
 		full_name=COALESCE(NULLIF($1,''),full_name),
 		email=COALESCE(NULLIF($2,''),email),
 		phone=COALESCE(NULLIF($3,''),phone),
@@ -207,6 +207,9 @@ func (h *Handler) UpdateCustomer(c *gin.Context) {
 		WHERE id=$12`,
 		req.FullName, req.Email, req.Phone, req.IDNumber, req.Address,
 		req.City, req.Country, req.ContractStart, req.ContractEnd, req.Notes, req.OrgID, id)
+	if !writeOK(c, res, err, "customer") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "customer updated"})
 }
 
@@ -217,7 +220,10 @@ func (h *Handler) DeleteCustomer(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM customers WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM customers WHERE id=$1`, id)
+	if !writeOK(c, res, err, "customer") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "customer deleted"})
 }
 
@@ -375,7 +381,10 @@ func (h *Handler) DeleteTicket(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM tickets WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM tickets WHERE id=$1`, id)
+	if !writeOK(c, res, err, "ticket") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "ticket deleted"})
 }
 

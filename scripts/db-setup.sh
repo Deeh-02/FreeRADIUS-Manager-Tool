@@ -33,12 +33,12 @@ for f in $(ls "$ROOT"/migrations/*.sql | sort); do
   name=$(basename "$f")
   [ "$(q -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$name'")" = "1" ] && continue
   echo "  migration $name"
-  if ! out=$( (echo "SET client_min_messages = warning;"; cat "$f") | q -1 -f - 2>&1); then
+  # The record is part of the migration's own transaction: both happen or neither.
+  if ! out=$( (echo "SET client_min_messages = warning;"; cat "$f"; echo; echo "INSERT INTO schema_migrations (filename) VALUES ('$name');") | q -1 -f - 2>&1); then
     echo "$out" >&2
     echo "Migration $name failed and was rolled back. Nothing after it was applied." >&2
     exit 1
   fi
-  q -c "INSERT INTO schema_migrations (filename) VALUES ('$name')"
   applied=$((applied + 1))
 done
 echo "  $applied migration(s) applied"

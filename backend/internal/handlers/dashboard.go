@@ -844,6 +844,16 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	settings.Invalidate()
 
 	resp := gin.H{"message": "settings updated successfully"}
+	if _, ok := updates["billing_grace_days"]; ok {
+		// The grace days are written into each customer's Expiration row; without this the
+		// router kept the old cut-off while the expiry task used the new one.
+		go func() {
+			if n, err := resyncDefaultGrace(h.db); err != nil {
+				h.log.WithError(err).Warnf("grace days changed: %d customer(s) re-synced before the error", n)
+			}
+		}()
+		resp["message"] = "settings updated; customers' access dates are being rewritten for the new grace days"
+	}
 	if len(unknown) > 0 {
 		resp["ignored_unknown_keys"] = unknown
 	}

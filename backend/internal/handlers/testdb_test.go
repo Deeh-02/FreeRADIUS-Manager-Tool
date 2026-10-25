@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ func openTestDB(t testing.TB) *database.DB {
 	}
 	// A cloud test database (Supabase's is always called "postgres") can be used by saying so
 	// explicitly: TEST_DATABASE_WIPE_OK=yes. Never point this at a database with real data.
-	if !strings.Contains(url, "_test") && os.Getenv("TEST_DATABASE_WIPE_OK") != "yes" {
+	if !strings.HasSuffix(testDBName(url), "_test") && os.Getenv("TEST_DATABASE_WIPE_OK") != "yes" {
 		t.Fatalf("TEST_DATABASE_URL must point at a database whose name ends in _test (tests delete data), or set TEST_DATABASE_WIPE_OK=yes for a throwaway cloud database")
 	}
 	testDBOnce.Do(func() {
@@ -52,6 +53,26 @@ func openTestDB(t testing.TB) *database.DB {
 		t.Fatalf("cannot open test database: %v", testDBErr)
 	}
 	return testDBConn
+}
+
+// testDBName is the database a connection string names, in either form lib/pq takes
+// ("postgres://user@host/name?..." or "host=... dbname=name ..."). "_test" anywhere else in
+// it (a user, a password, a host) does not make a database safe to wipe.
+func testDBName(conn string) string {
+	if strings.HasPrefix(conn, "postgres://") || strings.HasPrefix(conn, "postgresql://") {
+		u, err := url.Parse(conn)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimPrefix(u.Path, "/")
+	}
+	name := ""
+	for _, f := range strings.Fields(conn) {
+		if v, ok := strings.CutPrefix(f, "dbname="); ok {
+			name = strings.Trim(v, "'")
+		}
+	}
+	return name
 }
 
 // resetTestDB empties every table the billing code touches and restarts the numbering.

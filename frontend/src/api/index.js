@@ -80,8 +80,9 @@ api.interceptors.response.use(
         }
 
         originalRequest._retry = true
-        isRefreshing = true
 
+        // Checked before isRefreshing is set: returning here with it set left every later
+        // request waiting in the queue for a refresh that never came.
         const refreshToken = localStorage.getItem('refresh_token')
         if (!refreshToken) {
           const authStore = useAuthStore()
@@ -89,10 +90,13 @@ api.interceptors.response.use(
           router.push('/login')
           return Promise.reject(error)
         }
+        isRefreshing = true
 
         try {
           // Plain axios (not `api`), so a failing refresh does not re-enter this interceptor.
-          const { data } = await axios.post(`${API_BASE}/auth/refresh`, { refresh_token: refreshToken })
+          // Same timeout as `api`: a hung refresh would otherwise hold every queued request.
+          const { data } = await axios.post(`${API_BASE}/auth/refresh`, { refresh_token: refreshToken },
+            { timeout: api.defaults.timeout })
           localStorage.setItem('access_token', data.access_token)
           localStorage.setItem('refresh_token', data.refresh_token)
           api.defaults.headers.common.Authorization = `Bearer ${data.access_token}`

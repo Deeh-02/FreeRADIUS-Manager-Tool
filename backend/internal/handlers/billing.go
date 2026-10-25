@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strings"
@@ -337,19 +338,38 @@ func (h *Handler) DeleteInvoice(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	var payments int
-	h.db.QueryRow(`SELECT COUNT(*) FROM payments WHERE invoice_id=$1`, id).Scan(&payments)
-	if payments > 0 {
-		respondError(c, http.StatusConflict, "invoice has payments recorded; cancel it instead of deleting")
-		return
-	}
-	res, err := h.db.Exec(`DELETE FROM invoices WHERE id=$1`, id)
+	// Lock the invoice first: a payment locks it too (recordPaymentTx), so one being recorded
+	// right now either finishes before the count below (and is seen) or waits for the delete.
+	// Without the lock the delete could land just after it and detach it (ON DELETE SET NULL).
+	tx, err := h.db.Begin()
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to delete invoice")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	defer tx.Rollback()
+	var one, payments int
+	err = tx.QueryRow(`SELECT 1 FROM invoices WHERE id=$1 FOR UPDATE`, id).Scan(&one)
+	if err == sql.ErrNoRows {
 		respondError(c, http.StatusNotFound, "invoice not found")
+		return
+	}
+	if err == nil {
+		err = tx.QueryRow(`SELECT COUNT(*) FROM payments WHERE invoice_id=$1`, id).Scan(&payments)
+	}
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete invoice")
+		return
+	}
+	if payments > 0 {
+		respondError(c, http.StatusConflict, "invoice has payments recorded; cancel it instead of deleting")
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM invoices WHERE id=$1`, id); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete invoice")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete invoice")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "invoice deleted"})

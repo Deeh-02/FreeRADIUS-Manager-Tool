@@ -1,9 +1,9 @@
 package handlers
 
 import (
+	"errors"
 	"database/sql"
 	"net/http"
-	"time"
 
 	"github.com/freeradius-manager/backend/internal/auth"
 	"github.com/freeradius-manager/backend/internal/middleware"
@@ -19,10 +19,15 @@ import (
 // per-IP credential-stuffing window (CheckCredStuffing). A disabled account is only reported
 // after the correct password, so the response does not reveal which usernames exist. Each
 // login opens a new session; several devices can be signed in at once.
-// lockAppUserSQL records a failed sign-in ($2 = minutes to lock, 0 = no lock). The lock is
-// set by the database's clock so it is compared with the same clock.
-const lockAppUserSQL = `UPDATE app_users SET failed_attempts = $1,
-	locked_until = CASE WHEN $2::int > 0 THEN NOW() + make_interval(mins => $2::int) ELSE NULL END
+// failAppUserSQL records a failed sign-in: one more attempt (or the first after a lock that
+// has run out), and a lock of $2 minutes when that reaches $1. The count is increased by the
+// database, not written back from what this request read, so failures arriving at the same
+// moment all count. The lock is set by the database's clock so it is compared with the same
+// clock.
+const failAppUserSQL = `UPDATE app_users SET
+	failed_attempts = CASE WHEN locked_until <= NOW() THEN 1 ELSE failed_attempts + 1 END,
+	locked_until = CASE WHEN (CASE WHEN locked_until <= NOW() THEN 1 ELSE failed_attempts + 1 END) >= $1::int
+		THEN NOW() + make_interval(mins => $2::int) ELSE NULL END
 	WHERE id = $3`
 
 func (h *Handler) Login(c *gin.Context) {
@@ -72,19 +77,9 @@ func (h *Handler) Login(c *gin.Context) {
 		respondError(c, http.StatusTooManyRequests, "account temporarily locked due to too many failed attempts")
 		return
 	}
-	// A lock that has run out starts a fresh count.
-	if user.LockedUntil != nil {
-		user.FailedAttempts = 0
-	}
-
 	// Verify password
 	if !auth.CheckPassword(user.PasswordHash, req.Password) {
-		newAttempts := user.FailedAttempts + 1
-		lockMins := 0
-		if newAttempts >= maxAttempts {
-			lockMins = getBruteForceLockout()
-		}
-		h.db.Exec(lockAppUserSQL, newAttempts, lockMins, user.ID)
+		h.db.Exec(failAppUserSQL, maxAttempts, getBruteForceLockout(), user.ID)
 		CheckCredStuffing(h, c.ClientIP(), req.Username)
 
 		respondError(c, http.StatusUnauthorized, "invalid credentials")
@@ -104,12 +99,7 @@ func (h *Handler) Login(c *gin.Context) {
 		}
 		if !totp.Validate(req.MFACode, user.MFASecret) {
 			// A wrong code counts like a wrong password, so the 6 digits cannot be brute-forced.
-			newAttempts := user.FailedAttempts + 1
-			lockMins := 0
-			if newAttempts >= maxAttempts {
-				lockMins = getBruteForceLockout()
-			}
-			h.db.Exec(lockAppUserSQL, newAttempts, lockMins, user.ID)
+			h.db.Exec(failAppUserSQL, maxAttempts, getBruteForceLockout(), user.ID)
 			CheckCredStuffing(h, c.ClientIP(), req.Username)
 			respondError(c, http.StatusUnauthorized, "invalid MFA code")
 			return
@@ -143,11 +133,10 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	expiry := time.Now().Add(auth.RefreshExpiry())
 	if _, err := h.db.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, expires_at, session_id, client_ip, user_agent, last_activity)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-		user.ID, refreshHash, expiry, sessionID, c.ClientIP(), c.GetHeader("User-Agent"),
+		VALUES ($1, $2, NOW() + make_interval(secs => $3::int), $4, $5, $6, NOW())`,
+		user.ID, refreshHash, int(auth.RefreshExpiry().Seconds()), sessionID, c.ClientIP(), c.GetHeader("User-Agent"),
 	); err != nil {
 		h.log.WithError(err).Error("store session")
 		respondError(c, http.StatusInternalServerError, "failed to create session")
@@ -175,20 +164,31 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 
 	hash := auth.HashRefreshToken(req.RefreshToken)
 
+	// One statement checks the token and revokes it, so two refreshes racing with the same
+	// token cannot both pass: the second waits for the row and then finds it revoked. The old
+	// token is gone even if the client loses the response (the retry gets 401); a replayed old
+	// token is simply rejected, not treated as a theft signal. The revocation and the new
+	// token commit together. Times are compared by the database's clock (TIMESTAMP columns).
+	tx, err := h.db.Begin()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "internal server error")
+		return
+	}
+	defer tx.Rollback()
 	var userID int
 	var role, username, sessionID string
-	err := h.db.QueryRow(`
-		SELECT rt.user_id, au.username, au.role, rt.session_id
-		FROM refresh_tokens rt
-		JOIN app_users au ON au.id = rt.user_id
-		WHERE rt.token_hash = $1
+	err = tx.QueryRow(`
+		UPDATE refresh_tokens rt SET revoked = TRUE
+		FROM app_users au
+		WHERE au.id = rt.user_id
+		  AND rt.token_hash = $1
 		  AND rt.revoked = FALSE
 		  AND rt.expires_at > NOW()
-		  AND rt.last_activity > $2
-		  AND au.is_active = TRUE`,
-		hash, time.Now().Add(-auth.SessionTimeout()),
+		  AND rt.last_activity > NOW() - make_interval(secs => $2::int)
+		  AND au.is_active = TRUE
+		RETURNING rt.user_id, au.username, au.role, rt.session_id`,
+		hash, int(auth.SessionTimeout().Seconds()),
 	).Scan(&userID, &username, &role, &sessionID)
-
 	if err == sql.ErrNoRows {
 		respondError(c, http.StatusUnauthorized, "invalid or expired refresh token")
 		return
@@ -198,11 +198,6 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "internal server error")
 		return
 	}
-
-	// Rotate refresh token (same session). The old token is revoked here but if the client
-	// loses the response the retry fails with 401; a stolen-and-replayed old token is simply
-	// rejected (it is not treated as a theft signal that revokes the whole session).
-	h.db.Exec(`UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1`, hash)
 
 	newAccessToken, err := auth.GenerateAccessToken(userID, username, role, sessionID)
 	if err != nil {
@@ -216,12 +211,19 @@ func (h *Handler) RefreshToken(c *gin.Context) {
 		return
 	}
 
-	expiry := time.Now().Add(auth.RefreshExpiry())
-	h.db.Exec(`
+	if _, err := tx.Exec(`
 		INSERT INTO refresh_tokens (user_id, token_hash, expires_at, session_id, client_ip, user_agent, last_activity)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
-		userID, newHash, expiry, sessionID, c.ClientIP(), c.GetHeader("User-Agent"),
-	)
+		VALUES ($1, $2, NOW() + make_interval(secs => $3::int), $4, $5, $6, NOW())`,
+		userID, newHash, int(auth.RefreshExpiry().Seconds()), sessionID, c.ClientIP(), c.GetHeader("User-Agent"),
+	); err != nil {
+		h.log.WithError(err).Error("store refreshed session")
+		respondError(c, http.StatusInternalServerError, "failed to create session")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to create session")
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"access_token":  newAccessToken,
@@ -332,7 +334,7 @@ func (h *Handler) ChangePassword(c *gin.Context) {
 
 	newHash, err := auth.HashPassword(req.NewPassword)
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to hash password")
+		respondHashError(c, err)
 		return
 	}
 
@@ -425,4 +427,14 @@ func getBruteForceLockout() int {
 		return v
 	}
 	return 15
+}
+
+// respondHashError answers a failed auth.HashPassword: a password too long for bcrypt is the
+// caller's mistake (400), anything else is ours.
+func respondHashError(c *gin.Context, err error) {
+	if errors.Is(err, auth.ErrPasswordTooLong) {
+		respondError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	respondError(c, http.StatusInternalServerError, "failed to hash password")
 }

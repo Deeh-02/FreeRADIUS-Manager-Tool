@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/freeradius-manager/backend/internal/database"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,4 +126,41 @@ func ResyncAllAccess(db *sql.DB, w io.Writer) (synced, failed int, err error) {
 	}
 	fmt.Fprintf(w, "Synced %d customer(s), %d failed, in %s.\n", synced, failed, time.Since(start).Round(time.Millisecond))
 	return synced, failed, nil
+}
+
+// resyncDefaultGrace rewrites the RADIUS rows of every customer who uses the system-wide grace
+// days (no grace of their own), after that setting changed. Each customer is locked and
+// written in their own transaction, like a payment would.
+func resyncDefaultGrace(db *database.DB) (int, error) {
+	rows, err := db.Query(`SELECT id, username FROM radius_users WHERE grace_days IS NULL AND account_expiry IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	var users []profileUser
+	for rows.Next() {
+		var u profileUser
+		if rows.Scan(&u.id, &u.name) == nil {
+			users = append(users, u)
+		}
+	}
+	rows.Close()
+	done := 0
+	for _, u := range users {
+		tx, err := db.Begin()
+		if err != nil {
+			return done, err
+		}
+		if err := lockUser(tx, u.id); err == nil {
+			err = syncAccess(tx, u.name)
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		tx.Rollback()
+		if err != nil && err != sql.ErrNoRows {
+			return done, err
+		}
+		done++
+	}
+	return done, nil
 }

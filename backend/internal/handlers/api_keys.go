@@ -123,7 +123,10 @@ func (h *Handler) RevokeAPIKey(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE api_keys SET is_active=false WHERE id=$1`, id)
+	res, err := h.db.Exec(`UPDATE api_keys SET is_active=false WHERE id=$1`, id)
+	if !writeOK(c, res, err, "API key") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "API key revoked"})
 }
 
@@ -134,7 +137,10 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM api_keys WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM api_keys WHERE id=$1`, id)
+	if !writeOK(c, res, err, "API key") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "API key deleted"})
 }
 

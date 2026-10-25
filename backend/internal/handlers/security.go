@@ -173,7 +173,10 @@ func (h *Handler) CreateGeoIPRule(c *gin.Context) {
 // DeleteGeoIPRule removes a country rule.
 func (h *Handler) DeleteGeoIPRule(c *gin.Context) {
 	id, _ := mustInt(c, "id")
-	h.db.Exec(`DELETE FROM geoip_rules WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM geoip_rules WHERE id=$1`, id)
+	if !writeOK(c, res, err, "rule") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "rule deleted"})
 }
 
@@ -362,22 +365,31 @@ func (h *Handler) BlockIP(c *gin.Context) {
 	if req.Duration == 0 {
 		req.Duration = 24
 	}
-	blockedUntil := time.Now().Add(time.Duration(req.Duration) * time.Hour)
 	reason := req.Reason
 	if reason == "" {
 		reason = "manually blocked"
 	}
-	h.db.Exec(`INSERT INTO cred_stuffing_blocks (ip_address,fail_count,blocked_until,reason,auto_blocked)
-		VALUES ($1,0,$2,$3,false)
-		ON CONFLICT (ip_address) DO UPDATE SET blocked_until=$2, reason=$3, updated_at=NOW()`,
-		req.IP, blockedUntil, reason)
-	c.JSON(http.StatusOK, gin.H{"message": "IP blocked until " + blockedUntil.Format(time.RFC822)})
+	// The end is set by the database's clock, which is what loginGuard compares it with.
+	var until string
+	if err := h.db.QueryRow(`INSERT INTO cred_stuffing_blocks (ip_address,fail_count,blocked_until,reason,auto_blocked)
+		VALUES ($1,0,NOW() + make_interval(hours => $2::int),$3,false)
+		ON CONFLICT (ip_address) DO UPDATE SET blocked_until=EXCLUDED.blocked_until, reason=$3, updated_at=NOW()
+		RETURNING TO_CHAR(blocked_until, 'DD Mon YYYY HH24:MI')`,
+		req.IP, req.Duration, reason).Scan(&until); err != nil {
+		h.log.WithError(err).Error("block IP")
+		respondError(c, http.StatusInternalServerError, "failed to block IP")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "IP blocked until " + until})
 }
 
 // UnblockIP removes an IP from the block list.
 func (h *Handler) UnblockIP(c *gin.Context) {
 	id, _ := mustInt(c, "id")
-	h.db.Exec(`DELETE FROM cred_stuffing_blocks WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM cred_stuffing_blocks WHERE id=$1`, id)
+	if !writeOK(c, res, err, "block") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "IP unblocked"})
 }
 
@@ -425,9 +437,12 @@ func credStuffingCleanupWorker(db *database.DB, log *logrus.Logger) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
-		result, _ := db.Exec(`DELETE FROM cred_stuffing_blocks WHERE blocked_until < NOW()`)
-		n, _ := result.RowsAffected()
-		if n > 0 {
+		result, err := db.Exec(`DELETE FROM cred_stuffing_blocks WHERE blocked_until < NOW()`)
+		if err != nil {
+			log.WithError(err).Warn("Credential stuffing: could not remove expired blocks")
+			continue
+		}
+		if n, _ := result.RowsAffected(); n > 0 {
 			log.WithField("count", n).Info("Credential stuffing: expired blocks removed")
 		}
 		db.Exec(`DELETE FROM geoip_cache WHERE looked_up_at < NOW()-INTERVAL '48 hours'`)

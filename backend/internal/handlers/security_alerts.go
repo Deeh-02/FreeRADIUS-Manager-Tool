@@ -103,7 +103,11 @@ func (h *Handler) AcknowledgeAlert(c *gin.Context) {
 
 // AcknowledgeAllAlerts marks all alerts as acknowledged.
 func (h *Handler) AcknowledgeAllAlerts(c *gin.Context) {
-	result, _ := h.db.Exec(`UPDATE security_alerts SET is_acknowledged=TRUE WHERE is_acknowledged=FALSE`)
+	result, err := h.db.Exec(`UPDATE security_alerts SET is_acknowledged=TRUE WHERE is_acknowledged=FALSE`)
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to acknowledge alerts")
+		return
+	}
 	n, _ := result.RowsAffected()
 	c.JSON(http.StatusOK, gin.H{"message": "all alerts acknowledged", "count": n})
 }

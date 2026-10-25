@@ -227,12 +227,13 @@ type paymentOutcome struct {
 // the client reused an ID for a new payment.
 func replayPayment(q dbtx, in paymentInput) (out *paymentOutcome, found bool, err error) {
 	var id int
-	var receipt, status string
+	var receipt, status, method, currency string
 	var invoiceID sql.NullInt64
 	var username sql.NullString
 	var amount float64
-	err = q.QueryRow(`SELECT id, receipt_number, invoice_id, username, amount, status FROM payments
-		WHERE idempotency_key = $1`, in.IdempotencyKey).Scan(&id, &receipt, &invoiceID, &username, &amount, &status)
+	err = q.QueryRow(`SELECT id, receipt_number, invoice_id, username, amount, status,
+		COALESCE(payment_method, ''), COALESCE(currency, '') FROM payments
+		WHERE idempotency_key = $1`, in.IdempotencyKey).Scan(&id, &receipt, &invoiceID, &username, &amount, &status, &method, &currency)
 	if err == sql.ErrNoRows {
 		return nil, false, nil
 	}
@@ -241,7 +242,12 @@ func replayPayment(q dbtx, in paymentInput) (out *paymentOutcome, found bool, er
 	}
 	sameInvoice := (in.InvoiceID == nil && !invoiceID.Valid) ||
 		(in.InvoiceID != nil && invoiceID.Valid && int64(*in.InvoiceID) == invoiceID.Int64)
-	if !sameInvoice || round2(in.Amount) != amount {
+	// Username and currency may be left out with an invoice (they come from it), so they are
+	// compared only when given.
+	sameCustomer := in.Username == "" || in.Username == username.String
+	sameCurrency := in.Currency == "" || strings.EqualFold(in.Currency, currency)
+	if !sameInvoice || round2(in.Amount) != amount || !sameCustomer || !sameCurrency ||
+		(in.PaymentMethod != "" && in.PaymentMethod != method) {
 		return nil, true, errKeyMismatch
 	}
 	out = &paymentOutcome{PaymentID: id, Receipt: receipt, Username: username.String, Replayed: true}

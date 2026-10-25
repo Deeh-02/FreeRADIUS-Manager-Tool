@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"net/http"
 	"strconv"
 	"time"
@@ -70,6 +71,25 @@ func Version() gin.HandlerFunc {
 // respondError sends a JSON error response.
 func respondError(c *gin.Context, status int, message string) {
 	c.JSON(status, gin.H{"error": message})
+}
+
+// writeOK checks a write that must change one row: a failure is answered with 400 (a bad
+// value, such as an unknown ID it refers to) or 500, no matching row with 404 "<what> not
+// found". It reports whether the caller may go on to say it worked.
+func writeOK(c *gin.Context, res sql.Result, err error, what string) bool {
+	if err != nil {
+		if isBadValue(err) {
+			respondError(c, http.StatusBadRequest, "invalid value for "+what)
+		} else {
+			respondError(c, http.StatusInternalServerError, "failed to save "+what)
+		}
+		return false
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		respondError(c, http.StatusNotFound, what+" not found")
+		return false
+	}
+	return true
 }
 
 // paginationParams extracts page and limit from query string.

@@ -63,7 +63,8 @@ func ValidateSession(db *sql.DB, userID int, sessionID string) (SessionState, er
 	if sessionID == "" {
 		return st, nil
 	}
-	idleCutoff := time.Now().Add(-SessionTimeout())
+	// Idle time is measured by the database's clock: last_activity is a TIMESTAMP set with
+	// NOW(), and Go's clock can be in another zone than the database's.
 	err := db.QueryRow(`
 		SELECT au.role, au.mfa_enabled
 		FROM refresh_tokens rt
@@ -72,9 +73,9 @@ func ValidateSession(db *sql.DB, userID int, sessionID string) (SessionState, er
 		  AND rt.session_id = $2
 		  AND rt.revoked = FALSE
 		  AND rt.expires_at > NOW()
-		  AND rt.last_activity > $3
+		  AND rt.last_activity > NOW() - make_interval(secs => $3::int)
 		  AND au.is_active = TRUE
-		LIMIT 1`, userID, sessionID, idleCutoff).Scan(&st.Role, &st.MFAEnabled)
+		LIMIT 1`, userID, sessionID, int(SessionTimeout().Seconds())).Scan(&st.Role, &st.MFAEnabled)
 	if err == sql.ErrNoRows {
 		return st, nil
 	}

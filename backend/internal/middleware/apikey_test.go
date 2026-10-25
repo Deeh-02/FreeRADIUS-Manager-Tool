@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/freeradius-manager/backend/internal/database"
@@ -17,6 +18,16 @@ func TestAPIKeyExpiryAndCreatorRole(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
 		t.Skip("TEST_DATABASE_URL not set")
+	}
+	// It only touches its own rows, but still never runs against a database not meant for tests.
+	safe := os.Getenv("TEST_DATABASE_WIPE_OK") == "yes"
+	for _, f := range strings.Fields(url) {
+		if name, ok := strings.CutPrefix(f, "dbname="); ok && strings.HasSuffix(name, "_test") {
+			safe = true
+		}
+	}
+	if !safe {
+		t.Fatal("TEST_DATABASE_URL must name a database ending in _test (dbname=..._test), or set TEST_DATABASE_WIPE_OK=yes")
 	}
 	raw, err := sql.Open("postgres", url)
 	if err != nil {

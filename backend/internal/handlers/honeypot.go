@@ -210,8 +210,12 @@ func (h *Handler) ClearHoneypotLogs(c *gin.Context) {
 	if req.OlderThanDays == 0 {
 		req.OlderThanDays = 30
 	}
-	result, _ := h.db.Exec(`DELETE FROM honeypot_logs WHERE created_at < NOW()-($1 || ' days')::interval`,
+	result, err := h.db.Exec(`DELETE FROM honeypot_logs WHERE created_at < NOW()-($1 || ' days')::interval`,
 		fmt.Sprintf("%d", req.OlderThanDays))
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to delete logs")
+		return
+	}
 	n, _ := result.RowsAffected()
 	c.JSON(http.StatusOK, gin.H{"deleted": n})
 }

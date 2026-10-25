@@ -132,9 +132,12 @@ func (rl *RateLimiter) cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	cutoff := time.Now().Add(-10 * time.Minute)
+	now := time.Now()
+	cutoff := now.Add(-10 * time.Minute)
 	for ip, v := range rl.visitors {
-		if v.lastSeen.Before(cutoff) && !v.blocked {
+		// A block that has ended counts as gone too: the flag is only cleared by the next
+		// request from that IP, so one that never came back stayed in memory for good.
+		if v.lastSeen.Before(cutoff) && (!v.blocked || now.After(v.blockedUntil)) {
 			delete(rl.visitors, ip)
 		}
 	}

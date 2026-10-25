@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"errors"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strings"
@@ -128,7 +130,7 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 	if req.IsActive != nil {
 		isActive = *req.IsActive
 	}
-	h.db.Exec(`UPDATE organizations SET
+	res, err := h.db.Exec(`UPDATE organizations SET
 		name=COALESCE(NULLIF($1,''),name),
 		email=COALESCE(NULLIF($2,''),email),
 		phone=COALESCE(NULLIF($3,''),phone),
@@ -138,6 +140,9 @@ func (h *Handler) UpdateOrganization(c *gin.Context) {
 		is_active=$7
 		WHERE id=$8`,
 		req.Name, req.Email, req.Phone, req.Address, req.LogoURL, req.UserLimit, isActive, id)
+	if !writeOK(c, res, err, "organization") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "organization updated"})
 }
 
@@ -151,7 +156,10 @@ func (h *Handler) DeleteOrganization(c *gin.Context) {
 	h.db.Exec(`UPDATE radius_users SET org_id=NULL WHERE org_id=$1`, id)
 	h.db.Exec(`UPDATE nas SET org_id=NULL WHERE org_id=$1`, id)
 	h.db.Exec(`UPDATE app_users SET org_id=NULL WHERE org_id=$1`, id)
-	h.db.Exec(`DELETE FROM organizations WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM organizations WHERE id=$1`, id)
+	if !writeOK(c, res, err, "organization") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "organization deleted"})
 }
 
@@ -196,6 +204,8 @@ func (h *Handler) OrgStats(c *gin.Context) {
 	c.JSON(http.StatusOK, s)
 }
 
+var errOrgNotFound = errors.New("organization not found")
+
 // AssignUserToOrg links a RADIUS user to an organization.
 func (h *Handler) AssignUserToOrg(c *gin.Context) {
 	var req struct {
@@ -206,25 +216,44 @@ func (h *Handler) AssignUserToOrg(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.OrgID != nil {
-		var limit, count int
-		if err := h.db.QueryRow(`SELECT user_limit, (SELECT COUNT(*) FROM radius_users WHERE org_id=$1 AND username<>$2)
-			FROM organizations WHERE id=$1`, *req.OrgID, req.Username).Scan(&limit, &count); err != nil {
-			respondError(c, http.StatusNotFound, "organization not found")
-			return
+	// The organisation row is locked while counting, so two assignments at once cannot both
+	// take the last place.
+	var errLimit error
+	err := h.inTx(func(tx *sql.Tx) error {
+		if req.OrgID != nil {
+			var limit, count int
+			if err := tx.QueryRow(`SELECT user_limit FROM organizations WHERE id=$1 FOR UPDATE`, *req.OrgID).Scan(&limit); err != nil {
+				return errOrgNotFound
+			}
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM radius_users WHERE org_id=$1 AND username<>$2`, *req.OrgID, req.Username).Scan(&count); err != nil {
+				return err
+			}
+			if limit > 0 && count >= limit {
+				errLimit = fmt.Errorf("organization user limit (%d) reached", limit)
+				return errLimit
+			}
 		}
-		if limit > 0 && count >= limit {
-			respondError(c, http.StatusConflict, fmt.Sprintf("organization user limit (%d) reached", limit))
-			return
+		res, err := tx.Exec(`UPDATE radius_users SET org_id=$1 WHERE username=$2`, req.OrgID, req.Username)
+		if err != nil {
+			return err
 		}
-	}
-	res, err := h.db.Exec(`UPDATE radius_users SET org_id=$1 WHERE username=$2`, req.OrgID, req.Username)
-	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to update user")
+		if n, _ := res.RowsAffected(); n == 0 {
+			return sql.ErrNoRows
+		}
+		return nil
+	})
+	switch {
+	case err == errOrgNotFound:
+		respondError(c, http.StatusNotFound, "organization not found")
 		return
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	case err != nil && err == errLimit:
+		respondError(c, http.StatusConflict, err.Error())
+		return
+	case err == sql.ErrNoRows:
 		respondError(c, http.StatusNotFound, "user not found")
+		return
+	case err != nil:
+		respondError(c, http.StatusInternalServerError, "failed to update user")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "user organization updated"})

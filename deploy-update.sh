@@ -88,26 +88,12 @@ main() {
   $COMPOSE build backend frontend freeradius
   success "Images built"
 
-  # ── 4. Who will be refused once access is enforced ───────────────────────
+  # ── 4. Migrations (each file once, each in one transaction) ──────────────
+  # Before the access report: the new code it runs reads columns the migrations add, so on
+  # an older database it failed before the update could get this far. Migrations only add
+  # tables, columns and defaults, which the old version still running ignores.
   $COMPOSE up -d postgres >/dev/null
   wait_healthy radius_postgres 60 || error "Postgres did not become healthy."
-  info "Checking which customers will be refused after the update ..."
-  local report
-  report=$($COMPOSE run --rm --no-deps -T backend ./radius-manager access-report) \
-    || error "access-report failed: $report"
-  echo "$report"
-  if ! echo "$report" | grep -q 'Refused after sync: 0 '; then
-    if ! $assume_yes; then
-      if [ -t 0 ]; then
-        read -r -p "These customers will be refused by FreeRADIUS. Continue? [y/N] " answer
-        [[ "$answer" =~ ^[Yy] ]] || error "Stopped. Nothing was changed; the old version is still running."
-      else
-        error "Not a terminal: re-run with --yes to accept the list above."
-      fi
-    fi
-  fi
-
-  # ── 5. Migrations (each file once, each in one transaction) ──────────────
   info "Applying database migrations ..."
   psql_db() { docker exec -i radius_postgres psql -U "$db_user" -d "$db_name" -v ON_ERROR_STOP=1 -q "$@"; }
   psql_db -c "SET client_min_messages = warning; CREATE TABLE IF NOT EXISTS schema_migrations (filename VARCHAR(200) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
@@ -118,15 +104,32 @@ main() {
       continue
     fi
     info "  → $name"
-    if ! out=$(psql_db -1 -f - < "$f" 2>&1); then
+    # The record is part of the migration's own transaction: both happen or neither.
+    if ! out=$( (cat "$f"; echo; echo "INSERT INTO schema_migrations (filename) VALUES ('$name');") | psql_db -1 -f - 2>&1); then
       echo "$out" | grep -v 'NOTICE' >&2 || true
       error "Migration $name failed and was rolled back; the old version is still running."
     fi
     echo "$out" | grep -v 'NOTICE' || true
-    psql_db -c "INSERT INTO schema_migrations (filename) VALUES ('$name')"
     applied=$((applied + 1))
   done
   success "Migrations: $applied applied"
+
+  # ── 5. Who will be refused once access is enforced ───────────────────────
+  info "Checking which customers will be refused after the update ..."
+  local report
+  report=$($COMPOSE run --rm --no-deps -T backend ./radius-manager access-report) \
+    || error "access-report failed: $report"
+  echo "$report"
+  if ! echo "$report" | grep -q 'Refused after sync: 0 '; then
+    if ! $assume_yes; then
+      if [ -t 0 ]; then
+        read -r -p "These customers will be refused by FreeRADIUS. Continue? [y/N] " answer
+        [[ "$answer" =~ ^[Yy] ]] || error "Stopped. The old version is still running (the migrations above were applied; they only add to the schema, which it ignores)."
+      else
+        error "Not a terminal: re-run with --yes to accept the list above."
+      fi
+    fi
+  fi
 
   # ── 6. Restart ───────────────────────────────────────────────────────────
   info "Restarting containers ..."

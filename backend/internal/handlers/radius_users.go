@@ -176,7 +176,7 @@ func (h *Handler) CreateRadiusUser(c *gin.Context) {
 
 	hashedPw, err := auth.HashPassword(req.Password)
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to hash password")
+		respondHashError(c, err)
 		return
 	}
 	claims, _ := middleware.GetClaims(c)
@@ -484,7 +484,7 @@ func (h *Handler) ResetRadiusUserPassword(c *gin.Context) {
 
 	newHash, err := auth.HashPassword(req.NewPassword)
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to hash password")
+		respondHashError(c, err)
 		return
 	}
 
@@ -814,7 +814,7 @@ func (h *Handler) ImportRadiusUsers(c *gin.Context) {
 
 		hash, err := auth.HashPassword(password)
 		if err != nil {
-			results = append(results, RowResult{rowNum, username, "error", "hash failed"})
+			results = append(results, RowResult{rowNum, username, "error", "password: " + err.Error()})
 			failed++
 			continue
 		}

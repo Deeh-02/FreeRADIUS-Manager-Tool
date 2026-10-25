@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"fmt"
 	"math"
 	"net/http"
@@ -12,19 +13,19 @@ import (
 
 // UserPlan holds a subscription plan definition.
 type UserPlan struct {
-	ID                 int        `json:"id"`
-	Name               string     `json:"name"`
-	Description        *string    `json:"description"`
-	Price              float64    `json:"price"`
-	Currency           string     `json:"currency"`
-	DataLimitMB        *int64     `json:"data_limit_mb"`
-	ValidityDays       int        `json:"validity_days"`
-	BandwidthProfileID *int       `json:"bandwidth_profile_id"`
-	BandwidthName      *string    `json:"bandwidth_name"`
-	MaxDevices         int        `json:"max_devices"`
-	IsActive           bool       `json:"is_active"`
-	UserCount          int        `json:"user_count"`
-	CreatedAt          time.Time  `json:"created_at"`
+	ID                 int       `json:"id"`
+	Name               string    `json:"name"`
+	Description        *string   `json:"description"`
+	Price              float64   `json:"price"`
+	Currency           string    `json:"currency"`
+	DataLimitMB        *int64    `json:"data_limit_mb"`
+	ValidityDays       int       `json:"validity_days"`
+	BandwidthProfileID *int      `json:"bandwidth_profile_id"`
+	BandwidthName      *string   `json:"bandwidth_name"`
+	MaxDevices         int       `json:"max_devices"`
+	IsActive           bool      `json:"is_active"`
+	UserCount          int       `json:"user_count"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // ListPlans returns all user plans.
@@ -171,7 +172,23 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 	if req.Currency == "" {
 		req.Currency = defaultCurrency()
 	}
-	res, err := h.db.Exec(`
+	// The speed profile before the edit: customers who got it from this plan lose it if the
+	// plan no longer sets one. Read under the row lock the UPDATE takes, in one transaction.
+	tx, err := h.db.Begin()
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update plan")
+		return
+	}
+	defer tx.Rollback()
+	var prevProfile sql.NullInt64
+	if err := tx.QueryRow(`SELECT bandwidth_profile_id FROM user_plans WHERE id = $1 FOR UPDATE`, id).Scan(&prevProfile); err == sql.ErrNoRows {
+		respondError(c, http.StatusNotFound, "plan not found")
+		return
+	} else if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update plan")
+		return
+	}
+	res, err := tx.Exec(`
 		UPDATE user_plans SET name=COALESCE(NULLIF($1,''), name), description=$2, price=$3, currency=UPPER($4),
 		    data_limit_mb=$5, validity_days=$6, bandwidth_profile_id=$7,
 		    max_devices=$8, is_active=$9, updated_at=NOW()
@@ -195,8 +212,12 @@ func (h *Handler) UpdatePlan(c *gin.Context) {
 		respondError(c, http.StatusNotFound, "plan not found")
 		return
 	}
+	if err := tx.Commit(); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update plan")
+		return
+	}
 	// Existing customers on the plan get the new device limit, data cap and speed.
-	go h.reapplyPlan(id)
+	go h.reapplyPlan(id, prevProfile)
 	c.JSON(http.StatusOK, gin.H{"message": "plan updated; limits are being re-applied to its users"})
 }
 
@@ -288,30 +309,36 @@ func (h *Handler) AssignPlan(c *gin.Context) {
 }
 
 // reapplyPlan re-writes a plan's limits for every customer on it (after the plan changed).
-func (h *Handler) reapplyPlan(planID int) error {
-	p, err := loadPlan(h.db, planID)
-	if err != nil {
-		return err
-	}
+// Each customer is locked and re-checked in their own transaction: one moved to another plan
+// while this runs keeps the new plan instead of being put back on this one.
+func (h *Handler) reapplyPlan(planID int, prevProfile sql.NullInt64) error {
 	rows, err := h.db.Query(`SELECT id, username FROM radius_users WHERE plan_id = $1`, planID)
 	if err != nil {
 		return err
 	}
-	type u struct {
-		id   int
-		name string
-	}
-	var users []u
+	var users []profileUser
 	for rows.Next() {
-		var x u
-		if rows.Scan(&x.id, &x.name) == nil {
-			users = append(users, x)
+		var u profileUser
+		if rows.Scan(&u.id, &u.name) == nil {
+			users = append(users, u)
 		}
 	}
 	rows.Close()
-	for _, x := range users {
-		if err := applyPlanLimits(h.db, x.id, x.name, p); err != nil {
-			h.log.WithError(err).Warnf("re-apply plan %d to %s", planID, x.name)
+	for _, u := range users {
+		err := h.inTx(func(tx *sql.Tx) error {
+			var onPlan bool
+			if err := tx.QueryRow(`SELECT COALESCE(plan_id = $2, FALSE) FROM radius_users WHERE id = $1 FOR UPDATE`,
+				u.id, planID).Scan(&onPlan); err != nil || !onPlan {
+				return nil // deleted or moved meanwhile
+			}
+			p, err := loadPlan(tx, planID) // the newest version, if it was edited again meanwhile
+			if err != nil {
+				return err
+			}
+			return writePlanLimits(tx, u.id, u.name, p, prevProfile)
+		})
+		if err != nil {
+			h.log.WithError(err).Warnf("re-apply plan %d to %s", planID, u.name)
 		}
 	}
 	return nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -257,8 +258,20 @@ func runTaskLocked(db *database.DB, log *logrus.Logger, id int, taskType string)
 	}
 	defer conn.ExecContext(ctx, `SELECT pg_advisory_unlock(727501, $1)`, id)
 
-	result, count := runTask(db, log, taskType)
+	result, count := runTaskSafely(db, log, taskType)
 	return result, count, true
+}
+
+// runTaskSafely runs a task and turns a panic into a failed result. Tasks run outside any
+// request, where nothing else would catch it and one bad row would stop the whole API.
+func runTaskSafely(db *database.DB, log *logrus.Logger, taskType string) (result string, count int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Errorf("scheduler: task %s panicked: %v\n%s", taskType, r, debug.Stack())
+			result, count = fmt.Sprintf("failed: panic: %v", r), 0
+		}
+	}()
+	return runTask(db, log, taskType)
 }
 
 // runTask executes the logic for a given task type and returns a description and a count.

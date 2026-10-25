@@ -112,6 +112,28 @@ func RequireAuth(db *database.DB) gin.HandlerFunc {
 	}
 }
 
+// StillAuthorized repeats RequireAuth's checks for a request that has been open a while (the
+// live-stats stream): the access token has not expired, the session is not signed out or
+// idle, the account is enabled, the API key is not revoked. Without it a stream opened before
+// a logout, a deactivation or a key revocation kept sending data. A database that cannot be
+// asked is not treated as a sign-out.
+func StillAuthorized(db *database.DB, header string) bool {
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	if strings.EqualFold(parts[0], "ApiKey") {
+		_, _, err := apiKeyClaims(db, strings.TrimSpace(parts[1]))
+		return err == nil || err == errKeyLookup
+	}
+	claims, err := auth.ValidateAccessToken(parts[1])
+	if err != nil {
+		return false
+	}
+	st, err := auth.ValidateSession(db.DB, claims.UserID, claims.SessionID)
+	return err != nil || st.Active
+}
+
 // apiKeyClaims validates an API key. Keys act with the identity of the admin who created
 // them (who must still be active): permission "write" maps to the admin role, otherwise the
 // key is a read-only operator. Super-admin-only routes are therefore never reachable by key.

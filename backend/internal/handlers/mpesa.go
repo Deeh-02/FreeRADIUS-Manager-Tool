@@ -971,11 +971,19 @@ func reconcileMpesa(db *database.DB, log *logrus.Logger) (string, int) {
 	if err != nil {
 		return "M-Pesa not configured", 0
 	}
-	res, _ := db.Exec(`UPDATE mpesa_stk SET status='failed', result_desc='Safaricom did not confirm the prompt was sent', updated_at=NOW()
+	// A failed Exec returns a nil Result; calling RowsAffected on it would panic and, outside a
+	// request, take the whole API down with a database blip.
+	res, err := db.Exec(`UPDATE mpesa_stk SET status='failed', result_desc='Safaricom did not confirm the prompt was sent', updated_at=NOW()
 		WHERE status='sending' AND created_at < NOW() - INTERVAL '2 minutes'`)
+	if err != nil {
+		return "database error: " + err.Error(), 0
+	}
 	stale, _ := res.RowsAffected()
-	res, _ = db.Exec(`UPDATE mpesa_stk SET status='failed', result_desc='no answer from the customer within a day', updated_at=NOW()
+	res, err = db.Exec(`UPDATE mpesa_stk SET status='failed', result_desc='no answer from the customer within a day', updated_at=NOW()
 		WHERE status='pending' AND created_at < NOW() - INTERVAL '1 day'`)
+	if err != nil {
+		return "database error: " + err.Error(), 0
+	}
 	old, _ := res.RowsAffected()
 
 	// Claim the rows to ask about, so two backends do not both ask.
@@ -1035,7 +1043,14 @@ func StartMpesaLoop(db *database.DB, log *logrus.Logger) {
 	}
 	go func() {
 		for range time.Tick(time.Minute) {
-			reconcileMpesa(db, log)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("mpesa: reconcile panicked: %v", r)
+					}
+				}()
+				reconcileMpesa(db, log)
+			}()
 		}
 	}()
 }

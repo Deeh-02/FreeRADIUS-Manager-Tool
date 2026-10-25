@@ -30,14 +30,13 @@ func (h *Handler) PortalLogin(c *gin.Context) {
 		return
 	}
 
-	var userID, failed int
+	var userID int
 	var storedHash, status string
-	var hadLock, locked bool // decided by the database's clock (see lockAppUserSQL)
+	var locked bool // decided by the database's clock (see failAppUserSQL)
 	err := h.db.QueryRow(`
-		SELECT id, password, status, portal_failed_attempts, portal_locked_until IS NOT NULL,
-		       COALESCE(portal_locked_until > NOW(), FALSE)
+		SELECT id, password, status, COALESCE(portal_locked_until > NOW(), FALSE)
 		FROM radius_users WHERE username=$1`, req.Username).
-		Scan(&userID, &storedHash, &status, &failed, &hadLock, &locked)
+		Scan(&userID, &storedHash, &status, &locked)
 	if err != nil {
 		bcrypt.CompareHashAndPassword([]byte(dummyHash), []byte(req.Password))
 		CheckCredStuffing(h, c.ClientIP(), req.Username)
@@ -48,18 +47,13 @@ func (h *Handler) PortalLogin(c *gin.Context) {
 		respondError(c, http.StatusTooManyRequests, "too many failed attempts; try again later")
 		return
 	}
-	if hadLock {
-		failed = 0
-	}
 	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(req.Password)); err != nil {
-		failed++
-		lockMins := 0
-		if failed >= settings.Int("portal_max_attempts", "", 5) {
-			lockMins = settings.Int("portal_lockout_minutes", "", 15)
-		}
-		h.db.Exec(`UPDATE radius_users SET portal_failed_attempts=$1,
-			portal_locked_until = CASE WHEN $2::int > 0 THEN NOW() + make_interval(mins => $2::int) ELSE NULL END
-			WHERE id=$3`, failed, lockMins, userID)
+		// Counted by the database, so simultaneous failures all count (see failAppUserSQL).
+		h.db.Exec(`UPDATE radius_users SET
+			portal_failed_attempts = CASE WHEN portal_locked_until <= NOW() THEN 1 ELSE portal_failed_attempts + 1 END,
+			portal_locked_until = CASE WHEN (CASE WHEN portal_locked_until <= NOW() THEN 1 ELSE portal_failed_attempts + 1 END) >= $1::int
+				THEN NOW() + make_interval(mins => $2::int) ELSE NULL END
+			WHERE id=$3`, settings.Int("portal_max_attempts", "", 5), settings.Int("portal_lockout_minutes", "", 15), userID)
 		CheckCredStuffing(h, c.ClientIP(), req.Username)
 		respondError(c, http.StatusUnauthorized, "invalid username or password")
 		return

@@ -250,6 +250,17 @@ func (h *Handler) ReversePayment(c *gin.Context) {
 		respondError(c, http.StatusInternalServerError, "failed to reverse payment")
 		return
 	}
+	// New logins are refused now, but a customer who is online keeps the session the router
+	// granted with the old date. If the reversal left no paid time, end it now: the expiry
+	// task only looks at active customers, and the reversal may already have expired this one.
+	var username string
+	var cutOff bool
+	if h.db.QueryRow(`SELECT ru.username, ru.status IN ('expired','suspended') OR
+		    (ru.account_expiry IS NOT NULL AND ru.account_expiry + COALESCE(ru.grace_days, $2::int) < CURRENT_DATE)
+		FROM payments p JOIN radius_users ru ON ru.username = p.username WHERE p.id = $1`, id, graceDays()).
+		Scan(&username, &cutOff) == nil && cutOff {
+		msg += disconnectUserSessions(h.db, username, false).stillOnlineNote()
+	}
 	go h.dispatchWebhook("payment.reversed", gin.H{"payment_id": id, "reason": req.Reason})
 	c.JSON(http.StatusOK, gin.H{"message": msg})
 }

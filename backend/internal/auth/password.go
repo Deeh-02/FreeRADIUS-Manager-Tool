@@ -20,6 +20,9 @@ var (
 	ErrPasswordNoDigit     = errors.New("password must contain at least one digit")
 	ErrPasswordNoSpecial   = errors.New("password must contain at least one special character")
 	ErrPasswordReused      = errors.New("password was recently used, choose a different one")
+	// ErrPasswordTooLong: bcrypt takes at most 72 bytes (fewer characters if they are not
+	// plain ASCII) and refuses longer input instead of hashing it.
+	ErrPasswordTooLong = errors.New("password is too long (at most 72 bytes; non-English letters count as 2-4)")
 )
 
 // HashPassword creates a bcrypt hash of the password.
@@ -27,6 +30,9 @@ var (
 // RADIUS network passwords: FreeRADIUS needs the cleartext (PAP/CHAP/MS-CHAP), so
 // handlers also write the plain password to radcheck (Cleartext-Password).
 func HashPassword(password string) (string, error) {
+	if len(password) > 72 {
+		return "", ErrPasswordTooLong
+	}
 	cost := getBcryptCost()
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
 	if err != nil {
@@ -55,6 +61,9 @@ func ValidatePasswordWithMin(password string, minLen int) error {
 	}
 	if utf8.RuneCountInString(password) < minLen {
 		return fmt.Errorf(errPasswordTooShort, minLen)
+	}
+	if len(password) > 72 {
+		return ErrPasswordTooLong
 	}
 
 	var hasUpper, hasLower, hasDigit, hasSpecial bool

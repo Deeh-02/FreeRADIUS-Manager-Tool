@@ -55,10 +55,16 @@ if ! app_psql -tAc "select to_regclass('public.app_users')" | grep -q app_users;
   info "Creating base schema"
   app_psql -f init-db.sql
 fi
-# Migrations are idempotent, so they are re-applied on every run (NOTICE lines hidden).
-for f in migrations/*.sql; do
+# Each migration once, recorded in schema_migrations in the same transaction (as
+# deploy-update.sh does). Re-applying them on every start undid settings staff had chosen:
+# 014 turned a trial set to 0 back into 5 days, 012 a USD currency back into KES.
+app_psql -c "SET client_min_messages = warning; CREATE TABLE IF NOT EXISTS schema_migrations (filename VARCHAR(200) PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+for f in $(ls migrations/*.sql | sort); do
+  name=$(basename "$f")
+  [ "$(app_psql -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$name'")" = "1" ] && continue
   info "Applying $f"
-  out=$(app_psql -1 -f "$f" 2>&1) || { echo "$out" >&2; fail "Migration $f failed"; }
+  out=$( (echo "SET client_min_messages = warning;"; cat "$f"; echo; echo "INSERT INTO schema_migrations (filename) VALUES ('$name');") | app_psql -1 -f - 2>&1) \
+    || { echo "$out" >&2; fail "Migration $f failed"; }
   echo "$out" | grep -v NOTICE || true
 done
 

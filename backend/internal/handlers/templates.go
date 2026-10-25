@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -151,23 +152,22 @@ var allowedTemplateOps = map[string]bool{":=": true, "=": true, "==": true, "+="
 
 // protectedCheckAttrs may not be set by a template: they would change the password or the
 // billing/suspension state that syncAccess manages.
-var protectedCheckAttrs = map[string]bool{"Cleartext-Password": true, "Auth-Type": true,
-	"Expiration": true, "Simultaneous-Use": true, "Crypt-Password": true, "MD5-Password": true,
-	"NT-Password": true, "SHA-Password": true}
+// Keys are lower case: FreeRADIUS matches attribute names without regard to case.
+var protectedCheckAttrs = map[string]bool{"cleartext-password": true, "auth-type": true,
+	"expiration": true, "simultaneous-use": true, "crypt-password": true, "md5-password": true,
+	"nt-password": true, "sha-password": true}
 
 func validateTemplateAttrs(attrs []AttributeEntry) error {
 	for _, a := range attrs {
 		if a.Attribute == "" || len(a.Attribute) > 64 || len(a.Value) > 253 {
 			return fmt.Errorf("attribute names must be 1-64 characters and values at most 253")
 		}
-		if a.Op == "" {
-			continue
-		}
-		if !allowedTemplateOps[a.Op] {
-			return fmt.Errorf("operator %q is not allowed", a.Op)
-		}
-		if a.Table == "check" && protectedCheckAttrs[a.Attribute] {
+		// Checked whatever the operator: an empty one is applied as := (applyTemplateTx).
+		if a.Table == "check" && protectedCheckAttrs[strings.ToLower(strings.TrimSpace(a.Attribute))] {
 			return fmt.Errorf("%s is managed by the system and cannot be set by a template", a.Attribute)
+		}
+		if a.Op != "" && !allowedTemplateOps[a.Op] {
+			return fmt.Errorf("operator %q is not allowed", a.Op)
 		}
 	}
 	return nil

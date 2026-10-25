@@ -74,7 +74,7 @@ func (h *Handler) CreateAdminUser(c *gin.Context) {
 
 	hash, err := auth.HashPassword(req.Password)
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to process password")
+		respondHashError(c, err)
 		return
 	}
 

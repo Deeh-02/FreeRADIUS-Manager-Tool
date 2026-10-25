@@ -115,7 +115,7 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 	// Hash the admin password
 	hash, err := auth.HashPassword(req.Admin.Password)
 	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to hash password")
+		respondHashError(c, err)
 		return
 	}
 

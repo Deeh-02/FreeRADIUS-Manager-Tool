@@ -442,9 +442,12 @@ PostgreSQL 15, created from these files, in order:
 [`migrations/008_network_scanner.sql`](../migrations/008_network_scanner.sql) repeats tables
 already in `init-db.sql`, for old installs.
 
-All migration files can safely be re-applied. On a fresh Docker install they run from
-`docker-entrypoint-initdb.d`. On updates, [`deploy-update.sh`](../deploy-update.sh) applies each
-file once, in one transaction, and records it in `schema_migrations`.
+Each migration file is applied once and recorded in `schema_migrations` in the same
+transaction: on a fresh Docker install by [`scripts/initdb-migrations.sh`](../scripts/initdb-migrations.sh)
+(from `docker-entrypoint-initdb.d`), on updates by [`deploy-update.sh`](../deploy-update.sh), in
+local mode by `run-local.sh`, and on a managed database by `scripts/db-setup.sh`. The files can
+be re-applied without breaking the schema, but two of them set defaults (012 currency, 014
+trial days) that would undo a choice made on the Settings page, which is why they run once.
 
 ### 6.1 Tables
 
@@ -778,6 +781,47 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 | B21 | Medium | Grace days were one system-wide number. | **Fixed.** Each customer can have their own (customer dialog → *Grace days*, blank = system default), so staff can extend one customer on request. Raising it lets a lapsed customer who has paid before back in at once; lowering it blocks them; it never lets in a customer who has not paid yet. Migration 012. Tested, and exercised by the simulation. |
 | S11 | Low | Audit redaction shallow; GeoIP free plan non-commercial over HTTP. | **Partly.** Recursive redaction. **Open:** default GeoIP service is ip-api.com (non-commercial, HTTP) — set `GEOIP_API_URL`. |
 
+### 10.4.1 External review (25 Oct 2026)
+
+A second reviewer listed 42 findings. Every one was checked against the code and all were
+accurate. The ones below are fixed; each test fails on the code before its fix (all in
+`review_fixes_test.go` unless named). Not fixed yet: see the end of this section.
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| R1 | High | A database blip could stop the whole API: the M-Pesa reconcile loop and the IP-block cleanup called `RowsAffected` on the nil result of a failed write, in background jobs that nothing recovers. | **Fixed.** Errors checked; scheduler tasks and the M-Pesa loop turn a panic into a logged failure. `TestBackgroundJobsSurviveDatabaseOutage` (old code: nil pointer panic). |
+| R2 | High | Deleting an invoice while a payment for it was being recorded detached the payment (checked for payments, then deleted, unlocked). | **Fixed.** The delete locks the invoice first, as payments do. `TestDeleteInvoiceDuringPayment` (old code: 200, payment lost its invoice). |
+| R3 | High | Reversing a payment took the paid days back but left the customer online until the router's session ended. | **Fixed.** If no paid time is left, their sessions are disconnected (and staff told if the router does not confirm). `TestReversalDisconnectsCustomer`. |
+| R4 | Medium | An idempotency key reused for another customer, method or currency was answered with the first payment, as if recorded. | **Fixed.** 409 unless it is the same payment. `TestPaymentKeyReusedForAnotherCustomer`. |
+| R5 | High | Speed limits: a wrong profile ID removed the customer's working limits before answering 404; deleting a profile, or a plan dropping its profile, or moving to a plan without one, left the old limits on the router. | **Fixed.** Checked first, one transaction; the plan's old profile is removed (one staff gave by hand is kept). `TestSpeedLimitsFollowProfilesAndPlans`. |
+| R6 | High | Re-applying an edited plan could put back a customer who had just moved to another plan. | **Fixed.** Each customer locked and re-checked. `TestPlanReapplyKeepsCustomerWhoMoved`. Same for speed-profile edits. |
+| R7 | Medium | A template could set the password, paid-until date or device limit: the protected-attribute check was skipped for an empty operator (applied as `:=`) and was case-sensitive (FreeRADIUS is not). | **Fixed.** `TestTemplateCannotSetManagedAttributes`. |
+| R8 | High | Two refreshes with the same token both got new sessions (check, revoke, insert were separate; write errors ignored). | **Fixed.** One conditional update in a transaction with the new token. `TestRefreshTokenUsedOnce` (old code: 16 of 40 succeeded). |
+| R9 | Medium | Failed sign-ins at the same moment overwrote each other's count, so a burst never locked the account. | **Fixed.** The database adds one (staff and portal). `TestSimultaneousFailedLoginsAllCount` (old code: 12 failures counted as 1). |
+| R10 | Medium | Staff idle timeout and refresh-token expiry used Go's clock against TIMESTAMP columns (the B33 trap): with the app and database in different zones, idle sessions stayed for hours or every session timed out at once. Manual IP blocks the same. | **Fixed.** Compared and set by the database. `TestSessionIdleTimeoutUsesDatabaseClock`. |
+| R11 | High (operations) | The test guard accepted any connection string with `_test` anywhere (a user name), not the database name. The API-key test had no guard. | **Fixed.** The database name must end in `_test`. `TestTestDatabaseGuardReadsTheName`. |
+| R12 | Medium | Passwords over bcrypt's 72 bytes (40 accented letters) passed validation and failed with 500. | **Fixed.** 400 with the reason. `TestOverlongPasswordIsRefusedPolitely`. |
+| R13 | High | The captive portal took its form's destination from the link (`link-login-only`) when it had no fixed login URL: a crafted link showed the genuine page and sent passwords anywhere. | **Fixed.** Only a router address is accepted (private/CGNAT IP, local name, or a registered NAS); otherwise set the portal's login URL. `TestPortalFormOnlyPostsToARouter`. |
+| R14 | Medium | Revoking an API key, deleting a customer, zone, organisation, ticket, pool or IP block, or assigning a zone said "done" for a missing ID or a failed write. | **Fixed.** 404 / 400 / 500. `TestWritesThatChangeNothingSaySo`. |
+| R15 | Medium | Simultaneous IP assignments gave one customer several addresses; the organisation limit was counted unlocked. | **Fixed.** Customer and organisation locked. `TestOrgLimitAndIPAssignmentUnderConcurrency` (old code: one customer held 10 addresses; the organisation race did not show in the test). |
+| R16 | Medium | An open live-stats stream kept sending after sign-out, deactivation or key revocation. | **Fixed.** Checked before every update; the UI reconnects with its current token. `TestLiveStreamStopsAfterSignOut`. |
+| R17 | High | Changing the system-wide grace days did not reach the router's Expiration rows. | **Fixed.** Customers without their own grace are rewritten in the background. `TestGraceDaysChangeReachesTheRouter`. |
+| R18 | High | The M-Pesa callback secret (in the URL path) was written to the API log and nginx's access log. | **Fixed.** Masked in both (`pkg/logger` test; the nginx `map` is not yet run in a container). Still set `MPESA_ALLOWED_IPS` (10.6). |
+| R19 | High | Restarting local mode re-ran every migration: 014 turned trial days set to 0 back into 5, 012 a USD currency into KES. A fresh Docker install did not record its migrations, so the first update replayed them too. The updater ran the new code's access report before the migrations it needs, and recorded each migration in a separate transaction. | **Fixed.** Local mode, Docker's first start (`scripts/initdb-migrations.sh`), `deploy-update.sh` and `db-setup.sh` all apply each file once and record it in the same transaction; migrations run before the report. Checked on a scratch database: 10 recorded, a second run left trial 0 and USD alone. **Note:** a Docker install made before this has no records, so its next update replays them once; check trial days and currency on Settings afterwards. |
+| R20 | High | Dependencies: golang-jwt 5.2.1 (CVE-2025-30204, denial of service with malformed tokens); the backend image built with Go 1.21 (no security fixes since 2024). | **Fixed.** jwt 5.2.2; `golang:1.27-alpine`. |
+| R21 | Low | The browser could get stuck waiting for a token refresh (flag set before a missing-token return), and the refresh call had no timeout. The rate limiter never forgot an IP whose block had ended. | **Fixed.** `ratelimit_test.go` for the limiter. |
+
+**Not fixed, by decision or for later:** data used by a session already open when a customer
+renews early is not counted against the new period (in the customer's favour; only matters
+for capped plans); the portal shows 30 days of usage, not the current period; organisation and
+customer-record revenue mix currencies (reports only); live bandwidth divides total bytes by
+300 s; dashboards run ~30 queries per viewer; most queries have no deadline and email has no
+timeout; scanner job limits are racy; some settings are stored but not enforced (password
+expiry, forced change, zone `max_clients`, bursts); admins see a few super-admin-only buttons;
+dates are sent labelled `Z`. Deployment items (HTTPS only, a non-superuser database login,
+fewer trusted RADIUS ranges, the API not as root, off-host backups, a content security policy)
+belong to setting up the real server ([10.6](#106-still-to-do-before-relying-on-it)).
+
 ### 10.5 Quality and operations
 
 | # | Severity | Finding | Status |
@@ -837,8 +881,8 @@ can lose money, data or control; **High** = will bite in normal use; **Medium**;
 5. **Tax/VAT and exact-decimal money** (B8), if your jurisdiction needs invoices with tax.
 6. **Real multi-tenancy** (S9), if you plan to resell.
 7. **Set `MPESA_ALLOWED_IPS`** to Safaricom's callback addresses in production. The callback
-   secret is part of the URL, so anyone who can read request logs (the host's, a proxy's)
-   could otherwise post a fake payment.
+   secret is part of the URL. The API and the bundled nginx mask it in their logs (R18), but a
+   hosting provider's own request logs may not.
 8. **Decide two rules the adversarial review (24 Oct 2026) left to you:** a customer can send
    the portal's payment prompt to any phone (useful when someone else pays; limited to one
    prompt per invoice every 2 minutes), and deleting then re-creating a customer gives them a
