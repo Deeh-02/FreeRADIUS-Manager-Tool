@@ -32,8 +32,9 @@ rules that decide who gets online.
 11. [API](#api)
 12. [Running without Docker (development)](#running-without-docker-development)
 13. [Troubleshooting](#troubleshooting)
-14. [Limits: read before you sell service](#limits-read-before-you-sell-service)
-15. [License](#license)
+14. [Tests](#tests)
+15. [Limits: read before you sell service](#limits-read-before-you-sell-service)
+16. [License](#license)
 
 ---
 
@@ -157,10 +158,10 @@ date has not passed.
 |---|---|
 | **Create a plan** (Plans) | Price, currency, validity (days), speed (bandwidth profile), data cap, device count. |
 | **Assign it** (RADIUS Users → Assign Plan, or when creating the user) | The plan's limits are written to RADIUS at once. A paid plan raises an **invoice**. If the customer has no paid days left, they stay offline until it is paid, unless you tick **Start now** (postpaid). |
-| **Record the payment** (Billing → Record payment, or Payments) | Payments are recorded against an invoice, and an invoice can be paid in several parts. When fully paid, the invoice is marked paid and the plan's days are added to the paid-until date: from the current date if it is still running, otherwise from today. You get a printable receipt. |
+| **Record the payment** (Billing → Record payment, or Payments) | With M-Pesa configured, payments arrive by themselves: a prompt sent to the customer's phone (from the customer portal or by staff), or a paybill/till payment with the customer's username as the account number. Other payments are recorded by staff. Payments are recorded against an invoice, and an invoice can be paid in several parts. When fully paid, the invoice is marked paid and the plan's days are added to the paid-until date: from the current date if it is still running, otherwise from today. You get a printable receipt. |
 | **Renewal** | The **Raise Renewal Invoices** task bills each customer a few days (`renewal_invoice_days`) before they run out. Nothing is ever extended without payment. |
 | **Expiry** | At midnight (server timezone, `TZ`) after the paid-until date plus `billing_grace_days`, FreeRADIUS refuses the customer. The **Expire Accounts** task marks them expired and disconnects open sessions. |
-| **Mistakes and refunds** | Payments are never deleted. **Reverse** one (super admin): its invoice re-opens and the days it bought are taken back. |
+| **Mistakes and refunds** | Payments are never deleted. **Reverse** one (admin or super admin): its invoice re-opens, the days it bought are taken back, and a customer left with no paid time is disconnected. |
 | **Promo codes** (Promotions) | Give a code when creating an invoice or assigning a plan; the discount is applied to the invoice and the code's use is counted. |
 | **Vouchers** | Printable codes sold offline. Each code is a login with its own validity, data and time limits, optionally from a plan. |
 
@@ -361,10 +362,31 @@ only warn), so **don't use it for production**.
 
 ---
 
+## Tests
+
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs all of these on every push,
+in the Africa/Nairobi time zone:
+
+| Command | What it runs | Needs |
+|---|---|---|
+| `cd backend && make test-integration` | billing, payments, M-Pesa (against a fake Daraja), concurrency and time-simulation tests on a scratch PostgreSQL | PostgreSQL server binaries |
+| `cd backend && make test-e2e` | the above plus a real FreeRADIUS, the backend binary in production mode, crash and outage tests, and hostile requests against every route | also the `freeradius` package |
+| `cd frontend && npm test && npm run build` | frontend unit tests and the production build | Node 20 |
+| `cd frontend && npm run test:browser` | the screens that write money, dates and access, in Chromium: sign-in, a customer on a plan, paying on the Billing page, editing after a payment arrived, reversing on the Payments page | the backend from `scripts/test-stack.sh start`; `npx playwright install chromium` once |
+| `scripts/docker-smoke.sh` | the real Docker images on an empty database: setup, sign-in, a customer accepted by FreeRADIUS, secrets kept out of logs | Docker |
+
+---
+
 ## Limits: read before you sell service
 
-- **No payment gateway.** Payments (M-Pesa, bank, cash) are recorded by staff. Nothing
-  receives payment callbacks yet.
+- **M-Pesa is the only payment gateway** (Safaricom Daraja: a payment prompt to the
+  customer's phone, and paybill/till payments matched by account number). Set the `MPESA_*`
+  values in `.env` and `MPESA_ALLOWED_IPS` to Safaricom's addresses; payments that match no
+  customer wait on the Payments page for staff. Tested against the Daraja **sandbox** only
+  ([docs/CLOUD-TEST.md](docs/CLOUD-TEST.md)); make one small real payment before going live.
+  Bank and cash payments are recorded by staff. A paybill confirmation Safaricom never
+  delivers is not recovered automatically: compare the M-Pesa statement with the Payments
+  page.
 - **No tax/VAT, proration or credit notes.** Invoices are a single amount.
 - **Organizations are labels, not tenants.** Every staff account sees every customer, so
   don't give resellers staff accounts expecting isolation.
@@ -372,16 +394,19 @@ only warn), so **don't use it for production**.
   them. Protect the database and its backups accordingly.
 - **The free GeoIP service** (ip-api.com) is for non-commercial use. Set `GEOIP_API_URL` to a
   paid endpoint if you use country rules.
-- **One backend instance.** Rate limits and lockout counters live in memory. To run more
-  than one copy, set `RUN_WORKERS=false` on all but one.
+- **One backend instance.** Request rate limits live in memory (sign-in lockouts are in
+  the database). To run more than one copy, set `RUN_WORKERS=false` on all but one.
 - **The honeypot** listens on UDP 11812 inside the backend container. Publish that port in
   `docker-compose.yml` if you want it reachable.
 - **Tested with:**
   - FreeRADIUS 3.2.5 with PAP; the image uses 3.2.10, the same configuration format.
   - The full API flow and the main UI flows in a browser.
 
-  **Not yet tested** with real routers, EAP/PEAP or real SMS/SMTP providers: try them on a
-  test router first.
+  **Not yet tested** with real routers, EAP/PEAP, live M-Pesa money or real SMS/SMTP
+  providers: try them on a test router and with one real payment first.
+- **Browser tests cover only the money screens** (sign-in, customers, billing, payments).
+  The other screens are checked by hand; the API behind all of them is tested automatically
+  (see [Tests](#tests)).
 
 Known gaps and planned work: [docs/ARCHITECTURE.md §10](docs/ARCHITECTURE.md) and
 [docs/phase.md](docs/phase.md).

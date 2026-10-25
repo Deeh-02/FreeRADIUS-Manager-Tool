@@ -816,6 +816,7 @@ accurate. The ones below are fixed; each test fails on the code before its fix (
 | R25 | Medium | With two tabs open, both refreshing at once: refresh tokens now work once (R8), the loser signed out, and signing out ended the session for both. | **Fixed.** On a refused refresh the UI waits a second and carries on with the pair the other tab stored. Not covered by an automated test. |
 | R26 | Low | nginx's error log, which cannot mask, wrote the callback address (secret included) when the backend was down. | **Fixed.** `/api/v1/pay/` logs only critical nginx errors. Checked by `scripts/docker-smoke.sh` with the backend stopped. |
 | R27 | Low | Scheduled tasks' next run and the due date of invoices raised for M-Pesa payments came from Go's clock (the B33 trap): with the app in UTC and the database in Nairobi, hourly tasks ran every tick. | **Fixed.** Set by the database. |
+| R29 | Medium | Some handlers still answered success after a failed or empty write: enabling MFA ("enabled" while the account kept a password only), saving the MFA secret, portal sign-out (session still valid), the flag that stops a 100%-discount invoice granting its days twice, setup's settings, and deleting or acknowledging alerts, alert rules, portals, promotions, scans and templates. Organisation and zone deletes unlinked first, outside a transaction. | **Fixed.** Checked; deletes in one transaction. In `TestWritesThatChangeNothingSaySo` and `TestMFAEnableReportsFailedSave` (old code: "MFA enabled successfully" with nothing saved). Writes to logs (honeypot, webhook, SMS, alert history) stay best-effort. Reported 25 Oct 2026. |
 | R28 | High (testing) | `make test-integration`/`test-e2e` passed with every test skipped when the scratch database was already running (its "already running" line was run as a command and the start failed silently), and the scratch database hid migration errors. | **Fixed.** A failed start fails the run; the scratch database uses `scripts/initdb-migrations.sh`, the fresh-install path. |
 
 **Not fixed, by decision or for later:** data used by a session already open when a customer
@@ -833,7 +834,7 @@ belong to setting up the real server ([10.6](#106-still-to-do-before-relying-on-
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| Q1 | High | No automated tests or CI. | **Fixed.** Tests for billing, the API (every route fuzzed), FreeRADIUS, failures and the Docker images ([10.8](#108-automated-billing-tests)), run by CI on every push (`.github/workflows/ci.yml`). **Open:** browser tests of the screens. |
+| Q1 | High | No automated tests or CI. | **Fixed.** Tests for billing, the API (every route fuzzed), FreeRADIUS, failures and the Docker images ([10.8](#108-automated-billing-tests)), run by CI on every push (`.github/workflows/ci.yml`), and browser tests of the money screens (`frontend/e2e`: a customer on a plan, paying on Billing, editing after a payment arrived, reversing on Payments; the B31 test fails with the old form). **Open:** browser tests of the other screens. |
 | Q8 | High | Every billing step that reads a setting (grace days, due days) opened a second database connection while already holding one in a transaction. With enough simultaneous payments every connection waited for another, and the backend froze. | **Fixed.** Settings are held in memory and refreshed every 15 seconds; a lookup never touches the database. Found when 100 simultaneous requests hung the test run. |
 | Q9 | High | A database blip (restart, network hiccup) signed every member of staff out at once: the session check could not reach the database and answered 401 "session expired or signed out", which the UI treats as a logout. | **Fixed.** It answers 503 "database not reachable, try again" (`DB_UNAVAILABLE`, `Retry-After`) and the session survives. Same for API keys. Tested by stopping PostgreSQL. |
 | Q10 | High | Billing days come from the database's clock zone and the cut-off from FreeRADIUS's. With a managed database in UTC (Supabase) and a Kenyan ISP, payments between midnight and 03:00 were counted from yesterday and expiry ran 3 hours late; a FreeRADIUS left in UTC keeps customers online until 03:00. | **Fixed for the backend:** it sets its database sessions to `DB_TIMEZONE`/`PGTZ`/`TZ`, refuses an invalid zone name, and logs an error at startup if its date or UTC offset differs from the database's. FreeRADIUS must still be given the same `TZ` (Compose does). Tested with a fake clock across midnight (`midnight_test.go`). |
@@ -886,7 +887,8 @@ belong to setting up the real server ([10.6](#106-still-to-do-before-relying-on-
 3. **CI** ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs on every push: the
    database tests, the whole-system tests with a real FreeRADIUS, the frontend tests and build,
    and the real Docker images ([`scripts/docker-smoke.sh`](../scripts/docker-smoke.sh)), all in
-   Africa/Nairobi. Still missing: browser tests of the screens.
+   Africa/Nairobi, and browser tests of the money screens (`frontend/e2e`). Still missing:
+   browser tests of the other screens.
 4. **M-Pesa against the real sandbox** (B7), then production keys: [CLOUD-TEST.md](CLOUD-TEST.md).
 5. **Tax/VAT and exact-decimal money** (B8), if your jurisdiction needs invoices with tax.
 6. **Real multi-tenancy** (S9), if you plan to resell.

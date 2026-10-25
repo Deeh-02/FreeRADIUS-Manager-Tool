@@ -193,7 +193,10 @@ func (h *Handler) DeleteCaptivePortal(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM captive_portals WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM captive_portals WHERE id=$1`, id)
+	if !writeOK(c, res, err, "portal") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "portal deleted"})
 }
 

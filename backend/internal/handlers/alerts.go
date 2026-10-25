@@ -155,7 +155,10 @@ func (h *Handler) DeleteAlertRule(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM alert_rules WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM alert_rules WHERE id=$1`, id)
+	if !writeOK(c, res, err, "alert rule") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "alert rule deleted"})
 }
 

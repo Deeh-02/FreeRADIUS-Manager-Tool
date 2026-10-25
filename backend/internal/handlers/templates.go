@@ -142,7 +142,10 @@ func (h *Handler) DeleteTemplate(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM radius_templates WHERE id=$1`, id)
+	res, err := h.db.Exec(`DELETE FROM radius_templates WHERE id=$1`, id)
+	if !writeOK(c, res, err, "template") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "template deleted"})
 }
 

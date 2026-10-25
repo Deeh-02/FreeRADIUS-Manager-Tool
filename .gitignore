@@ -33,3 +33,7 @@ backups/
 
 # Compiled backend binary (built by the Dockerfile or `go build`)
 backend/radius-manager
+
+# Playwright output
+frontend/test-results/
+frontend/playwright-report/

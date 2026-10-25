@@ -629,7 +629,11 @@ func assignPlanTx(q dbtx, userID int, username string, planID int, startNow bool
 			if err != nil {
 				return nil, err
 			}
-			q.Exec(`UPDATE invoices SET service_applied = TRUE, applied_days = $1, period_end = $2 WHERE id = $3`, days, exp, inv.ID)
+			// service_applied is what stops these days being granted twice.
+			if _, err := q.Exec(`UPDATE invoices SET service_applied = TRUE, applied_days = $1, period_end = $2 WHERE id = $3`,
+				days, exp, inv.ID); err != nil {
+				return nil, err
+			}
 			res.Expiry = &exp
 		}
 		res.Message = fmt.Sprintf("plan '%s' assigned to %s; invoice %s fully discounted", p.Name, username, inv.Number)

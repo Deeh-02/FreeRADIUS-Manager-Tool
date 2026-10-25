@@ -242,7 +242,10 @@ func (h *Handler) DeleteNetworkScan(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid scan ID")
 		return
 	}
-	h.db.Exec(`DELETE FROM network_scans WHERE id = $1`, id)
+	res, err := h.db.Exec(`DELETE FROM network_scans WHERE id = $1`, id)
+	if !writeOK(c, res, err, "scan") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "scan deleted"})
 }
 

@@ -372,7 +372,11 @@ func (h *Handler) MFASetup(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`UPDATE app_users SET mfa_secret = $1 WHERE id = $2`, key.Secret(), claims.UserID)
+	// Checked: an unsaved secret would leave the authenticator app with codes nobody accepts.
+	if _, err := h.db.Exec(`UPDATE app_users SET mfa_secret = $1 WHERE id = $2`, key.Secret(), claims.UserID); err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to save MFA secret")
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"secret":   key.Secret(),
@@ -406,7 +410,11 @@ func (h *Handler) MFAVerify(c *gin.Context) {
 		return
 	}
 
-	h.db.Exec(`UPDATE app_users SET mfa_enabled = TRUE WHERE id = $1`, claims.UserID)
+	// "Enabled" must mean enabled: the account is otherwise still protected by a password only.
+	res, err := h.db.Exec(`UPDATE app_users SET mfa_enabled = TRUE WHERE id = $1`, claims.UserID)
+	if !writeOK(c, res, err, "account") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "MFA enabled successfully"})
 }
 

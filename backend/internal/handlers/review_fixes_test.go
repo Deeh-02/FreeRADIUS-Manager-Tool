@@ -16,6 +16,7 @@ import (
 	"github.com/freeradius-manager/backend/internal/database"
 	"github.com/freeradius-manager/backend/internal/middleware"
 	"github.com/gin-gonic/gin"
+	"github.com/pquerna/otp/totp"
 )
 
 // Fixes from the external review of 2026-10-25 (ARCHITECTURE.md §10, R-items). Each test
@@ -461,6 +462,9 @@ func TestWritesThatChangeNothingSaySo(t *testing.T) {
 	for name, fn := range map[string]gin.HandlerFunc{
 		"revoke API key": h.RevokeAPIKey, "delete customer": h.DeleteCustomer, "delete zone": h.DeleteZone,
 		"delete organization": h.DeleteOrganization, "unblock IP": h.UnblockIP,
+		"acknowledge alert": h.AcknowledgeAlert, "delete alert": h.DeleteAlert, "delete alert rule": h.DeleteAlertRule,
+		"delete portal": h.DeleteCaptivePortal, "delete promotion": h.DeletePromotion,
+		"delete scan": h.DeleteNetworkScan, "delete template": h.DeleteTemplate,
 	} {
 		if code, _ := callHandler(fn, missing, nil, nil); code != 404 {
 			t.Errorf("%s with an unknown ID: %d, want 404", name, code)
@@ -654,5 +658,22 @@ func TestStaffAndMpesaPaymentsDoNotDeadlock(t *testing.T) {
 	// owed, which is right. A deadlock is not.
 	if err := <-staffDone; err != nil && err != errOverpayment {
 		t.Errorf("staff payment: %v", err)
+	}
+}
+
+// R29: "MFA enabled" was answered even when the save failed, leaving the account on a
+// password alone.
+func TestMFAEnableReportsFailedSave(t *testing.T) {
+	db := resetTestDB(t)
+	h := newTestHandler(t)
+	secret := "JBSWY3DPEHPK3PXP"
+	mustExec(t, db, `UPDATE app_users SET mfa_secret = $1, mfa_enabled = FALSE WHERE username = 'staff'`, secret)
+	code, _ := totp.GenerateCode(secret, time.Now())
+	// The save does not happen (a trigger cancels it, as a lost row or failed write would).
+	mustExec(t, db, `CREATE OR REPLACE FUNCTION refuse_mfa() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`)
+	mustExec(t, db, `CREATE TRIGGER refuse_mfa BEFORE UPDATE ON app_users FOR EACH ROW WHEN (NEW.mfa_enabled) EXECUTE FUNCTION refuse_mfa()`)
+	defer db.Exec(`DROP TRIGGER IF EXISTS refuse_mfa ON app_users`)
+	if status, resp := callHandler(h.MFAVerify, nil, nil, map[string]interface{}{"code": code}); status == 200 {
+		t.Errorf("MFA reported enabled although nothing was saved: %v", resp)
 	}
 }

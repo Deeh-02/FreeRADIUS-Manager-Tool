@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"net/http"
 	"time"
 
@@ -126,8 +127,15 @@ func (h *Handler) DeleteZone(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE nas SET zone_id=NULL WHERE zone_id=$1`, id)
-	res, err := h.db.Exec(`DELETE FROM hotspot_zones WHERE id=$1`, id)
+	var res sql.Result
+	err = h.inTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE nas SET zone_id=NULL WHERE zone_id=$1`, id); err != nil {
+			return err
+		}
+		var err error
+		res, err = tx.Exec(`DELETE FROM hotspot_zones WHERE id=$1`, id)
+		return err
+	})
 	if !writeOK(c, res, err, "zone") {
 		return
 	}

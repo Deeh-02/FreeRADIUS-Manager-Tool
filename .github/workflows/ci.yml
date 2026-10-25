@@ -3,6 +3,7 @@
 #   e2e      - the whole system on the runner: real FreeRADIUS, the backend binary in production
 #              mode, crash and outage tests, the fuzz of every route (make test-e2e)
 #   frontend - unit tests and the production build
+#   browser  - the screens that write money, dates and access, in Chromium (frontend/e2e)
 #   docker   - the real images with docker compose on an empty database (scripts/docker-smoke.sh)
 # Everything runs in Africa/Nairobi: most timestamps are wall-clock time without a zone, and
 # UTC hides the bugs that come from mixing clocks (ARCHITECTURE.md B30, B33, R10).
@@ -76,6 +77,42 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - working-directory: frontend
         run: npm ci && npm test && npm run build
+
+  browser:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: PostgreSQL and FreeRADIUS
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq postgresql freeradius freeradius-postgresql freeradius-utils
+          sudo systemctl stop freeradius || true
+      - name: Backend stack
+        run: |
+          env=$(scripts/test-stack.sh start)
+          eval "$env"
+          test -n "$TEST_API_URL"
+      - name: Browser tests (money, dates and access forms)
+        working-directory: frontend
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run test:browser
+      - name: Screenshots and traces of failures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-test-results
+          path: frontend/test-results/
 
   docker:
     runs-on: ubuntu-24.04

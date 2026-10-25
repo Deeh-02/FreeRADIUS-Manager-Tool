@@ -97,7 +97,10 @@ func (h *Handler) AcknowledgeAlert(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE security_alerts SET is_acknowledged=TRUE WHERE id=$1`, id)
+	res, err := h.db.Exec(`UPDATE security_alerts SET is_acknowledged=TRUE WHERE id=$1`, id)
+	if !writeOK(c, res, err, "alert") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "alert acknowledged"})
 }
 
@@ -114,8 +117,15 @@ func (h *Handler) AcknowledgeAllAlerts(c *gin.Context) {
 
 // DeleteAlert removes a single alert.
 func (h *Handler) DeleteAlert(c *gin.Context) {
-	id, _ := mustInt(c, "id")
-	h.db.Exec(`DELETE FROM security_alerts WHERE id=$1`, id)
+	id, err := mustInt(c, "id")
+	if err != nil {
+		respondError(c, http.StatusBadRequest, "invalid ID")
+		return
+	}
+	res, err := h.db.Exec(`DELETE FROM security_alerts WHERE id=$1`, id)
+	if !writeOK(c, res, err, "alert") {
+		return
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "alert deleted"})
 }
 

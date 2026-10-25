@@ -270,7 +270,11 @@ func portalMpesaInfo(username string) gin.H {
 func (h *Handler) PortalLogout(c *gin.Context) {
 	token := c.GetHeader("X-Portal-Token")
 	if token != "" {
-		h.db.Exec(`DELETE FROM portal_sessions WHERE token=$1`, token)
+		// A failed delete leaves the session usable: say so rather than "logged out".
+		if _, err := h.db.Exec(`DELETE FROM portal_sessions WHERE token=$1`, token); err != nil {
+			respondError(c, http.StatusInternalServerError, "could not sign out; try again")
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "logged out"})
 }

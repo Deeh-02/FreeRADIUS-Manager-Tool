@@ -152,8 +152,12 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 	}
 
 	// Upsert all settings
+	var upsertErr error
 	upsert := func(key, value, desc string) {
-		tx.Exec(`
+		if upsertErr != nil {
+			return
+		}
+		_, upsertErr = tx.Exec(`
 			INSERT INTO system_settings (key, value, description)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
@@ -171,6 +175,11 @@ func (h *Handler) SetupComplete(c *gin.Context) {
 	upsert("mfa_required", strconv.FormatBool(req.Security.MFARequired), "Require MFA for admin users")
 	upsert("brute_force_attempts", strconv.Itoa(req.Security.BruteForceAttempts), "Failed attempts before lockout")
 	upsert("max_device_limit", strconv.Itoa(req.RADIUS.MaxDevices), "Max devices per RADIUS user")
+	if upsertErr != nil {
+		h.log.WithError(upsertErr).Error("setup: save settings")
+		respondError(c, http.StatusInternalServerError, "failed to save settings")
+		return
+	}
 
 	if err = tx.Commit(); err != nil {
 		respondError(c, http.StatusInternalServerError, "failed to save setup")

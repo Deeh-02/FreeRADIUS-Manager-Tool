@@ -153,10 +153,20 @@ func (h *Handler) DeleteOrganization(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "invalid ID")
 		return
 	}
-	h.db.Exec(`UPDATE radius_users SET org_id=NULL WHERE org_id=$1`, id)
-	h.db.Exec(`UPDATE nas SET org_id=NULL WHERE org_id=$1`, id)
-	h.db.Exec(`UPDATE app_users SET org_id=NULL WHERE org_id=$1`, id)
-	res, err := h.db.Exec(`DELETE FROM organizations WHERE id=$1`, id)
+	// Unlinking and deleting together: a failure part-way used to leave customers unlinked
+	// from an organisation that still existed.
+	var res sql.Result
+	err = h.inTx(func(tx *sql.Tx) error {
+		for _, q := range []string{`UPDATE radius_users SET org_id=NULL WHERE org_id=$1`,
+			`UPDATE nas SET org_id=NULL WHERE org_id=$1`, `UPDATE app_users SET org_id=NULL WHERE org_id=$1`} {
+			if _, err := tx.Exec(q, id); err != nil {
+				return err
+			}
+		}
+		var err error
+		res, err = tx.Exec(`DELETE FROM organizations WHERE id=$1`, id)
+		return err
+	})
 	if !writeOK(c, res, err, "organization") {
 		return
 	}
