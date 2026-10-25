@@ -282,6 +282,12 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 		paid           float64
 	}
 	if in.InvoiceID != nil {
+		// Customer first, then invoice: the order the M-Pesa and plan paths lock in. The other
+		// way round, a staff payment and an M-Pesa payment for the same customer at the same
+		// moment deadlocked and one of them failed.
+		if err := lockInvoiceCustomer(q, *in.InvoiceID); err != nil {
+			return nil, err
+		}
 		err := q.QueryRow(`SELECT amount, currency, status, username, user_id, plan_id, service_applied, plan_days
 			FROM invoices WHERE id = $1 FOR UPDATE`, *in.InvoiceID).
 			Scan(&inv.amount, &inv.currency, &inv.status, &inv.username, &inv.userID, &inv.planID, &inv.serviceApplied, &inv.planDays)
@@ -407,6 +413,19 @@ func recordPaymentTx(q dbtx, in paymentInput) (*paymentOutcome, error) {
 // reversePaymentTx marks a payment reversed (it is kept for the record). If that leaves its
 // invoice unpaid, the invoice re-opens and the period it granted is taken back.
 func reversePaymentTx(q dbtx, paymentID int, by *int, reason string) (string, error) {
+	// Customer first (see recordPaymentTx), then payment and invoice.
+	var custID sql.NullInt64
+	if err := q.QueryRow(`SELECT COALESCE(i.user_id, ru.id) FROM payments p
+		LEFT JOIN invoices i ON i.id = p.invoice_id
+		LEFT JOIN radius_users ru ON ru.username = p.username
+		WHERE p.id = $1`, paymentID).Scan(&custID); err != nil && err != sql.ErrNoRows {
+		return "", err
+	}
+	if custID.Valid {
+		if err := lockUser(q, int(custID.Int64)); err != nil && err != sql.ErrNoRows {
+			return "", err
+		}
+	}
 	var status, username string
 	var invoiceID sql.NullInt64
 	err := q.QueryRow(`SELECT status, COALESCE(username, ''), invoice_id FROM payments WHERE id = $1 FOR UPDATE`, paymentID).
@@ -467,6 +486,32 @@ type assignResult struct {
 	Invoice   string
 	Amount    float64
 	Expiry    *time.Time
+}
+
+// dbToday is today's date by the database's clock, the one CURRENT_DATE comparisons use (an
+// invoice due "today" by Go's clock in UTC was already a day overdue in Nairobi after midnight).
+func dbToday(q dbtx) (time.Time, error) {
+	var d time.Time
+	err := q.QueryRow(`SELECT CURRENT_DATE`).Scan(&d)
+	return d, err
+}
+
+// lockInvoiceCustomer takes the row lock of the customer an invoice belongs to, if any.
+func lockInvoiceCustomer(q dbtx, invoiceID int) error {
+	var uid sql.NullInt64
+	if err := q.QueryRow(`SELECT user_id FROM invoices WHERE id = $1`, invoiceID).Scan(&uid); err != nil {
+		if err == sql.ErrNoRows {
+			return nil // reported as "invoice not found" by the caller
+		}
+		return err
+	}
+	if !uid.Valid {
+		return nil
+	}
+	if err := lockUser(q, int(uid.Int64)); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	return nil
 }
 
 // lockUser takes the customer's row lock for the rest of the transaction. Anything that

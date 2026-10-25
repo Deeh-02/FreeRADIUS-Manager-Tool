@@ -130,14 +130,15 @@ func (h *Handler) UpdateTaskSchedule(c *gin.Context) {
 		respondError(c, http.StatusBadRequest, "schedule must be hourly, daily or weekly")
 		return
 	}
-	nextRun := nextRunTime(req.Schedule)
-	res, err := h.db.Exec(`UPDATE scheduled_tasks SET schedule=$1, next_run=$2 WHERE id=$3`, req.Schedule, nextRun, id)
-	if err != nil {
-		respondError(c, http.StatusInternalServerError, "failed to update schedule")
+	var nextRun string
+	err = h.db.QueryRow(`UPDATE scheduled_tasks SET schedule=$1, next_run=NOW() + $2::interval WHERE id=$3
+		RETURNING TO_CHAR(next_run, 'YYYY-MM-DD"T"HH24:MI:SS')`, req.Schedule, nextRunInterval(req.Schedule), id).Scan(&nextRun)
+	if err == sql.ErrNoRows {
+		respondError(c, http.StatusNotFound, "task not found")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		respondError(c, http.StatusNotFound, "task not found")
+	if err != nil {
+		respondError(c, http.StatusInternalServerError, "failed to update schedule")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "schedule updated", "next_run": nextRun})
@@ -226,8 +227,8 @@ func runTaskList(db *database.DB, log *logrus.Logger, tasks []dueTask) {
 			db.Exec(`UPDATE scheduled_tasks SET next_run = NOW() WHERE id = $1`, t.id)
 			continue
 		}
-		db.Exec(`UPDATE scheduled_tasks SET last_run=NOW(), next_run=$1, last_result=$2 WHERE id=$3`,
-			nextRunTime(t.schedule), fmt.Sprintf("%s (%d)", result, count), t.id)
+		db.Exec(`UPDATE scheduled_tasks SET last_run=NOW(), next_run=NOW() + $1::interval, last_result=$2 WHERE id=$3`,
+			nextRunInterval(t.schedule), fmt.Sprintf("%s (%d)", result, count), t.id)
 		log.Infof("Scheduler: ran '%s' — %s (%d)", t.taskType, result, count)
 	}
 }
@@ -627,7 +628,7 @@ func sendExpiryReminders(db *database.DB, log *logrus.Logger) (string, int) {
 	}
 	rows.Close()
 
-	sent := 0
+	sent, mailFailures := 0, 0
 	for _, c := range list {
 		msg := strings.NewReplacer("{username}", c.user, "{expiry}", c.expiry.Format("2006-01-02"),
 			"{amount}", c.amount, "{plan}", c.plan, "{org}", org).Replace(tmpl)
@@ -642,10 +643,14 @@ func sendExpiryReminders(db *database.DB, log *logrus.Logger) (string, int) {
 			}
 			logSMS(db, c.phone, msg, status, ref, c.user)
 		}
-		if email && c.mail != "" {
+		// After three failures in a row the mail server is taken to be down for this run, so a
+		// long list does not cost the timeout once per customer (the reminders go next run).
+		if email && c.mail != "" && mailFailures < 3 {
 			if err := sendEmail(c.mail, "Your internet subscription expires on "+c.expiry.Format("2 Jan 2006"), msg); err == nil {
 				ok = true
+				mailFailures = 0
 			} else {
+				mailFailures++
 				log.WithError(err).Warnf("reminder email to %s", c.user)
 			}
 		}
@@ -657,13 +662,16 @@ func sendExpiryReminders(db *database.DB, log *logrus.Logger) (string, int) {
 	return fmt.Sprintf("%d reminder(s) sent", sent), sent
 }
 
-func nextRunTime(schedule string) time.Time {
+// nextRunInterval is how long after now a task runs again. next_run is a TIMESTAMP compared
+// with the database's NOW(), so it is set from the same clock: from Go's, with the app in UTC
+// and the database in Nairobi, an hourly task ran on every 10-minute tick.
+func nextRunInterval(schedule string) string {
 	switch schedule {
 	case "hourly":
-		return time.Now().Add(1 * time.Hour)
+		return "1 hour"
 	case "weekly":
-		return time.Now().AddDate(0, 0, 7)
+		return "7 days"
 	default: // daily
-		return time.Now().AddDate(0, 0, 1)
+		return "1 day"
 	}
 }

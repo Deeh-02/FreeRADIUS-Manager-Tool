@@ -642,7 +642,10 @@ func applyMpesaMoney(q dbtx, username string, invoiceID *int, amount float64, re
 				break
 			}
 			pid, pname, days := p.ID, p.Name, p.ValidityDays
-			today := time.Now()
+			today, err := dbToday(q)
+			if err != nil {
+				return ids, err
+			}
 			inv, err := createInvoiceTx(q, newInvoice{UserID: &uid, Username: username, PlanID: &pid, PlanName: &pname,
 				Amount: p.Price, Currency: "KES", DueDate: &today, PlanDays: &days,
 				Notes: "raised for M-Pesa payment " + receipt, CreatedBy: by})
@@ -1467,7 +1470,11 @@ func (h *Handler) invoiceToPay(uid int, username string, planID sql.NullInt64) (
 	if err != nil || !p.IsActive || p.Price <= 0 {
 		return 0, errors.New("your plan cannot be paid online; contact us")
 	}
-	pid, pname, days, today := p.ID, p.Name, p.ValidityDays, time.Now()
+	pid, pname, days := p.ID, p.Name, p.ValidityDays
+	today, err := dbToday(tx)
+	if err != nil {
+		return 0, err
+	}
 	inv, err := createInvoiceTx(tx, newInvoice{UserID: &uid, Username: username, PlanID: &pid, PlanName: &pname,
 		Amount: p.Price, Currency: p.Currency, DueDate: &today, PlanDays: &days, Notes: "raised from the customer portal"})
 	if err != nil {

@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"crypto/tls"
 	"fmt"
 	"mime"
+	"net"
 	"net/http"
 	"net/smtp"
 	"os"
@@ -179,9 +181,11 @@ func (h *Handler) SendTestEmail(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "test email sent to " + req.To})
 }
 
-// sendEmail sends a plain-text email using the SMTP settings from environment.
-// smtp.SendMail upgrades to STARTTLS when the server offers it; port 465 (implicit TLS) is
-// not supported, use 587.
+// sendEmail sends a plain-text email using the SMTP settings from environment. Port 465 is
+// implicit TLS; any other port upgrades to STARTTLS when the server offers it. The whole
+// exchange is bounded by smtpTimeout: emails are sent from the scheduler, and a server that
+// never answers (465 spoken to as plain SMTP, a provider blocking outbound mail) used to
+// hold it, and with it expiry, renewal invoices and backups, for as long as it liked.
 func sendEmail(to, subject, body string) error {
 	host := os.Getenv("SMTP_HOST")
 	if host == "" {
@@ -213,12 +217,70 @@ func sendEmail(to, subject, body string) error {
 		from, to, mime.QEncoding.Encode("utf-8", subject), time.Now().Format(time.RFC1123Z),
 		time.Now().UnixNano(), domain, strings.ReplaceAll(body, "\n", "\r\n"))
 
-	addr := host + ":" + port
 	var auth smtp.Auth
 	if user != "" {
 		auth = smtp.PlainAuth("", user, pass, host)
 	}
-	return smtp.SendMail(addr, auth, from, []string{to}, []byte(msg))
+	return smtpSend(host, port, auth, from, to, []byte(msg))
+}
+
+var smtpTimeout = 30 * time.Second
+
+// smtpSend is smtp.SendMail with a connect timeout, a deadline for the whole conversation and
+// implicit TLS on port 465.
+func smtpSend(host, port string, auth smtp.Auth, from, to string, msg []byte) error {
+	addr := net.JoinHostPort(host, port)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	tlsConf := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+	var conn net.Conn
+	var err error
+	if port == "465" {
+		conn, err = tls.DialWithDialer(dialer, "tcp", addr, tlsConf)
+	} else {
+		conn, err = dialer.Dial("tcp", addr)
+	}
+	if err != nil {
+		return err
+	}
+	conn.SetDeadline(time.Now().Add(smtpTimeout))
+	c, err := smtp.NewClient(conn, host)
+	if err != nil {
+		conn.Close()
+		return err
+	}
+	defer c.Close()
+	if port != "465" {
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(tlsConf); err != nil {
+				return err
+			}
+		}
+	}
+	if auth != nil {
+		if ok, _ := c.Extension("AUTH"); !ok {
+			return fmt.Errorf("smtp: server doesn't support AUTH")
+		}
+		if err := c.Auth(auth); err != nil {
+			return err
+		}
+	}
+	if err := c.Mail(from); err != nil {
+		return err
+	}
+	if err := c.Rcpt(to); err != nil {
+		return err
+	}
+	w, err := c.Data()
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(msg); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+	return c.Quit()
 }
 
 // StartAlertWorker launches a background goroutine that checks alert conditions

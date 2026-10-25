@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/freeradius-manager/backend/internal/settings"
 	"github.com/gin-gonic/gin"
 )
 
@@ -225,6 +226,8 @@ func (h *Handler) ServeCaptivePortal(c *gin.Context) {
 		if l := c.Query("link-login-only"); l != "" {
 			if u, err := url.Parse(l); err == nil && (u.Scheme == "http" || u.Scheme == "https") && routerLoginHost(h.db, u.Hostname()) {
 				p.LoginURL = l
+			} else {
+				h.log.Warnf("captive portal %d: refused link-login-only %q (not a router address; add its hostname to the portal_router_hosts setting or set the portal's login URL)", id, l)
 			}
 		}
 	}
@@ -375,8 +378,8 @@ func safeColor(c, def string) string {
 
 // routerLoginHost reports whether a link-login-only host can be the hotspot router itself: a
 // private, CGNAT or link-local address, a local name (no dot, .local, .lan, .home.arpa,
-// .internal), or a registered NAS. A hotspot whose login page has a public-looking DNS name
-// needs the portal's fixed login URL set instead.
+// .internal), a registered NAS, or a hostname staff listed in the portal_router_hosts setting
+// (for a hotspot whose login page has a public-looking DNS name).
 func routerLoginHost(q dbtx, host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
 	if host == "" {
@@ -387,8 +390,11 @@ func routerLoginHost(q dbtx, host string) bool {
 			return true
 		}
 	} else {
+		// A dot-less name such as "wifi" or "hotspot", starting with a letter: browsers read a
+		// bare number (134744072, 0x08080808) as an IPv4 address, which would let any public
+		// server through.
 		if !strings.Contains(host, ".") {
-			return true
+			return localName.MatchString(host)
 		}
 		for _, suffix := range []string{".local", ".lan", ".home.arpa", ".internal"} {
 			if strings.HasSuffix(host, suffix) {
@@ -396,9 +402,16 @@ func routerLoginHost(q dbtx, host string) bool {
 			}
 		}
 	}
+	for _, allowed := range strings.Split(settings.String("portal_router_hosts", "", ""), ",") {
+		if strings.ToLower(strings.TrimSuffix(strings.TrimSpace(allowed), ".")) == host {
+			return true
+		}
+	}
 	var known bool
 	q.QueryRow(`SELECT EXISTS (SELECT 1 FROM nas WHERE LOWER(nasname) = $1)`, host).Scan(&known)
 	return known
 }
+
+var localName = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 
 var cgnat = func() *net.IPNet { _, n, _ := net.ParseCIDR("100.64.0.0/10"); return n }()

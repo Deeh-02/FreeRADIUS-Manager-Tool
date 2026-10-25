@@ -1,0 +1,88 @@
+# Runs on every push and pull request. Four jobs, in parallel:
+#   backend  - go vet and every database test against a scratch PostgreSQL (scripts/test-db.sh)
+#   e2e      - the whole system on the runner: real FreeRADIUS, the backend binary in production
+#              mode, crash and outage tests, the fuzz of every route (make test-e2e)
+#   frontend - unit tests and the production build
+#   docker   - the real images with docker compose on an empty database (scripts/docker-smoke.sh)
+# Everything runs in Africa/Nairobi: most timestamps are wall-clock time without a zone, and
+# UTC hides the bugs that come from mixing clocks (ARCHITECTURE.md B30, B33, R10).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TZ: Africa/Nairobi
+  PGTZ: Africa/Nairobi
+  GO_VERSION: "1.27"
+
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+      - name: PostgreSQL server binaries
+        run: sudo apt-get update -q && sudo apt-get install -yq postgresql
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+      - name: Tests against a scratch database
+        working-directory: backend
+        run: |
+          env=$(../scripts/test-db.sh start)   # a failed start stops here (eval would not)
+          eval "$env"
+          test -n "$TEST_DATABASE_URL"
+          go test ./... -count=1 -p 1 -timeout 30m
+
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: backend/go.sum
+      - name: PostgreSQL and FreeRADIUS
+        # The package starts its own FreeRADIUS, whose inner tunnel listens on 127.0.0.1:18120,
+        # the port the test server uses. Only the test server may run.
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq postgresql freeradius freeradius-postgresql freeradius-utils
+          sudo systemctl stop freeradius || true
+          sudo systemctl disable freeradius || true
+      - name: Whole system, failure and fuzz tests
+        working-directory: backend
+        run: make test-e2e
+
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - working-directory: frontend
+        run: npm ci && npm test && npm run build
+
+  docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts parse
+        run: for f in *.sh scripts/*.sh freeradius/init.sh; do bash -n "$f"; done
+      - name: Real images, empty database
+        run: SHOW_LOGS=1 scripts/docker-smoke.sh

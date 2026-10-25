@@ -104,6 +104,20 @@ api.interceptors.response.use(
           originalRequest.headers.Authorization = `Bearer ${data.access_token}`
           return api(originalRequest)
         } catch (refreshError) {
+          // Each refresh token works once. Another tab that refreshed at the same moment won,
+          // and has stored the new pair (or is about to): carry on with it. Signing out here
+          // would end the session for every tab, the winner's too.
+          if (refreshError.response?.status === 401) {
+            await new Promise((r) => setTimeout(r, 1000))
+            const latest = localStorage.getItem('refresh_token')
+            const token = localStorage.getItem('access_token')
+            if (latest && latest !== refreshToken && token) {
+              api.defaults.headers.common.Authorization = `Bearer ${token}`
+              processQueue(null, token)
+              originalRequest.headers.Authorization = `Bearer ${token}`
+              return api(originalRequest)
+            }
+          }
           processQueue(refreshError, null)
           const authStore = useAuthStore()
           authStore.logout()

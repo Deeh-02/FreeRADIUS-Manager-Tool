@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"database/sql"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -436,11 +437,18 @@ func TestPortalFormOnlyPostsToARouter(t *testing.T) {
 		"https://evil.example.com/harvest":     false,
 		"http://198.51.100.20/login":           false,
 		"https://10.5.50.1.evil.example/login": false,
+		"http://134744072/login":               false, // 8.8.8.8 written as one number
+		"http://0x08080808/login":              false,
+		"http://hotspot.myisp.co.ke/login":     false, // until listed in portal_router_hosts
 	} {
 		posts := strings.Contains(page(link), `action="`+link+`"`)
 		if posts != ok {
 			t.Errorf("link-login-only=%s: form posts there = %v, want %v", link, posts, ok)
 		}
+	}
+	setTestSettings(t, db, map[string]string{"portal_router_hosts": "login.wifi, Hotspot.MyISP.co.ke"})
+	if link := "http://hotspot.myisp.co.ke/login"; !strings.Contains(page(link), `action="`+link+`"`) {
+		t.Error("a hostname listed in portal_router_hosts is refused")
 	}
 }
 
@@ -563,5 +571,88 @@ func TestGraceDaysChangeReachesTheRouter(t *testing.T) {
 	}
 	if got := expiration("owngrace"); got != ownBefore {
 		t.Errorf("a customer with their own grace changed from %q to %q", ownBefore, got)
+	}
+}
+
+// R22: email had no timeout and is sent from the scheduler, so a mail server that accepts the
+// connection and never answers (port 465 spoken to as plain SMTP) stopped expiry, renewal
+// invoices and backups with it.
+func TestEmailToSilentServerTimesOut(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // accepts and says nothing
+		}
+	}()
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	t.Setenv("SMTP_HOST", host)
+	t.Setenv("SMTP_PORT", port)
+	saved := smtpTimeout
+	smtpTimeout = time.Second
+	defer func() { smtpTimeout = saved }()
+	done := make(chan error, 1)
+	go func() { done <- sendEmail("someone@example.com", "hello", "body") }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("an email to a server that never answered was reported sent")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("sendEmail still waiting after 10 s on a silent server")
+	}
+}
+
+// R23: a staff payment locked the invoice and then the customer; an M-Pesa payment for the same
+// customer locks the customer and then the invoice. At the same moment, the two deadlocked and
+// PostgreSQL aborted one.
+func TestStaffAndMpesaPaymentsDoNotDeadlock(t *testing.T) {
+	db := resetTestDB(t)
+	plan := seedPlan(t, db, "Monthly", 100, 30)
+	uid := seedUser(t, db, "both", intPtr(-1))
+	mustExec(t, db, `UPDATE radius_users SET plan_id = $1 WHERE id = $2`, plan.ID, uid)
+	inv := seedInvoice(t, db, uid, "both", plan, 100)
+	mustExec(t, db, `UPDATE invoices SET currency = 'KES' WHERE id = $1`, inv) // M-Pesa pays KES invoices only
+
+	mpesa, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mpesa.Rollback()
+	if err := lockUser(mpesa, uid); err != nil { // the M-Pesa path's first step
+		t.Fatal(err)
+	}
+	staffDone := make(chan error, 1)
+	go func() {
+		tx, err := db.Begin()
+		if err != nil {
+			staffDone <- err
+			return
+		}
+		defer tx.Rollback()
+		if _, err := recordPaymentTx(tx, paymentInput{InvoiceID: &inv, Amount: 100, PaymentMethod: "cash"}); err != nil {
+			staffDone <- err
+			return
+		}
+		staffDone <- tx.Commit()
+	}()
+	time.Sleep(300 * time.Millisecond) // the staff payment is now waiting on a lock
+	if _, err := applyMpesaMoney(mpesa, "both", &inv, 40, "QDEADLOCK1", "254700000001", nil); err != nil {
+		t.Errorf("M-Pesa payment: %v", err)
+	}
+	if err := mpesa.Commit(); err != nil {
+		t.Errorf("M-Pesa commit: %v", err)
+	}
+	// The staff payment now waits for the M-Pesa one and is then refused as more than is still
+	// owed, which is right. A deadlock is not.
+	if err := <-staffDone; err != nil && err != errOverpayment {
+		t.Errorf("staff payment: %v", err)
 	}
 }

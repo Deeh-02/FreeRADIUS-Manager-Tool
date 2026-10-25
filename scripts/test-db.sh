@@ -24,7 +24,7 @@ OPTS="-p $PORT -c unix_socket_directories= -c fsync=off -c max_connections=200 -
 case "${1:-}" in
   start)
     if "$BIN/pg_isready" -h 127.0.0.1 -p "$PORT" >/dev/null 2>&1; then
-      echo "already running on port $PORT"
+      echo "already running on port $PORT" >&2   # stdout is eval'd by callers
     else
       rm -rf "$DIR"
       "$BIN/initdb" -D "$DIR" -U postgres --auth=trust >/dev/null
@@ -39,10 +39,10 @@ case "${1:-}" in
         -o "$OPTS" start >/dev/null
       psql_t -c "CREATE DATABASE radius_test"
       psql_t -d radius_test -f "$ROOT/init-db.sql" >/dev/null 2>&1
-      for f in "$ROOT"/migrations/*.sql; do
-        case "$f" in *008_network_scanner.sql) continue ;; esac  # already part of init-db.sql
-        psql_t -d radius_test -f "$f" >/dev/null 2>&1
-      done
+      # The same path as a fresh Docker install: every migration once, recorded, and a failing
+      # one stops the start (its errors used to be hidden).
+      PGHOST=127.0.0.1 PGPORT="$PORT" POSTGRES_USER=postgres POSTGRES_DB=radius_test MIGRATIONS_DIR="$ROOT/migrations" \
+        "$ROOT/scripts/initdb-migrations.sh" >/dev/null
     fi
     echo "export TEST_DATABASE_URL=\"$URL\""
     ;;
