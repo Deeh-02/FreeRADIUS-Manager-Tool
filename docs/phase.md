@@ -11,10 +11,19 @@ done in code and tested against real PostgreSQL and FreeRADIUS. Billing now cont
 - a customer who doesn't pay is refused after their paid-until date
 - paying lets them back on
 
-Since then the billing code has automated tests (concurrency, a 560-day time simulation, edge
-cases: [ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)). They found and
-fixed about ten real bugs (B11–B19, Q8). **Passing them does not make it ready to deploy:** they
-cannot show how real routers, your server, your timezone and your staff behave. Order of work:
+Since then the code has been tested in layers (concurrency, a 560-day time simulation, edge
+cases: [ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)), and **CI runs all
+of them on every push** (`.github/workflows/ci.yml`, five jobs, all green on commit 4568ce0):
+
+- backend: `go vet` and every database test
+- e2e: real FreeRADIUS, crash and outage tests, a fuzz of every route
+- frontend: unit tests and the production build
+- browser: the screens that write money, dates and access, in Chromium
+- docker: the real images on an empty database
+
+Testing and two outside reviews found and fixed dozens of real bugs (B11–B36, Q8, R1–R29; see
+[ARCHITECTURE.md § 10.4.1](ARCHITECTURE.md)). **Passing them does not make it ready to deploy:**
+they cannot show how real routers, your server, your timezone and your staff behave. Order of work:
 
 - your decisions (Phase 0)
 - a trial on real hardware, including failure and load tests (Phase A)
@@ -60,6 +69,28 @@ The full list is at the end of [ARCHITECTURE.md § 10.5](ARCHITECTURE.md#105-qua
 
 ---
 
+## Done since 1.1: tests and outside reviews
+
+| What | Result |
+|---|---|
+| CI [Q1] | Five jobs on every push (see the top of this page). A test run that finishes in about a second means the database tests were silently skipped; CI checks `TEST_DATABASE_URL` is set. |
+| Docker images | Built and run in CI on an empty database (`scripts/docker-smoke.sh`): every container healthy, every migration recorded, setup wizard and sign-in through nginx, the real FreeRADIUS accepts a paid customer and rejects a wrong password, the M-Pesa callback secret stays out of the logs. |
+| Browser tests | `npm run test:browser`: sign in; create a customer on a plan (invoice raised); pay on Billing (30 days added); edit a customer after a renewal arrived with the page open (B31); reverse a payment. |
+| Outside reviews | A 42-item review was checked item by item (all accurate) and the chosen items fixed as R1–R29: crash on a database blip, payment/invoice races, lock order, refresh-token reuse, failed-login counting, portal redirects to non-router hosts, email timeouts, writes reported as saved when nothing changed. Each fix has a test that fails on the old code. |
+| Migrations | Each file is applied once and recorded in `schema_migrations`, on all four paths (Docker first start, `run-local.sh`, `deploy-update.sh`, `scripts/db-setup.sh`). |
+| Audit of ignored errors [D7] | Most handlers now report a failed or no-op write instead of "saved" (`writeOK`). |
+
+**Known and not fixed** (listed in [ARCHITECTURE.md § 10.4.1](ARCHITECTURE.md), none lose money
+silently):
+
+- early renewal leaves an open session's data uncounted
+- the portal shows 30 days of usage, not the current period
+- organisation and CRM revenue reports mix currencies
+- password expiry, forced password change, zone `max_clients` and bursts are stored but not enforced
+- most database queries have no deadline
+
+---
+
 ## Phase 0: your decisions
 
 These were defaulted in code; all are changeable on the **Settings** page.
@@ -77,10 +108,14 @@ These were defaulted in code; all are changeable on the **Settings** page.
 - [ ] **Renewal invoices:** how many days before paid-until. Default: 3 (`renewal_invoice_days`).
 - [ ] **Overdue postpaid invoices block service?** Default: no (`suspend_overdue`).
 - [ ] **Reminders:** days before expiry and the message. Default: 3 days, SMS/email.
-- [ ] **How customers pay:** staff-recorded, M-Pesa prompts (staff or portal) and paybill/till. M-Pesa is built and tested against a fake Daraja; choose paybill or till, and run the sandbox test ([CLOUD-TEST.md](CLOUD-TEST.md)).
+- [ ] **How customers pay:** staff-recorded, M-Pesa prompts (staff or portal) and paybill/till. M-Pesa is built and tested against a fake Daraja and the Daraja sandbox ([CLOUD-TEST.md](CLOUD-TEST.md)); choose paybill or till.
 - [x] **Currency:** **KES** (new installs and new rows default to KES; existing plans keep their
       currency, so check Plans after upgrading).
 - [ ] **Tax:** decide whether invoices need VAT (Phase C).
+- [ ] **Changing plan mid-period:** (a) the new plan starts at the next renewal, (b) leftover days
+      are converted at the new price, or (c) keep today's behaviour.
+- [ ] **Portal M-Pesa prompt:** restrict it to the customer's own phone number?
+- [ ] **Deleting and re-creating a customer:** should it give a new free trial? (Today it does.)
 - [x] **Deleting a customer** [B20]: **decided and built.** Prepaid means nothing is owed, so
       unpaid invoices are cancelled with the customer. If an invoice has money on it or service
       was started on credit, the delete is refused until staff refund, collect or write it off.
@@ -99,9 +134,10 @@ Do this on a test server that matches production, with one real router.
 
 | # | Task | Size |
 |---|---|---|
-| A.1 | Build and run the Docker images on a test server (`./setup.sh`); check every container is healthy; enable HTTPS with `COMPOSE_PROFILES=https`. Nothing in the Docker setup has been run yet. | S |
+| A.1 | Build and run the Docker images on a test server (`./setup.sh`); check every container is healthy; enable HTTPS with `COMPOSE_PROFILES=https`. CI already builds and runs the images on an empty database on every push (`scripts/docker-smoke.sh`); run them once on your own server too. | S |
 | A.1a | **Before applying migration 011** to any database that already holds payments: check there are no duplicate payment references (`SELECT gateway, upper(gateway_ref), count(*) FROM payments WHERE status='confirmed' AND gateway_ref IS NOT NULL GROUP BY 1,2 HAVING count(*)>1`). The new unique index fails to create if there are. Fix them first. | S |
 | A.1b | **Timezone:** set `TZ` once in `.env` to your local zone and confirm PostgreSQL, FreeRADIUS and the backend all use it (the backend now logs an error at startup if it and the database disagree, Q10). Then check a customer whose paid-until is today is refused at 00:00 local time, not at 00:00 UTC. *The FreeRADIUS side is tested with a fake clock (`midnight_test.go`); check it once on the server.* | S |
+| A.1c | **Harden the real server:** HTTPS only; a database login that is not a superuser; RADIUS clients limited to your router addresses, not wide ranges; backups copied off the server; set `MPESA_ALLOWED_IPS` before going live with M-Pesa. | S |
 | A.5 | Set up SMTP (and SMS if used); send a test email; create alert rules for `nas_down` and `backup_failed`. Confirm the alert actually reaches you. | S |
 
 **A-2. Real router and the customer journey**
@@ -154,7 +190,7 @@ Repeatable with `make test-load` (sizes via `LOAD_*`, see `load_test.go`). **Mea
 | # | Task | Size |
 |---|---|---|
 | A.18 | Supabase + Render + FreeRADIUS on a laptop: the journey and real-FreeRADIUS tests over the internet; note the login latency when FreeRADIUS and the database are far apart. | S |
-| A.19 | M-Pesa sandbox: a real prompt to your phone (paid, and cancelled), simulated paybill payments (known and unknown account). | S |
+| A.19 | M-Pesa sandbox: a real prompt to your phone (paid, and cancelled), simulated paybill payments (known and unknown account). ✅ Run against the Daraja sandbox. It cannot show real-money behaviour: the shared test shortcode can be overwritten by other developers, and a lost STK callback is recovered by the reconcile loop but a lost paybill confirmation is not (check the statement daily during the pilot). | S |
 
 **Done when** A.1–A.5 and A.7–A.17 pass on the test server. (A.6 only if you have a 1.0 install.)
 Any failure in A.7–A.10 or A.13 is a bug to fix before continuing.
@@ -165,7 +201,7 @@ Any failure in A.7–A.10 or A.13 is a bug to fix before continuing.
 
 Real customers, real money, but few of them, and every payment checked by hand.
 
-- [ ] Start with about 10–20 friendly customers on one router. Do not move everyone at once.
+- [ ] Start with about 5–20 friendly customers on one router. Do not move everyone at once.
 - [ ] Run for at least **one full billing cycle** and ideally two, so you see renewals, expiry,
       late payers and at least one reversal for real.
 - [ ] **Every day**, reconcile: the Payments page total against your cash, bank and mobile-money
@@ -193,10 +229,10 @@ daily reconciliation for the first week of each stage.
 
 | # | Task | Why | Size |
 |---|---|---|---|
-| B.1 | **CI** [Q1]: run the billing tests (`make test-integration`) on every push. They are in the repository ([ARCHITECTURE.md § 10.8](ARCHITECTURE.md#108-automated-billing-tests)) but nothing runs them automatically. Then extend tests to the rest of the API, FreeRADIUS and a browser smoke test. | The billing and enforcement paths cost money if they break. | S–M |
+| B.1 | ~~**CI** [Q1]: run the tests on every push.~~ Done: five jobs (backend, e2e, frontend, browser, docker). Still to add: more browser tests for the remaining forms. | The billing and enforcement paths cost money if they break. | ✅ |
 | B.1a | ~~Turn the Phase A failure tests (A.7–A.10) into repeatable scripts.~~ Done: `make test-e2e`. Run it before each release (CI needs the freeradius package on the runner). | | ✅ |
 | B.1b | **More simulation coverage:** other seeds, `suspend_overdue` on, non-default `invoice_due_days`, and a customer deleted while a payment is being recorded. Give back a promo use when an unpaid invoice is cancelled on a plan switch. | Found while writing the tests; not covered yet. | S–M |
-| B.2 | **Audit the remaining handlers for ignored errors** [D7]. | A failure should never look like "saved". | M |
+| B.2 | **Audit the remaining handlers for ignored errors** [D7]. Most are done (R22–R29); finish the rest and add the missing query deadlines. | A failure should never look like "saved". | S–M |
 | B.3 | **EAP/PEAP** [N6], if you use WPA-Enterprise: certificates and a test with a real client. | Untested today. | M |
 | B.4 | **NAS monitor via Status-Server** [N7], so routers that block TCP probes are not shown "down". | Cosmetic but confusing. | S |
 | B.5 | **Scanner-imported routers get their own secret** [N4]. | They reuse `RADIUS_SECRET` until edited. | S |
@@ -207,7 +243,7 @@ daily reconciliation for the first week of each stage.
 
 - [x] **M-Pesa** [B7]: STK push from staff and the portal, paybill/till (C2B), reconciliation,
       unmatched payments for staff. Built and tested against a fake Daraja.
-  - [ ] Run [CLOUD-TEST.md](CLOUD-TEST.md) against the real sandbox (needs your Daraja app keys).
+  - [x] Run [CLOUD-TEST.md](CLOUD-TEST.md) against the real sandbox (needs your Daraja app keys).
   - [ ] Production: apply for Lipa na M-Pesa Online on your paybill/till ("Go Live" on Daraja),
         set `MPESA_ENV=production`, the production keys and passkey, `MPESA_ALLOWED_IPS` to
         Safaricom's published addresses, and register the C2B addresses again.
